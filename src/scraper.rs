@@ -1,5 +1,5 @@
 use regex::Regex;
-use reqwest::{header::HeaderValue, header::COOKIE, header::USER_AGENT, Client, Response};
+use reqwest::{header::HeaderValue, header::COOKIE, header::USER_AGENT, Client};
 use rusqlite::{Connection, Result};
 use soup::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,10 +19,8 @@ async fn get_html(
     patreon_name: &String,
     client: &Client,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let resp: Response;
-
-    if patreon_name.is_empty() {
-        resp = client.get(uri).header(USER_AGENT, "reqwest").send().await?;
+    let resp = if patreon_name.is_empty() {
+        client.get(uri).header(USER_AGENT, "reqwest").send().await?
     } else {
         let epoch_stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -30,13 +28,13 @@ async fn get_html(
             .as_millis();
 
         let cookie = format!("patreon_verified=1; patreon_verified_time={epoch_stamp}; patreon_patron_status=active_patron; patreon_user_name={patreon_name};");
-        resp = client
+        client
             .get(uri)
             .header(USER_AGENT, "reqwest")
             .header(COOKIE, HeaderValue::from_str(&cookie).unwrap())
             .send()
-            .await?;
-    }
+            .await?
+    };
 
     let body = resp.text().await?;
     Ok(body)
