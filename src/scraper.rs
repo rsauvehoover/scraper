@@ -29,7 +29,7 @@ async fn get_html(
             .unwrap()
             .as_millis();
 
-        let cookie = format!("patreon_verified=1; patreon_verified_time={epoch_stamp}; patreon_patron_status=active_patron; patreon_tier_cents=500; patreon_user_name={patreon_name}; patreon_verified_debug=true");
+        let cookie = format!("patreon_verified=1; patreon_verified_time={epoch_stamp}; patreon_patron_status=active_patron; patreon_user_name={patreon_name};");
         resp = client
             .get(uri)
             .header(USER_AGENT, "reqwest")
