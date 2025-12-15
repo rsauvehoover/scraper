@@ -12,8 +12,6 @@
     // also generate an an epub with colours stripped - will be set to true if any destination has StripColour set to true
     "StripColour": true
   },
-  // Prompt for user to fill in chapter password from patreon, false by default
-  "PatreonPrompt": false,
   // none of these are required if local generation is all you want
   "Mail": {
     "Name": "Email to send from",
