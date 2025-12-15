@@ -17,7 +17,7 @@ async fn main() {
         }
     };
 
-    let client = match scraper::build_client(config.patreon_prompt).await {
+    let client = match scraper::build_client().await {
         Ok(client) => client,
         Err(e) => panic!("Error building request client: {}", e),
     };
@@ -30,7 +30,7 @@ async fn main() {
     match scraper::download_all_chapters(
         &conn,
         &config.request_delay,
-        config.patreon_prompt,
+        &config.patreon_name,
         &client,
     )
     .await
