@@ -1,6 +1,6 @@
 use regex::Regex;
 
-use super::PostProcessor;
+use crate::postprocess::PostProcessor;
 
 /// Post-processor that removes all HTML links from content
 pub struct StripLinksProcessor;

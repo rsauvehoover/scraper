@@ -1,13 +1,13 @@
-mod mrsha_write;
-mod strip_colour;
-mod strip_links;
-
-pub use mrsha_write::MrshaWriteProcessor;
-pub use strip_colour::StripColourProcessor;
-pub use strip_links::StripLinksProcessor;
+// Processor categories - add new subdirectories here
+pub mod common;
+pub mod wandering_inn;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// Re-export processors for convenience
+pub use common::{StripColourProcessor, StripLinksProcessor};
+pub use wandering_inn::MrshaWriteProcessor;
 
 /// Trait for post-processors that transform chapter content
 pub trait PostProcessor: Send + Sync {
@@ -30,10 +30,12 @@ impl ProcessorRegistry {
             processors: HashMap::new(),
         };
 
-        // Register default processors
-        registry.register(Arc::new(MrshaWriteProcessor));
+        // Register common processors
         registry.register(Arc::new(StripColourProcessor));
         registry.register(Arc::new(StripLinksProcessor));
+
+        // Register series-specific processors
+        registry.register(Arc::new(MrshaWriteProcessor));
 
         registry
     }

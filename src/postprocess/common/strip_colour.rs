@@ -1,7 +1,7 @@
 use color_name::Color;
 use regex::Regex;
 
-use super::PostProcessor;
+use crate::postprocess::PostProcessor;
 
 /// Post-processor that converts colored spans to text representation
 pub struct StripColourProcessor;

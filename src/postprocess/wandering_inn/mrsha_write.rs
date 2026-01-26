@@ -1,6 +1,6 @@
 use regex::Regex;
 
-use super::PostProcessor;
+use crate::postprocess::PostProcessor;
 
 /// Post-processor that converts Mrsha's writing style to italic emphasis
 pub struct MrshaWriteProcessor;
