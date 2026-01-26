@@ -1,19 +1,23 @@
-use color_name::Color;
 use epub_builder::{EpubBuilder, EpubContent, ZipLibrary};
 use image::io::Reader as ImageReader;
 use image::Rgba;
 use imageproc::drawing::draw_text_mut;
-use regex::Regex;
-use rusqlite::Connection;
 use rusttype::{Font, Scale};
 use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
 };
 
-use crate::config;
-use crate::db;
+use crate::config::{Config, SourceConfig};
+use crate::db::{Chapter, SourceDatabase, Volume};
 use crate::mail::{send_epubs, Attachment};
+use crate::postprocess::ProcessorRegistry;
+
+/// Context for EPUB generation containing source metadata and processors
+pub struct EpubContext<'a> {
+    pub source: &'a SourceConfig,
+    pub processor_registry: &'a ProcessorRegistry,
+}
 
 fn generate_cover(
     volume_title: &str,
@@ -49,39 +53,34 @@ fn load_stylesheet() -> String {
     contents
 }
 
-fn strip_chapter_colour(chapter_data: &str) -> String {
-    let re = Regex::new(r#"<span style="color:\s*(#......).*?">(.*?)</span>"#).unwrap();
-    re.replace_all(chapter_data, |captures: &regex::Captures| {
-        let colour_arr = hex::decode(&captures[1][1..]).unwrap();
-        let name = Color::similar([colour_arr[0], colour_arr[1], colour_arr[2]]);
-        format!(
-            "<span>&lt;{a}|{b}|{a}&gt;</span>",
-            a = name,
-            b = &captures[2]
-        )
-    })
-    .to_string()
-}
+fn process_chapter_data(
+    raw_data: &str,
+    ctx: &EpubContext,
+    strip_colour: bool,
+) -> String {
+    // Always apply mrsha-write processor
+    let mut processed = ctx.processor_registry.apply(raw_data, "mrsha-write");
 
-fn replace_mrsha_write(chapter_data: &str) -> String {
-    let re = Regex::new(r#"<span.*?mrsha-write.*?>(.*?)</span>"#).unwrap();
-    re.replace_all(chapter_data, |captures: &regex::Captures| {
-        format!("<em>{}</em>", &captures[1])
-    })
-    .to_string()
+    // Optionally apply strip-colour
+    if strip_colour {
+        processed = ctx.processor_registry.apply(&processed, "strip-colour");
+    }
+
+    processed
 }
 
 fn generate_chapter(
-    db_conn: &Connection,
-    chapter: &db::Chapter,
+    db: &SourceDatabase,
+    chapter: &Chapter,
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
     std::fs::create_dir_all(output_dir.join("individual"))?;
 
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    epub.metadata("author", "pirate aba")?;
+    epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
     epub.metadata("title", &chapter.name)?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
@@ -103,14 +102,13 @@ fn generate_chapter(
     )?;
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-    if strip_colour {
-        raw_data = strip_chapter_colour(&raw_data);
-    }
+    let raw_data = db.get_chapter_data(chapter.id)?;
+    let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
     epub.add_content(
         EpubContent::new(
             format!("{}({}).xhtml", &chapter.id, &chapter.name),
-            raw_data.as_bytes(),
+            processed_data.as_bytes(),
         )
         .title(&chapter.name),
     )?;
@@ -129,9 +127,10 @@ fn generate_chapter(
 }
 
 fn generate_chapters(
-    db_conn: &Connection,
-    chapters: &Vec<db::Chapter>,
+    db: &SourceDatabase,
+    chapters: &[Chapter],
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Vec<Attachment>, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir.join("combined"))?;
@@ -143,13 +142,13 @@ fn generate_chapters(
     let mut combined_output = Vec::<u8>::new();
     let last_chapter = chapters.last().unwrap();
     let mut combined_epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    combined_epub.metadata("author", "pirate aba")?;
+    combined_epub.metadata("author", &ctx.source.metadata.author)?;
     combined_epub.metadata("lang", "en")?;
     combined_epub.metadata(
         "title",
         format!(
-            "The Wandering Inn Chapters {}-{}",
-            chapters[0].name, last_chapter.name
+            "{} Chapters {}-{}",
+            ctx.source.name, chapters[0].name, last_chapter.name
         ),
     )?;
     combined_epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
@@ -178,24 +177,18 @@ fn generate_chapters(
     let mut attachments = Vec::<Attachment>::new();
 
     for chapter in chapters {
-        let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-        if strip_colour {
-            raw_data = strip_chapter_colour(&raw_data);
-        }
+        let raw_data = db.get_chapter_data(chapter.id)?;
+        let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
         combined_epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, chapter.name),
-                raw_data.as_bytes(),
+                processed_data.as_bytes(),
             )
             .title(&chapter.name),
         )?;
-        attachments.push(generate_chapter(
-            db_conn,
-            chapter,
-            output_dir,
-            strip_colour,
-        )?);
-        db::update_generated_chapter(db_conn, chapter.id, false)?;
+        attachments.push(generate_chapter(db, chapter, output_dir, ctx, strip_colour)?);
+        db.update_generated_chapter(chapter.id, false)?;
     }
 
     combined_epub.generate(&mut combined_output)?;
@@ -209,18 +202,19 @@ fn generate_chapters(
 }
 
 fn generate_volume(
-    db_conn: &Connection,
-    volume: &db::Volume,
-    chapters: &Vec<db::Chapter>,
+    db: &SourceDatabase,
+    volume: &Volume,
+    chapters: &[Chapter],
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
 
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    epub.metadata("author", "pirate aba")?;
+    epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
-    epub.metadata("title", format!("The Wandering Inn {}", &volume.name))?;
+    epub.metadata("title", format!("{} {}", ctx.source.name, &volume.name))?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
@@ -240,14 +234,13 @@ fn generate_volume(
     epub.inline_toc();
 
     for chapter in chapters {
-        let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-        if strip_colour {
-            raw_data = strip_chapter_colour(&raw_data);
-        }
+        let raw_data = db.get_chapter_data(chapter.id)?;
+        let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
         epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, chapter.name),
-                raw_data.as_bytes(),
+                processed_data.as_bytes(),
             )
             .title(&chapter.name),
         )?;
@@ -269,68 +262,82 @@ fn generate_volume(
     })
 }
 
-pub async fn generate_epubs(
-    db_conn: &Connection,
+/// Generate EPUBs for a specific source
+pub async fn generate_epubs_for_source(
+    db: &SourceDatabase,
     build_dir: &Path,
-    config: &config::Config,
+    config: &Config,
+    source: &SourceConfig,
+    processor_registry: &ProcessorRegistry,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = EpubContext {
+        source,
+        processor_registry,
+    };
+
+    // Create source-specific output directory
+    let source_dir = build_dir.join(&source.id);
+
     let mut vols = Vec::<Attachment>::new();
     let mut vols_stripped = Vec::<Attachment>::new();
     let mut chaps = Vec::<Attachment>::new();
     let mut chaps_stripped = Vec::<Attachment>::new();
 
     if config.epub_gen.volumes {
-        let volumes = db::get_volumes_to_regenerate(db_conn)?;
+        let volumes = db.get_volumes_to_regenerate()?;
 
         if volumes.is_empty() {
-            println!("No volumes to generate");
+            println!("({}) No volumes to generate", source.id);
         } else {
-            println!("Generating epubs for {} volumes", volumes.len());
+            println!("({}) Generating epubs for {} volumes", source.id, volumes.len());
         }
 
         for volume in volumes {
-            println!("Generating epub for {}", volume.name);
-            let chapters = db::get_chapters_by_volume(db_conn, volume.id)?;
+            println!("({}) Generating epub for {}", source.id, volume.name);
+            let chapters = db.get_chapters_by_volume(volume.id)?;
             if config.epub_gen.strip_colour {
-                vols.push(generate_volume(
-                    db_conn,
+                vols_stripped.push(generate_volume(
+                    db,
                     &volume,
                     &chapters,
-                    &build_dir.join("volumes_stripped_colour"),
+                    &source_dir.join("volumes_stripped_colour"),
+                    &ctx,
                     true,
                 )?);
             }
-            vols_stripped.push(generate_volume(
-                db_conn,
+            vols.push(generate_volume(
+                db,
                 &volume,
                 &chapters,
-                &build_dir.join("volumes"),
+                &source_dir.join("volumes"),
+                &ctx,
                 false,
             )?);
-            db::update_generated_volume(db_conn, volume.id, false)?;
+            db.update_generated_volume(volume.id, false)?;
         }
     } else {
-        println!("Skipping volume generation");
+        println!("({}) Skipping volume generation", source.id);
     }
 
     if config.epub_gen.chapters {
-        let chapters = db::get_chapters_to_regenerate(db_conn)?;
+        let chapters = db.get_chapters_to_regenerate()?;
         if chapters.is_empty() {
-            println!("No chapters to generate");
-            return Ok(());
+            println!("({}) No chapters to generate", source.id);
+        } else {
+            println!("({}) Generating epubs for {} chapters", source.id, chapters.len());
+            if config.epub_gen.strip_colour {
+                chaps_stripped = generate_chapters(
+                    db,
+                    &chapters,
+                    &source_dir.join("chapters_stripped_colour"),
+                    &ctx,
+                    true,
+                )?;
+            }
+            chaps = generate_chapters(db, &chapters, &source_dir.join("chapters"), &ctx, false)?;
         }
-        println!("Generating epubs for {} chapters", chapters.len());
-        if config.epub_gen.strip_colour {
-            chaps_stripped = generate_chapters(
-                db_conn,
-                &chapters,
-                &build_dir.join("chapters_stripped_colour"),
-                true,
-            )?;
-        }
-        chaps = generate_chapters(db_conn, &chapters, &build_dir.join("chapters"), false)?;
     } else {
-        println!("Skipping chapter generation");
+        println!("({}) Skipping chapter generation", source.id);
     }
 
     send_epubs(&config.mail, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
