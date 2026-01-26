@@ -115,6 +115,15 @@ impl SourceDatabase {
         )
     }
 
+    /// Get a volume name by ID
+    pub fn get_volume_name(&self, volume_id: usize) -> Result<String> {
+        self.conn.query_row(
+            "SELECT name FROM volumes WHERE id = ?1",
+            [volume_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Add a chapter to the database
     pub fn add_chapter(&self, name: &str, uri: &str, volume_id: usize) -> Result<()> {
         self.conn
@@ -129,6 +138,28 @@ impl SourceDatabase {
             .prepare("DELETE FROM chapters WHERE id = ?1")?
             .execute([chapter_id])?;
         Ok(())
+    }
+
+    /// Check if a chapter exists by URI
+    pub fn chapter_exists_by_uri(&self, uri: &str) -> Result<bool> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chapters WHERE uri = ?1",
+            [uri],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Add a discovered chapter (from next chapter links)
+    /// Returns true if the chapter was newly added, false if it already existed
+    pub fn add_discovered_chapter(&self, name: &str, uri: &str, volume_name: &str) -> Result<bool> {
+        if self.chapter_exists_by_uri(uri)? {
+            return Ok(false);
+        }
+
+        let volume_id = self.add_volume(volume_name)?;
+        self.add_chapter(name, uri, volume_id)?;
+        Ok(true)
     }
 
     /// Add or update chapter data

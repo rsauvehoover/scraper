@@ -66,6 +66,36 @@ Backward compatible: legacy single-source configs auto-migrate to multi-source f
 2. If generic parsing doesn't work, create custom scraper in `src/sources/` implementing `SourceScraper`
 3. Register in `ScraperRegistry::create_scraper()` match statement
 
+### Royal Road Sources
+
+Royal Road sources are supported via the `RoyalRoadScraper`. To add a Royal Road fiction:
+
+1. Add a source config with an ID starting with `royal-road-` (e.g., `royal-road-65058`)
+2. The scraper handles:
+   - Parsing the chapter table (`table#chapters`)
+   - Extracting content from `div.chapter-content`
+   - **Chapter discovery**: Since Royal Road paginates its TOC, the scraper discovers additional chapters by following `<link rel="next">` headers during download
+
+Example config:
+```json
+{
+  "Sources": [
+    {
+      "Id": "royal-road-65058",
+      "Name": "Pale Lights",
+      "Enabled": true,
+      "TocUrl": "https://www.royalroad.com/fiction/65058/pale-lights",
+      "Auth": { "Type": "None" },
+      "Metadata": {
+        "Author": "ErraticErrata",
+        "Description": "From the author of A Practical Guide to Evil"
+      },
+      "PostProcessors": ["strip-links"]
+    }
+  ]
+}
+```
+
 ## Adding Post-Processors
 
 1. Create processor in `src/postprocess/{category}/` implementing `PostProcessor`

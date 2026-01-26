@@ -16,6 +16,10 @@ pub struct ChapterContent {
     pub title: String,
     pub html: String,
     pub is_patreon_only: bool,
+    /// URL to next chapter (for chapter discovery in paginated sources)
+    pub next_chapter_url: Option<String>,
+    /// Title of next chapter (if available)
+    pub next_chapter_title: Option<String>,
 }
 
 /// Trait for source scrapers

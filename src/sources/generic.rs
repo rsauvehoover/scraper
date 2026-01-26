@@ -133,6 +133,8 @@ impl SourceScraper for GenericScraper {
             title: title.to_string(),
             html: full_html,
             is_patreon_only,
+            next_chapter_url: None,
+            next_chapter_title: None,
         })
     }
 

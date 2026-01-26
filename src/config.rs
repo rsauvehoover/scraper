@@ -208,6 +208,42 @@ impl SourceConfig {
         };
         config
     }
+
+    /// Create a Royal Road source configuration
+    pub fn royal_road(fiction_id: &str, name: &str, author: &str, description: &str) -> Self {
+        SourceConfig {
+            id: format!("royal-road-{}", fiction_id),
+            name: name.to_string(),
+            enabled: true,
+            toc_url: format!("https://www.royalroad.com/fiction/{}/{}", fiction_id, slug_name(name)),
+            selectors: Selectors {
+                volume_wrapper: String::from("volume-selector"),
+                volume_title: String::from("h6"),
+                chapter_entry: String::from("chapter-row"),
+                chapter_link: String::from("a"),
+                main_content: String::from("chapter-content"),
+                selector_type: SelectorType::Class,
+            },
+            auth: AuthConfig::None,
+            metadata: SourceMetadata {
+                author: author.to_string(),
+                description: description.to_string(),
+            },
+            post_processors: vec![String::from("strip-links")],
+        }
+    }
+}
+
+/// Convert a name to a URL slug
+fn slug_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[derive(Debug, Deserialize)]
