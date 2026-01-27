@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +25,23 @@ impl Default for MailConfig {
     }
 }
 
+/// Per-source overrides for a user. All fields are optional;
+/// when `None`, the top-level UserConfig default is used.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct UserSourceConfig {
+    pub strip_colour: Option<bool>,
+    pub send_full_volumes: Option<bool>,
+    pub send_individual_chapters: Option<bool>,
+}
+
+/// Resolved (non-optional) source config after merging overrides with defaults.
+pub struct ResolvedSourceConfig {
+    pub strip_colour: bool,
+    pub send_full_volumes: bool,
+    pub send_individual_chapters: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UserConfig {
@@ -31,8 +50,8 @@ pub struct UserConfig {
     pub strip_colour: bool,
     pub send_full_volumes: bool,
     pub send_individual_chapters: bool,
-    /// List of source IDs to send to this user (empty means all sources)
-    pub sources: Vec<String>,
+    /// Map of source ID to per-source overrides. Empty map means all sources with defaults.
+    pub sources: HashMap<String, UserSourceConfig>,
 }
 impl Default for UserConfig {
     fn default() -> Self {
@@ -42,7 +61,7 @@ impl Default for UserConfig {
             strip_colour: false,
             send_full_volumes: true,
             send_individual_chapters: false,
-            sources: Vec::new(),
+            sources: HashMap::new(),
         }
     }
 }
@@ -50,7 +69,23 @@ impl Default for UserConfig {
 impl UserConfig {
     /// Check if this user should receive emails for the given source
     pub fn receives_source(&self, source_id: &str) -> bool {
-        self.sources.is_empty() || self.sources.iter().any(|s| s == source_id)
+        self.sources.is_empty() || self.sources.contains_key(source_id)
+    }
+
+    /// Get the resolved config for a specific source, merging per-source overrides with defaults.
+    pub fn source_config(&self, source_id: &str) -> ResolvedSourceConfig {
+        let overrides = self.sources.get(source_id);
+        ResolvedSourceConfig {
+            strip_colour: overrides
+                .and_then(|o| o.strip_colour)
+                .unwrap_or(self.strip_colour),
+            send_full_volumes: overrides
+                .and_then(|o| o.send_full_volumes)
+                .unwrap_or(self.send_full_volumes),
+            send_individual_chapters: overrides
+                .and_then(|o| o.send_individual_chapters)
+                .unwrap_or(self.send_individual_chapters),
+        }
     }
 }
 
@@ -316,14 +351,30 @@ pub fn load_config() -> Config {
                 }
 
                 for dest in &config.mail.destinations {
-                    if dest.strip_colour {
-                        config.epub_gen.strip_colour = true;
-                    }
-                    if dest.send_full_volumes {
-                        config.epub_gen.volumes = true;
-                    }
-                    if dest.send_individual_chapters {
-                        config.epub_gen.chapters = true;
+                    if dest.sources.is_empty() {
+                        // User receives all sources — use top-level defaults
+                        if dest.strip_colour {
+                            config.epub_gen.strip_colour = true;
+                        }
+                        if dest.send_full_volumes {
+                            config.epub_gen.volumes = true;
+                        }
+                        if dest.send_individual_chapters {
+                            config.epub_gen.chapters = true;
+                        }
+                    } else {
+                        for (source_id, _) in &dest.sources {
+                            let resolved = dest.source_config(source_id);
+                            if resolved.strip_colour {
+                                config.epub_gen.strip_colour = true;
+                            }
+                            if resolved.send_full_volumes {
+                                config.epub_gen.volumes = true;
+                            }
+                            if resolved.send_individual_chapters {
+                                config.epub_gen.chapters = true;
+                            }
+                        }
                     }
                 }
 

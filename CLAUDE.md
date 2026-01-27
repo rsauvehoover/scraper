@@ -60,6 +60,28 @@ Sources are configured in `config.json` with:
 
 Backward compatible: legacy single-source configs auto-migrate to multi-source format.
 
+#### Per-User Source Config
+
+Each user destination's `Sources` is a map of source ID to per-source overrides:
+
+```json
+{
+  "Name": "Kindle Upload",
+  "Email": "user@kindle.com",
+  "StripColour": false,
+  "SendFullVolumes": false,
+  "SendIndividualChapters": true,
+  "Sources": {
+    "wandering-inn": { "StripColour": true },
+    "royal-road-pale-lights": {}
+  }
+}
+```
+
+- Top-level `StripColour`, `SendFullVolumes`, `SendIndividualChapters` are defaults for all sources
+- Per-source entries can override any of these with explicit values; omitted fields inherit the defaults
+- An empty `Sources` map (or omitted) means the user receives all sources with their defaults
+
 ## Adding New Sources
 
 1. Add source config to `config.json` with appropriate selectors

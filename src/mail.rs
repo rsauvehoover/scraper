@@ -58,21 +58,22 @@ pub async fn send_epubs(
         if !dest.receives_source(source_id) {
             continue;
         }
-        if dest.send_full_volumes {
+        let src_cfg = dest.source_config(source_id);
+        if src_cfg.send_full_volumes {
             for vol in volumes {
                 send_epub(config, &dest, vol).await;
             }
-            if dest.strip_colour {
+            if src_cfg.strip_colour {
                 for vol in volumes_s {
                     send_epub(config, &dest, vol).await;
                 }
             }
         }
-        if dest.send_individual_chapters {
+        if src_cfg.send_individual_chapters {
             for chapter in chapters {
                 send_epub(config, &dest, chapter).await;
             }
-            if dest.strip_colour {
+            if src_cfg.strip_colour {
                 for chapter in chapters_s {
                     send_epub(config, &dest, chapter).await;
                 }
