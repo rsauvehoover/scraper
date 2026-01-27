@@ -59,9 +59,9 @@ jobs:
         run: cargo bundle --release
       - name: Tar bundle
         run: |
-          artifact_name=$(ls target/release/bundle/deb/)
-          tar -czvf $artifact_name.tar.gz target/release/bundle/deb/$artifact_name
-          echo "ARTIFACT_NAME=$artifact_name.tar.gz" >> $GITHUB_ENV
+          deb_file=$(basename target/release/bundle/deb/*.deb)
+          tar -czvf "$deb_file.tar.gz" -C target/release/bundle/deb "$deb_file"
+          echo "ARTIFACT_NAME=$deb_file.tar.gz" >> $GITHUB_ENV
       - name: upload linux artifact
         uses: actions/upload-release-asset@v1
         env:
