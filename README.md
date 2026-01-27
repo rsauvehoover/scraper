@@ -73,7 +73,8 @@ Create a `config.json` file with the following structure:
         "Email": "recipient@example.com",
         "StripColour": false,             // Remove colored text styling
         "SendFullVolumes": true,          // Send complete volume EPUBs
-        "SendIndividualChapters": false   // Send each chapter as separate EPUB
+        "SendIndividualChapters": false,  // Send each chapter as separate EPUB
+        "Sources": ["my-serial"]          // Only send these sources (empty = all)
       }
     ]
   },

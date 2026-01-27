@@ -31,6 +31,8 @@ pub struct UserConfig {
     pub strip_colour: bool,
     pub send_full_volumes: bool,
     pub send_individual_chapters: bool,
+    /// List of source IDs to send to this user (empty means all sources)
+    pub sources: Vec<String>,
 }
 impl Default for UserConfig {
     fn default() -> Self {
@@ -40,7 +42,16 @@ impl Default for UserConfig {
             strip_colour: false,
             send_full_volumes: true,
             send_individual_chapters: false,
+            sources: Vec::new(),
         }
+    }
+}
+
+impl UserConfig {
+    /// Check if this user should receive emails for the given source
+    #[allow(dead_code)]
+    pub fn receives_source(&self, source_id: &str) -> bool {
+        self.sources.is_empty() || self.sources.iter().any(|s| s == source_id)
     }
 }
 
