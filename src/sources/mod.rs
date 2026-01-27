@@ -7,4 +7,3 @@ mod wandering_inn;
 
 pub use client::ScraperClient;
 pub use registry::ScraperRegistry;
-pub use royal_road::RoyalRoadScraper;

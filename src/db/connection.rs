@@ -6,7 +6,9 @@ use super::models::{Chapter, Volume};
 /// Database connection for a specific source
 pub struct SourceDatabase {
     conn: Connection,
+    #[allow(dead_code)]
     source_id: String,
+    #[allow(dead_code)]
     db_path: PathBuf,
 }
 
@@ -30,16 +32,19 @@ impl SourceDatabase {
     }
 
     /// Get the source ID for this database
+    #[allow(dead_code)]
     pub fn source_id(&self) -> &str {
         &self.source_id
     }
 
     /// Get the database file path
+    #[allow(dead_code)]
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
 
     /// Get a reference to the underlying connection
+    #[allow(dead_code)]
     pub fn connection(&self) -> &Connection {
         &self.conn
     }

@@ -20,11 +20,13 @@ impl WanderingInnScraper {
     }
 
     /// Create with default Wandering Inn configuration
+    #[allow(dead_code)]
     pub fn default_config() -> Self {
         Self::new(SourceConfig::wandering_inn())
     }
 
     /// Create with Patreon authentication
+    #[allow(dead_code)]
     pub fn with_patreon(patreon_name: &str) -> Self {
         Self::new(SourceConfig::wandering_inn_with_patreon(patreon_name))
     }

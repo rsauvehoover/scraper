@@ -5,6 +5,7 @@ pub struct Chapter {
     pub name: String,
     pub uri: String,
     pub volume_id: usize,
+    #[allow(dead_code)]
     pub data_id: Option<usize>,
 }
 

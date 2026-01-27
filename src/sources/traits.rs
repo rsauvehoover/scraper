@@ -13,6 +13,7 @@ pub struct ScrapedChapter {
 /// Parsed chapter content
 #[derive(Debug, Clone)]
 pub struct ChapterContent {
+    #[allow(dead_code)]
     pub title: String,
     pub html: String,
     pub is_patreon_only: bool,
@@ -44,6 +45,7 @@ pub trait SourceScraper: Send + Sync {
     fn build_auth_headers(&self) -> Option<Vec<(String, String)>>;
 
     /// Check if this source requires authentication
+    #[allow(dead_code)]
     fn requires_auth(&self) -> bool {
         self.build_auth_headers().is_some()
     }

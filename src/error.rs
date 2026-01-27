@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Errors that can occur during scraping operations
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum ScrapeError {
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
@@ -30,6 +31,7 @@ pub enum ScrapeError {
 
 /// Errors that can occur during EPUB generation
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum EpubError {
     #[error("Failed to generate EPUB: {0}")]
     GenerationError(String),
@@ -46,6 +48,7 @@ pub enum EpubError {
 
 /// Errors that can occur during database operations
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum DbError {
     #[error("SQLite error: {0}")]
     SqliteError(#[from] rusqlite::Error),
@@ -64,6 +67,7 @@ pub enum DbError {
 pub type ScrapeResult<T> = Result<T, ScrapeError>;
 
 /// Result type alias for EPUB operations
+#[allow(dead_code)]
 pub type EpubResult<T> = Result<T, EpubError>;
 
 /// Result type alias for database operations

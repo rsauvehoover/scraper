@@ -52,6 +52,7 @@ impl ProcessorRegistry {
     }
 
     /// Apply a chain of processors to content
+    #[allow(dead_code)]
     pub fn apply_chain(&self, content: &str, processor_names: &[String]) -> String {
         let mut result = content.to_string();
 

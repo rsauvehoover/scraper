@@ -210,6 +210,7 @@ impl SourceConfig {
     }
 
     /// Create a Royal Road source configuration
+    #[allow(dead_code)]
     pub fn royal_road(fiction_id: &str, name: &str, author: &str, description: &str) -> Self {
         SourceConfig {
             id: format!("royal-road-{}", fiction_id),
@@ -235,6 +236,7 @@ impl SourceConfig {
 }
 
 /// Convert a name to a URL slug
+#[allow(dead_code)]
 fn slug_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -283,6 +285,7 @@ impl Config {
     }
 
     /// Find a source by ID
+    #[allow(dead_code)]
     pub fn find_source(&self, id: &str) -> Option<&SourceConfig> {
         self.sources.iter().find(|s| s.id == id)
     }

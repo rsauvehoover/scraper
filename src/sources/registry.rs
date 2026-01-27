@@ -60,16 +60,19 @@ impl ScraperRegistry {
     }
 
     /// Get all registered scrapers
+    #[allow(dead_code)]
     pub fn all(&self) -> impl Iterator<Item = &Arc<dyn SourceScraper>> {
         self.scrapers.values()
     }
 
     /// Get all source IDs
+    #[allow(dead_code)]
     pub fn source_ids(&self) -> impl Iterator<Item = &str> {
         self.scrapers.keys().map(|s| s.as_str())
     }
 
     /// Check if a source is registered
+    #[allow(dead_code)]
     pub fn has_source(&self, source_id: &str) -> bool {
         self.scrapers.contains_key(source_id)
     }
