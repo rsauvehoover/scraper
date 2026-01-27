@@ -71,10 +71,18 @@ Create a `config.json` file with the following structure:
       {
         "Name": "Recipient",
         "Email": "recipient@example.com",
-        "StripColour": false,             // Remove colored text styling
-        "SendFullVolumes": true,          // Send complete volume EPUBs
-        "SendIndividualChapters": false,  // Send each chapter as separate EPUB
-        "Sources": ["my-serial"]          // Only send these sources (empty = all)
+        "StripColour": false,             // Default: remove colored text styling
+        "SendFullVolumes": true,          // Default: send complete volume EPUBs
+        "SendIndividualChapters": false,  // Default: send each chapter as separate EPUB
+
+        // Map of source ID to per-source overrides (empty map or omitted = all sources with defaults)
+        "Sources": {
+          "my-serial": {},                           // Inherits all defaults above
+          "another-serial": {                        // Override specific settings for this source
+            "StripColour": true,
+            "SendFullVolumes": false
+          }
+        }
       }
     ]
   },
