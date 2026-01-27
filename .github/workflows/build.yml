@@ -1,4 +1,4 @@
-name: Pre-checks
+name: Release
 
 on: workflow_dispatch
 
