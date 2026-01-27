@@ -49,7 +49,6 @@ impl Default for UserConfig {
 
 impl UserConfig {
     /// Check if this user should receive emails for the given source
-    #[allow(dead_code)]
     pub fn receives_source(&self, source_id: &str) -> bool {
         self.sources.is_empty() || self.sources.iter().any(|s| s == source_id)
     }

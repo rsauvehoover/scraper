@@ -414,7 +414,7 @@ pub async fn generate_epubs_for_source(
         println!("({}) Skipping chapter generation", source.id);
     }
 
-    send_epubs(&config.mail, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
+    send_epubs(&config.mail, &source.id, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
 
     Ok(())
 }

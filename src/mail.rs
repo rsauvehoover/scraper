@@ -48,12 +48,16 @@ async fn send_epub(config: &MailConfig, dest: &UserConfig, attachment: &Attachme
 
 pub async fn send_epubs(
     config: &MailConfig,
+    source_id: &str,
     volumes: &Vec<Attachment>,
     volumes_s: &Vec<Attachment>,
     chapters: &Vec<Attachment>,
     chapters_s: &Vec<Attachment>,
 ) {
     for dest in config.destinations.clone() {
+        if !dest.receives_source(source_id) {
+            continue;
+        }
         if dest.send_full_volumes {
             for vol in volumes {
                 send_epub(config, &dest, vol).await;
