@@ -83,10 +83,11 @@ jobs:
       - name: Build
         run: cargo wix -v
       - name: Get artifact name
+        shell: bash
         run: |
-          artifact_name=$(dir -n -file target/wix/*.msi)
+          artifact_name=$(basename target/wix/*.msi)
           echo "WINDOWS_ARTIFACT_NAME=$artifact_name" >> $GITHUB_ENV
-      - name: upload linux artifact
+      - name: upload windows artifact
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,4 +95,4 @@ jobs:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: ./target/wix/${{ env.WINDOWS_ARTIFACT_NAME }}
           asset_name: ${{ env.WINDOWS_ARTIFACT_NAME }}
-          asset_content_type: application/gzip
+          asset_content_type: application/x-msi
