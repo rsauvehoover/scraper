@@ -1,11 +1,29 @@
 use async_trait::async_trait;
 use regex::Regex;
+use serde::Deserialize;
 use soup::prelude::*;
+use std::collections::HashMap;
 
 use crate::config::SourceConfig;
 use crate::error::{ScrapeError, ScrapeResult};
 
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
+
+/// Volume data from Royal Road's JavaScript
+#[derive(Debug, Deserialize)]
+struct RoyalRoadVolume {
+    id: i64,
+    title: String,
+}
+
+/// Chapter data from Royal Road's JavaScript
+#[derive(Debug, Deserialize)]
+struct RoyalRoadChapter {
+    #[serde(rename = "volumeId")]
+    volume_id: Option<i64>,
+    title: String,
+    url: String,
+}
 
 /// Scraper for Royal Road fiction
 pub struct RoyalRoadScraper {
@@ -32,6 +50,35 @@ impl RoyalRoadScraper {
             url.to_string()
         }
     }
+
+    /// Extract volumes array from Royal Road's JavaScript
+    fn extract_volumes(html: &str) -> Vec<RoyalRoadVolume> {
+        let re = Regex::new(r"window\.volumes\s*=\s*(\[[\s\S]*?\]);").unwrap();
+        if let Some(caps) = re.captures(html) {
+            if let Some(json_str) = caps.get(1) {
+                if let Ok(volumes) = serde_json::from_str::<Vec<RoyalRoadVolume>>(json_str.as_str())
+                {
+                    return volumes;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Extract chapters array from Royal Road's JavaScript
+    fn extract_chapters(html: &str) -> Vec<RoyalRoadChapter> {
+        let re = Regex::new(r"window\.chapters\s*=\s*(\[[\s\S]*?\]);").unwrap();
+        if let Some(caps) = re.captures(html) {
+            if let Some(json_str) = caps.get(1) {
+                if let Ok(chapters) =
+                    serde_json::from_str::<Vec<RoyalRoadChapter>>(json_str.as_str())
+                {
+                    return chapters;
+                }
+            }
+        }
+        Vec::new()
+    }
 }
 
 #[async_trait]
@@ -49,64 +96,100 @@ impl SourceScraper for RoyalRoadScraper {
     }
 
     async fn parse_toc(&self, html: &str) -> ScrapeResult<Vec<ScrapedChapter>> {
-        let soup = Soup::new(html);
         let mut chapters = Vec::new();
 
-        // Royal Road uses a table with id="chapters"
-        // Each row has class="chapter-row" containing links to chapters
-        let chapter_rows = soup.class("chapter-row").find_all();
+        // Try to extract chapter and volume data from JavaScript objects first
+        let js_volumes = Self::extract_volumes(html);
+        let js_chapters = Self::extract_chapters(html);
 
-        // Try to extract volume information from the volume carousel
-        // For now, we'll use a default volume name since chapter-to-volume
-        // mapping requires JavaScript interaction
-        let default_volume = "Main Story".to_string();
+        if !js_chapters.is_empty() {
+            // Build volume lookup map
+            let volume_map: HashMap<i64, String> = js_volumes
+                .into_iter()
+                .map(|v| (v.id, v.title))
+                .collect();
 
-        for row in chapter_rows {
-            // Find the first link in the row (chapter link)
-            if let Some(link) = row.tag("a").find() {
-                if let Some(href) = link.get("href") {
-                    let title = link.text().trim().to_string();
-                    let uri = self.normalize_url(&href);
+            // Determine default volume name for chapters without a volumeId
+            let default_volume = if volume_map.is_empty() {
+                "Main Story".to_string()
+            } else {
+                "Uncategorized".to_string()
+            };
 
-                    // Skip empty titles
-                    if !title.is_empty() {
-                        chapters.push(ScrapedChapter {
-                            title,
-                            uri,
-                            volume_name: default_volume.clone(),
-                        });
+            for chapter in js_chapters {
+                let volume_name = chapter
+                    .volume_id
+                    .and_then(|id| volume_map.get(&id).cloned())
+                    .unwrap_or_else(|| default_volume.clone());
+
+                let uri = self.normalize_url(&chapter.url);
+
+                if !chapter.title.is_empty() {
+                    chapters.push(ScrapedChapter {
+                        title: chapter.title,
+                        uri,
+                        volume_name,
+                    });
+                }
+            }
+
+            println!(
+                "({}) Found {} chapters in {} volumes from JavaScript data",
+                self.source_id(),
+                chapters.len(),
+                volume_map.len().max(1)
+            );
+        } else {
+            // Fallback to HTML parsing if JavaScript extraction failed
+            let soup = Soup::new(html);
+            let chapter_rows = soup.class("chapter-row").find_all();
+            let default_volume = "Main Story".to_string();
+
+            for row in chapter_rows {
+                if let Some(link) = row.tag("a").find() {
+                    if let Some(href) = link.get("href") {
+                        let title = link.text().trim().to_string();
+                        let uri = self.normalize_url(&href);
+
+                        if !title.is_empty() {
+                            chapters.push(ScrapedChapter {
+                                title,
+                                uri,
+                                volume_name: default_volume.clone(),
+                            });
+                        }
                     }
                 }
             }
-        }
 
-        // If we found no chapters via chapter-row, try tbody tr as fallback
-        if chapters.is_empty() {
-            if let Some(table) = soup.attr("id", "chapters").find() {
-                for row in table.tag("tr").find_all() {
-                    if let Some(link) = row.tag("a").find() {
-                        if let Some(href) = link.get("href") {
-                            let title = link.text().trim().to_string();
-                            let uri = self.normalize_url(&href);
+            // If we found no chapters via chapter-row, try tbody tr as fallback
+            if chapters.is_empty() {
+                if let Some(table) = soup.attr("id", "chapters").find() {
+                    for row in table.tag("tr").find_all() {
+                        if let Some(link) = row.tag("a").find() {
+                            if let Some(href) = link.get("href") {
+                                let title = link.text().trim().to_string();
+                                let uri = self.normalize_url(&href);
 
-                            if !title.is_empty() && href.contains("/chapter/") {
-                                chapters.push(ScrapedChapter {
-                                    title,
-                                    uri,
-                                    volume_name: default_volume.clone(),
-                                });
+                                if !title.is_empty() && href.contains("/chapter/") {
+                                    chapters.push(ScrapedChapter {
+                                        title,
+                                        uri,
+                                        volume_name: default_volume.clone(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        println!(
-            "({}) Found {} chapters in TOC (may discover more during download)",
-            self.source_id(),
-            chapters.len()
-        );
+            println!(
+                "({}) Found {} chapters in TOC via HTML parsing (may discover more during download)",
+                self.source_id(),
+                chapters.len()
+            );
+        }
 
         Ok(chapters)
     }
