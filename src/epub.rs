@@ -1,11 +1,8 @@
 use epub_builder::{EpubBuilder, EpubContent, ZipLibrary};
 use image::io::Reader as ImageReader;
-use image::Rgba;
-use imageproc::drawing::draw_text_mut;
-use rusttype::{Font, Scale};
 use std::{
     io::{Cursor, Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::config::{Config, SourceConfig};
@@ -19,31 +16,23 @@ pub struct EpubContext<'a> {
     pub processor_registry: &'a ProcessorRegistry,
 }
 
-fn generate_cover(
-    volume_title: &str,
-    output_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut img = ImageReader::open("src/assets/cover.png")
-        .unwrap()
+/// Load cover image bytes from the configured path, if any
+fn load_cover_image(source: &SourceConfig) -> Option<Vec<u8>> {
+    let cover_path = source.metadata.cover_image.as_ref()?;
+
+    let img = ImageReader::open(cover_path)
+        .ok()?
         .decode()
-        .unwrap();
+        .ok()?;
 
-    let font = Vec::from(include_bytes!("font/RobotoSlab-VariableFont_wght.ttf") as &[u8]);
-    let font = Font::try_from_vec(font).unwrap();
+    let mut img_bytes = Vec::new();
+    img.write_to(
+        &mut Cursor::new(&mut img_bytes),
+        image::ImageOutputFormat::Png,
+    )
+    .ok()?;
 
-    draw_text_mut(
-        &mut img,
-        Rgba([255, 255, 60, 255]),
-        15,
-        112,
-        Scale::uniform(30.0),
-        &font,
-        volume_title,
-    );
-    std::fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(format!("{}.png", &volume_title));
-    img.save(&path)?;
-    Ok(path)
+    Some(img_bytes)
 }
 
 fn load_stylesheet() -> String {
@@ -85,21 +74,13 @@ fn generate_chapter(
     epub.metadata("title", &chapter.name)?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
 
-    let cover_img = generate_cover(
-        &format!("Chapter {}", chapter.name),
-        &output_dir.join("..").join("covers"),
-    );
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    epub.add_cover_image(
-        output_dir.join(format!("{}({}).png", chapter.id, chapter.name)),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    if let Some(img_bytes) = load_cover_image(ctx.source) {
+        epub.add_cover_image(
+            format!("{}({}).png", chapter.id, chapter.name),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
     let raw_data = db.get_chapter_data(chapter.id)?;
@@ -154,24 +135,16 @@ fn generate_chapters(
     combined_epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     combined_epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let cover_img = generate_cover(
-        &format!("Chapters {}-{}", chapters[0].name, last_chapter.name),
-        &output_dir.join("..").join("covers"),
-    );
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    combined_epub.add_cover_image(
-        output_dir.join(format!(
-            "{}({})-{}({}).png",
-            chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
-        )),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    if let Some(img_bytes) = load_cover_image(ctx.source) {
+        combined_epub.add_cover_image(
+            format!(
+                "{}({})-{}({}).png",
+                chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
+            ),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
     combined_epub.inline_toc();
 
     let mut attachments = Vec::<Attachment>::new();
@@ -218,18 +191,13 @@ fn generate_volume(
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let cover_img = generate_cover(&volume.name, &output_dir.join("..").join("covers"));
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    epub.add_cover_image(
-        output_dir.join(format!("{}.png", &volume.name)),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    if let Some(img_bytes) = load_cover_image(ctx.source) {
+        epub.add_cover_image(
+            format!("{}.png", &volume.name),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
 
     epub.inline_toc();
 

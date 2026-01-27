@@ -131,6 +131,8 @@ impl Default for AuthConfig {
 pub struct SourceMetadata {
     pub author: String,
     pub description: String,
+    /// Optional path to cover image for EPUB generation
+    pub cover_image: Option<String>,
 }
 
 impl Default for SourceMetadata {
@@ -138,6 +140,7 @@ impl Default for SourceMetadata {
         SourceMetadata {
             author: String::from("Unknown"),
             description: String::new(),
+            cover_image: None,
         }
     }
 }
@@ -192,6 +195,7 @@ impl SourceConfig {
             metadata: SourceMetadata {
                 author: String::from("pirate aba"),
                 description: String::from("The Wandering Inn"),
+                cover_image: None,
             },
             post_processors: vec![
                 String::from("mrsha-write"),
@@ -229,6 +233,7 @@ impl SourceConfig {
             metadata: SourceMetadata {
                 author: author.to_string(),
                 description: description.to_string(),
+                cover_image: None,
             },
             post_processors: vec![String::from("strip-links")],
         }
