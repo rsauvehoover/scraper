@@ -38,9 +38,7 @@ impl ScraperRegistry {
     fn create_scraper(source: &SourceConfig) -> Arc<dyn SourceScraper> {
         match source.id.as_str() {
             "wandering-inn" => Arc::new(WanderingInnScraper::new(source.clone())),
-            id if id.starts_with("royal-road") => {
-                Arc::new(RoyalRoadScraper::new(source.clone()))
-            }
+            id if id.starts_with("royal-road") => Arc::new(RoyalRoadScraper::new(source.clone())),
             _ => Arc::new(GenericScraper::new(source.clone())),
         }
     }

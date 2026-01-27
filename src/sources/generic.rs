@@ -40,9 +40,19 @@ impl SourceScraper for GenericScraper {
 
         // Find volumes - always use class selector for volume wrapper (most common pattern)
         let volumes: Vec<_> = match selectors.selector_type {
-            SelectorType::Class => soup.class(selectors.volume_wrapper.as_str()).find_all().collect(),
-            SelectorType::Id => soup.attr("id", selectors.volume_wrapper.as_str()).find().into_iter().collect(),
-            SelectorType::Tag => soup.tag(selectors.volume_wrapper.as_str()).find_all().collect(),
+            SelectorType::Class => soup
+                .class(selectors.volume_wrapper.as_str())
+                .find_all()
+                .collect(),
+            SelectorType::Id => soup
+                .attr("id", selectors.volume_wrapper.as_str())
+                .find()
+                .into_iter()
+                .collect(),
+            SelectorType::Tag => soup
+                .tag(selectors.volume_wrapper.as_str())
+                .find_all()
+                .collect(),
         };
 
         for volume in volumes {
@@ -55,9 +65,19 @@ impl SourceScraper for GenericScraper {
 
             // Find chapters within this volume
             let chapter_entries: Vec<_> = match selectors.selector_type {
-                SelectorType::Class => volume.class(selectors.chapter_entry.as_str()).find_all().collect(),
-                SelectorType::Id => volume.attr("id", selectors.chapter_entry.as_str()).find().into_iter().collect(),
-                SelectorType::Tag => volume.tag(selectors.chapter_entry.as_str()).find_all().collect(),
+                SelectorType::Class => volume
+                    .class(selectors.chapter_entry.as_str())
+                    .find_all()
+                    .collect(),
+                SelectorType::Id => volume
+                    .attr("id", selectors.chapter_entry.as_str())
+                    .find()
+                    .into_iter()
+                    .collect(),
+                SelectorType::Tag => volume
+                    .tag(selectors.chapter_entry.as_str())
+                    .find_all()
+                    .collect(),
             };
 
             for chapter in chapter_entries {
@@ -101,7 +121,11 @@ impl SourceScraper for GenericScraper {
             })?;
 
         // Check for Patreon-only content
-        let page_title = soup.tag("title").find().map(|t| t.text()).unwrap_or_default();
+        let page_title = soup
+            .tag("title")
+            .find()
+            .map(|t| t.text())
+            .unwrap_or_default();
         let patron_re = Regex::new(r"(?i)Patron Early Access").unwrap();
         let is_patreon_only = patron_re.is_match(&page_title);
 
@@ -118,9 +142,7 @@ impl SourceScraper for GenericScraper {
 <link rel="stylesheet" href="style.css" type = "text/css" />
 </head>
 <body>"#,
-            self.config.metadata.author,
-            self.config.metadata.description,
-            self.config.name
+            self.config.metadata.author, self.config.metadata.description, self.config.name
         );
 
         let chapter_title = format!("<h1>{}</h1>", title);

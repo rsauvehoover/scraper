@@ -104,10 +104,8 @@ impl SourceScraper for RoyalRoadScraper {
 
         if !js_chapters.is_empty() {
             // Build volume lookup map
-            let volume_map: HashMap<i64, String> = js_volumes
-                .into_iter()
-                .map(|v| (v.id, v.title))
-                .collect();
+            let volume_map: HashMap<i64, String> =
+                js_volumes.into_iter().map(|v| (v.id, v.title)).collect();
 
             // Determine default volume name for chapters without a volumeId
             let default_volume = if volume_map.is_empty() {
@@ -206,12 +204,9 @@ impl SourceScraper for RoyalRoadScraper {
         let soup = Soup::new(&html_string);
 
         // Royal Road chapter content is in div with both "chapter-inner" and "chapter-content" classes
-        let content = soup
-            .class("chapter-content")
-            .find()
-            .ok_or_else(|| {
-                ScrapeError::ContentNotFound("Chapter content element not found".to_string())
-            })?;
+        let content = soup.class("chapter-content").find().ok_or_else(|| {
+            ScrapeError::ContentNotFound("Chapter content element not found".to_string())
+        })?;
 
         // Extract next chapter link from <link rel="next"> in head
         let next_chapter_url = soup
@@ -251,9 +246,7 @@ impl SourceScraper for RoyalRoadScraper {
 <link rel="stylesheet" href="style.css" type = "text/css" />
 </head>
 <body>"#,
-            self.config.metadata.author,
-            self.config.metadata.description,
-            self.config.name
+            self.config.metadata.author, self.config.metadata.description, self.config.name
         );
 
         let chapter_heading = format!("<h1>{}</h1>", chapter_title);

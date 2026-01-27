@@ -80,7 +80,10 @@ async fn main() {
 
     // Process each source
     for source in sources_to_process {
-        println!("\n=== Processing source: {} ({}) ===", source.name, source.id);
+        println!(
+            "\n=== Processing source: {} ({}) ===",
+            source.name, source.id
+        );
 
         // Open database for this source
         let db = match SourceDatabase::open(&source.id) {

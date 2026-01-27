@@ -5,10 +5,10 @@ use thiserror::Error;
 #[allow(dead_code)]
 pub enum ScrapeError {
     #[error("HTTP request failed: {0}")]
-    HttpError(#[from] reqwest::Error),
+    Http(#[from] reqwest::Error),
 
     #[error("Failed to parse HTML: {0}")]
-    ParseError(String),
+    Parse(String),
 
     #[error("Content not found: {0}")]
     ContentNotFound(String),
@@ -17,16 +17,16 @@ pub enum ScrapeError {
     PatreonOnly(String),
 
     #[error("Database error: {0}")]
-    DatabaseError(#[from] rusqlite::Error),
+    Database(#[from] rusqlite::Error),
 
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Source not found: {0}")]
     SourceNotFound(String),
 
     #[error("Invalid configuration: {0}")]
-    ConfigError(String),
+    Config(String),
 }
 
 /// Errors that can occur during EPUB generation
@@ -34,16 +34,16 @@ pub enum ScrapeError {
 #[allow(dead_code)]
 pub enum EpubError {
     #[error("Failed to generate EPUB: {0}")]
-    GenerationError(String),
+    Generation(String),
 
     #[error("Database error: {0}")]
-    DatabaseError(#[from] rusqlite::Error),
+    Database(#[from] rusqlite::Error),
 
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Image processing error: {0}")]
-    ImageError(String),
+    Image(String),
 }
 
 /// Errors that can occur during database operations
@@ -51,13 +51,13 @@ pub enum EpubError {
 #[allow(dead_code)]
 pub enum DbError {
     #[error("SQLite error: {0}")]
-    SqliteError(#[from] rusqlite::Error),
+    Sqlite(#[from] rusqlite::Error),
 
     #[error("Migration error: {0}")]
-    MigrationError(String),
+    Migration(String),
 
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Database not found: {0}")]
     NotFound(String),

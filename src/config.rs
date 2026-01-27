@@ -71,12 +71,6 @@ pub enum SelectorType {
     Tag,
 }
 
-impl Default for SelectorType {
-    fn default() -> Self {
-        SelectorType::Class
-    }
-}
-
 /// HTML selectors for parsing a source's TOC and chapters
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
@@ -117,12 +111,6 @@ pub enum AuthConfig {
     /// Patreon integration
     #[serde(rename_all = "PascalCase")]
     Patreon { patreon_name: String },
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        AuthConfig::None
-    }
 }
 
 /// Metadata for a source (used in EPUB generation)
@@ -197,10 +185,7 @@ impl SourceConfig {
                 description: String::from("The Wandering Inn"),
                 cover_image: None,
             },
-            post_processors: vec![
-                String::from("mrsha-write"),
-                String::from("strip-links"),
-            ],
+            post_processors: vec![String::from("mrsha-write"), String::from("strip-links")],
         }
     }
 
@@ -220,7 +205,11 @@ impl SourceConfig {
             id: format!("royal-road-{}", fiction_id),
             name: name.to_string(),
             enabled: true,
-            toc_url: format!("https://www.royalroad.com/fiction/{}/{}", fiction_id, slug_name(name)),
+            toc_url: format!(
+                "https://www.royalroad.com/fiction/{}/{}",
+                fiction_id,
+                slug_name(name)
+            ),
             selectors: Selectors {
                 volume_wrapper: String::from("volume-selector"),
                 volume_title: String::from("h6"),

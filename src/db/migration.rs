@@ -20,7 +20,7 @@ pub fn migrate_legacy_database() -> DbResult<bool> {
     println!("Migrating legacy database from db/index.db to db/wandering-inn.db");
 
     // Simply rename the file
-    std::fs::rename(legacy_path, new_path).map_err(|e| DbError::MigrationError(e.to_string()))?;
+    std::fs::rename(legacy_path, new_path).map_err(|e| DbError::Migration(e.to_string()))?;
 
     // Open the renamed database and add source metadata
     let conn = rusqlite::Connection::open(new_path)?;

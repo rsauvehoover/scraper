@@ -113,11 +113,10 @@ impl SourceDatabase {
         self.conn
             .prepare("INSERT OR IGNORE INTO volumes(name) VALUES(?1)")?
             .execute([name])?;
-        self.conn.query_row(
-            "SELECT id FROM volumes WHERE name = ?1",
-            [name],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row("SELECT id FROM volumes WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
     }
 
     /// Get a volume name by ID
@@ -184,11 +183,11 @@ impl SourceDatabase {
             .execute((data, chapter_id))?;
 
         let regenerate = !existing_data.eq(data);
-        let data_id: usize = self.conn.query_row(
-            "SELECT id FROM raw_data WHERE data = ?1",
-            [data],
-            |row| row.get(0),
-        )?;
+        let data_id: usize =
+            self.conn
+                .query_row("SELECT id FROM raw_data WHERE data = ?1", [data], |row| {
+                    row.get(0)
+                })?;
 
         self.conn
             .prepare("UPDATE chapters SET data_id = ?1, regenerate_epub = ?2 WHERE id = ?3")?
@@ -242,10 +241,7 @@ impl SourceDatabase {
 
     /// Get volumes needing EPUB regeneration
     pub fn get_volumes_to_regenerate(&self) -> Result<Vec<Volume>> {
-        self.volume_query(
-            "SELECT id, name FROM volumes WHERE regenerate_epub = 1",
-            [],
-        )
+        self.volume_query("SELECT id, name FROM volumes WHERE regenerate_epub = 1", [])
     }
 
     /// Update volume regeneration flag

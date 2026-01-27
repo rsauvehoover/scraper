@@ -27,7 +27,9 @@ fn load_font() -> Option<Font<'static>> {
 
 /// Calculate the width of rendered text
 fn text_width(font: &Font, scale: Scale, text: &str) -> i32 {
-    let glyphs: Vec<_> = font.layout(text, scale, rusttype::point(0.0, 0.0)).collect();
+    let glyphs: Vec<_> = font
+        .layout(text, scale, rusttype::point(0.0, 0.0))
+        .collect();
     if glyphs.is_empty() {
         return 0;
     }
@@ -74,8 +76,8 @@ fn generate_cover_with_text(
     let (width, height) = (img.width(), img.height());
 
     // Calculate font sizes based on image dimensions
-    let title_scale = Scale::uniform((width as f32 * 0.08).max(24.0).min(72.0));
-    let subtitle_scale = Scale::uniform((width as f32 * 0.05).max(16.0).min(48.0));
+    let title_scale = Scale::uniform((width as f32 * 0.08).clamp(24.0, 72.0));
+    let subtitle_scale = Scale::uniform((width as f32 * 0.05).clamp(16.0, 48.0));
 
     // Calculate text positions (centered, bottom portion of image)
     let title_width = text_width(&font, title_scale, series_title);
@@ -95,13 +97,32 @@ fn generate_cover_with_text(
 
     // Draw title text (white)
     let white = Rgba([255u8, 255u8, 255u8, 255u8]);
-    draw_text_mut(&mut img, white, title_x, title_y as i32, title_scale, &font, series_title);
-    draw_text_mut(&mut img, white, subtitle_x, subtitle_y as i32, subtitle_scale, &font, subtitle);
+    draw_text_mut(
+        &mut img,
+        white,
+        title_x,
+        title_y as i32,
+        title_scale,
+        &font,
+        series_title,
+    );
+    draw_text_mut(
+        &mut img,
+        white,
+        subtitle_x,
+        subtitle_y as i32,
+        subtitle_scale,
+        &font,
+        subtitle,
+    );
 
     // Encode to PNG
     let mut img_bytes = Vec::new();
     DynamicImage::ImageRgba8(img)
-        .write_to(&mut Cursor::new(&mut img_bytes), image::ImageOutputFormat::Png)
+        .write_to(
+            &mut Cursor::new(&mut img_bytes),
+            image::ImageOutputFormat::Png,
+        )
         .ok()?;
 
     Some(img_bytes)
@@ -114,11 +135,7 @@ fn load_stylesheet() -> String {
     contents
 }
 
-fn process_chapter_data(
-    raw_data: &str,
-    ctx: &EpubContext,
-    strip_colour: bool,
-) -> String {
+fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -> String {
     // Always apply mrsha-write processor
     let mut processed = ctx.processor_registry.apply(raw_data, "mrsha-write");
 
@@ -208,7 +225,9 @@ fn generate_chapters(
     combined_epub.stylesheet(load_stylesheet().as_bytes())?;
 
     let chapters_subtitle = format!("{} - {}", chapters[0].name, last_chapter.name);
-    if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &chapters_subtitle) {
+    if let Some(img_bytes) =
+        generate_cover_with_text(ctx.source, &ctx.source.name, &chapters_subtitle)
+    {
         combined_epub.add_cover_image(
             format!(
                 "{}({})-{}({}).png",
@@ -233,7 +252,13 @@ fn generate_chapters(
             )
             .title(&chapter.name),
         )?;
-        attachments.push(generate_chapter(db, chapter, output_dir, ctx, strip_colour)?);
+        attachments.push(generate_chapter(
+            db,
+            chapter,
+            output_dir,
+            ctx,
+            strip_colour,
+        )?);
         db.update_generated_chapter(chapter.id, false)?;
     }
 
@@ -330,7 +355,11 @@ pub async fn generate_epubs_for_source(
         if volumes.is_empty() {
             println!("({}) No volumes to generate", source.id);
         } else {
-            println!("({}) Generating epubs for {} volumes", source.id, volumes.len());
+            println!(
+                "({}) Generating epubs for {} volumes",
+                source.id,
+                volumes.len()
+            );
         }
 
         for volume in volumes {
@@ -365,7 +394,11 @@ pub async fn generate_epubs_for_source(
         if chapters.is_empty() {
             println!("({}) No chapters to generate", source.id);
         } else {
-            println!("({}) Generating epubs for {} chapters", source.id, chapters.len());
+            println!(
+                "({}) Generating epubs for {} chapters",
+                source.id,
+                chapters.len()
+            );
             if config.epub_gen.strip_colour {
                 chaps_stripped = generate_chapters(
                     db,

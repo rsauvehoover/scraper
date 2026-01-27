@@ -19,7 +19,7 @@ impl ScraperClient {
         let client = Client::builder()
             .cookie_store(true)
             .build()
-            .map_err(ScrapeError::HttpError)?;
+            .map_err(ScrapeError::Http)?;
 
         Ok(ScraperClient { client })
     }
@@ -40,8 +40,8 @@ impl ScraperClient {
             }
         }
 
-        let resp = request.send().await.map_err(ScrapeError::HttpError)?;
-        let body = resp.text().await.map_err(ScrapeError::HttpError)?;
+        let resp = request.send().await.map_err(ScrapeError::Http)?;
+        let body = resp.text().await.map_err(ScrapeError::Http)?;
 
         Ok(body)
     }
@@ -67,7 +67,9 @@ impl ScraperClient {
         for chapter in chapters {
             let volume_id = db.add_volume(&chapter.volume_name)?;
             db.add_chapter(&chapter.title, &chapter.uri, volume_id)?;
-            *volume_counts.entry(chapter.volume_name.clone()).or_insert(0) += 1;
+            *volume_counts
+                .entry(chapter.volume_name.clone())
+                .or_insert(0) += 1;
         }
 
         for (volume_name, count) in &volume_counts {
@@ -111,7 +113,11 @@ impl ScraperClient {
 
             for chapter in chapters {
                 if batch_count % 10 == 0 && batch_count != 0 {
-                    println!("({}) Downloaded {} chapters", scraper.source_id(), batch_count);
+                    println!(
+                        "({}) Downloaded {} chapters",
+                        scraper.source_id(),
+                        batch_count
+                    );
                 }
 
                 if batch_count > 0 {
@@ -184,7 +190,10 @@ impl ScraperClient {
         }
 
         // Apply strip-links post-processor during download
-        let processed_html = if scraper.post_processors().contains(&"strip-links".to_string()) {
+        let processed_html = if scraper
+            .post_processors()
+            .contains(&"strip-links".to_string())
+        {
             let re = regex::Regex::new(r"<a.*?</a>").unwrap();
             re.replace_all(&content.html, "").to_string()
         } else {
