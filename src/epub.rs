@@ -1,45 +1,131 @@
-use color_name::Color;
 use epub_builder::{EpubBuilder, EpubContent, ZipLibrary};
 use image::io::Reader as ImageReader;
-use image::Rgba;
+use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
-use regex::Regex;
-use rusqlite::Connection;
 use rusttype::{Font, Scale};
 use std::{
     io::{Cursor, Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
-use crate::config;
-use crate::db;
+use crate::config::{Config, SourceConfig};
+use crate::db::{Chapter, SourceDatabase, Volume};
 use crate::mail::{send_epubs, Attachment};
+use crate::postprocess::ProcessorRegistry;
 
-fn generate_cover(
-    volume_title: &str,
-    output_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut img = ImageReader::open("src/assets/cover.png")
-        .unwrap()
-        .decode()
-        .unwrap();
+/// Context for EPUB generation containing source metadata and processors
+pub struct EpubContext<'a> {
+    pub source: &'a SourceConfig,
+    pub processor_registry: &'a ProcessorRegistry,
+}
 
-    let font = Vec::from(include_bytes!("font/RobotoSlab-VariableFont_wght.ttf") as &[u8]);
-    let font = Font::try_from_vec(font).unwrap();
+/// Load font for cover text rendering
+fn load_font() -> Option<Font<'static>> {
+    let font_data = std::fs::read("src/font/RobotoSlab-VariableFont_wght.ttf").ok()?;
+    Font::try_from_vec(font_data)
+}
 
+/// Calculate the width of rendered text
+fn text_width(font: &Font, scale: Scale, text: &str) -> i32 {
+    let glyphs: Vec<_> = font
+        .layout(text, scale, rusttype::point(0.0, 0.0))
+        .collect();
+    if glyphs.is_empty() {
+        return 0;
+    }
+    let min_x = glyphs
+        .first()
+        .and_then(|g| g.pixel_bounding_box())
+        .map(|bb| bb.min.x)
+        .unwrap_or(0);
+    let max_x = glyphs
+        .last()
+        .and_then(|g| g.pixel_bounding_box())
+        .map(|bb| bb.max.x)
+        .unwrap_or(0);
+    max_x - min_x
+}
+
+/// Draw a semi-transparent overlay rectangle
+fn draw_overlay(img: &mut RgbaImage, y_start: u32, height: u32, opacity: u8) {
+    let width = img.width();
+    for y in y_start..(y_start + height).min(img.height()) {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            // Blend with dark overlay
+            let alpha = opacity as f32 / 255.0;
+            pixel[0] = ((pixel[0] as f32) * (1.0 - alpha)) as u8;
+            pixel[1] = ((pixel[1] as f32) * (1.0 - alpha)) as u8;
+            pixel[2] = ((pixel[2] as f32) * (1.0 - alpha)) as u8;
+        }
+    }
+}
+
+/// Generate cover image with title text overlay
+fn generate_cover_with_text(
+    source: &SourceConfig,
+    series_title: &str,
+    subtitle: &str,
+) -> Option<Vec<u8>> {
+    let cover_path = source.metadata.cover_image.as_ref()?;
+
+    let img = ImageReader::open(cover_path).ok()?.decode().ok()?;
+    let font = load_font()?;
+
+    let mut img = img.to_rgba8();
+    let (width, height) = (img.width(), img.height());
+
+    // Calculate font sizes based on image dimensions
+    let title_scale = Scale::uniform((width as f32 * 0.08).clamp(24.0, 72.0));
+    let subtitle_scale = Scale::uniform((width as f32 * 0.05).clamp(16.0, 48.0));
+
+    // Calculate text positions (centered, bottom portion of image)
+    let title_width = text_width(&font, title_scale, series_title);
+    let subtitle_width = text_width(&font, subtitle_scale, subtitle);
+
+    let title_x = ((width as i32 - title_width) / 2).max(10);
+    let subtitle_x = ((width as i32 - subtitle_width) / 2).max(10);
+
+    // Position text in the bottom third of the image
+    let text_area_height = (height as f32 * 0.2) as u32;
+    let overlay_y = height - text_area_height - 20;
+    let title_y = height - text_area_height;
+    let subtitle_y = title_y + (title_scale.y as u32) + 10;
+
+    // Draw semi-transparent overlay for text readability
+    draw_overlay(&mut img, overlay_y, text_area_height + 40, 180);
+
+    // Draw title text (white)
+    let white = Rgba([255u8, 255u8, 255u8, 255u8]);
     draw_text_mut(
         &mut img,
-        Rgba([255, 255, 60, 255]),
-        15,
-        112,
-        Scale::uniform(30.0),
+        white,
+        title_x,
+        title_y as i32,
+        title_scale,
         &font,
-        volume_title,
+        series_title,
     );
-    std::fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(format!("{}.png", &volume_title));
-    img.save(&path)?;
-    Ok(path)
+    draw_text_mut(
+        &mut img,
+        white,
+        subtitle_x,
+        subtitle_y as i32,
+        subtitle_scale,
+        &font,
+        subtitle,
+    );
+
+    // Encode to PNG
+    let mut img_bytes = Vec::new();
+    DynamicImage::ImageRgba8(img)
+        .write_to(
+            &mut Cursor::new(&mut img_bytes),
+            image::ImageOutputFormat::Png,
+        )
+        .ok()?;
+
+    Some(img_bytes)
 }
 
 fn load_stylesheet() -> String {
@@ -49,68 +135,50 @@ fn load_stylesheet() -> String {
     contents
 }
 
-fn strip_chapter_colour(chapter_data: &str) -> String {
-    let re = Regex::new(r#"<span style="color:\s*(#......).*?">(.*?)</span>"#).unwrap();
-    re.replace_all(chapter_data, |captures: &regex::Captures| {
-        let colour_arr = hex::decode(&captures[1][1..]).unwrap();
-        let name = Color::similar([colour_arr[0], colour_arr[1], colour_arr[2]]);
-        format!(
-            "<span>&lt;{a}|{b}|{a}&gt;</span>",
-            a = name,
-            b = &captures[2]
-        )
-    })
-    .to_string()
-}
+fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -> String {
+    // Always apply mrsha-write processor
+    let mut processed = ctx.processor_registry.apply(raw_data, "mrsha-write");
 
-fn replace_mrsha_write(chapter_data: &str) -> String {
-    let re = Regex::new(r#"<span.*?mrsha-write.*?>(.*?)</span>"#).unwrap();
-    re.replace_all(chapter_data, |captures: &regex::Captures| {
-        format!("<em>{}</em>", &captures[1])
-    })
-    .to_string()
+    // Optionally apply strip-colour
+    if strip_colour {
+        processed = ctx.processor_registry.apply(&processed, "strip-colour");
+    }
+
+    processed
 }
 
 fn generate_chapter(
-    db_conn: &Connection,
-    chapter: &db::Chapter,
+    db: &SourceDatabase,
+    chapter: &Chapter,
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
     std::fs::create_dir_all(output_dir.join("individual"))?;
 
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    epub.metadata("author", "pirate aba")?;
+    epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
     epub.metadata("title", &chapter.name)?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
 
-    let cover_img = generate_cover(
-        &format!("Chapter {}", chapter.name),
-        &output_dir.join("..").join("covers"),
-    );
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    epub.add_cover_image(
-        output_dir.join(format!("{}({}).png", chapter.id, chapter.name)),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &chapter.name) {
+        epub.add_cover_image(
+            format!("{}({}).png", chapter.id, chapter.name),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-    if strip_colour {
-        raw_data = strip_chapter_colour(&raw_data);
-    }
+    let raw_data = db.get_chapter_data(chapter.id)?;
+    let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
     epub.add_content(
         EpubContent::new(
             format!("{}({}).xhtml", &chapter.id, &chapter.name),
-            raw_data.as_bytes(),
+            processed_data.as_bytes(),
         )
         .title(&chapter.name),
     )?;
@@ -129,9 +197,10 @@ fn generate_chapter(
 }
 
 fn generate_chapters(
-    db_conn: &Connection,
-    chapters: &Vec<db::Chapter>,
+    db: &SourceDatabase,
+    chapters: &[Chapter],
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Vec<Attachment>, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir.join("combined"))?;
@@ -143,59 +212,54 @@ fn generate_chapters(
     let mut combined_output = Vec::<u8>::new();
     let last_chapter = chapters.last().unwrap();
     let mut combined_epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    combined_epub.metadata("author", "pirate aba")?;
+    combined_epub.metadata("author", &ctx.source.metadata.author)?;
     combined_epub.metadata("lang", "en")?;
     combined_epub.metadata(
         "title",
         format!(
-            "The Wandering Inn Chapters {}-{}",
-            chapters[0].name, last_chapter.name
+            "{} Chapters {}-{}",
+            ctx.source.name, chapters[0].name, last_chapter.name
         ),
     )?;
     combined_epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     combined_epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let cover_img = generate_cover(
-        &format!("Chapters {}-{}", chapters[0].name, last_chapter.name),
-        &output_dir.join("..").join("covers"),
-    );
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    combined_epub.add_cover_image(
-        output_dir.join(format!(
-            "{}({})-{}({}).png",
-            chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
-        )),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    let chapters_subtitle = format!("{} - {}", chapters[0].name, last_chapter.name);
+    if let Some(img_bytes) =
+        generate_cover_with_text(ctx.source, &ctx.source.name, &chapters_subtitle)
+    {
+        combined_epub.add_cover_image(
+            format!(
+                "{}({})-{}({}).png",
+                chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
+            ),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
     combined_epub.inline_toc();
 
     let mut attachments = Vec::<Attachment>::new();
 
     for chapter in chapters {
-        let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-        if strip_colour {
-            raw_data = strip_chapter_colour(&raw_data);
-        }
+        let raw_data = db.get_chapter_data(chapter.id)?;
+        let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
         combined_epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, chapter.name),
-                raw_data.as_bytes(),
+                processed_data.as_bytes(),
             )
             .title(&chapter.name),
         )?;
         attachments.push(generate_chapter(
-            db_conn,
+            db,
             chapter,
             output_dir,
+            ctx,
             strip_colour,
         )?);
-        db::update_generated_chapter(db_conn, chapter.id, false)?;
+        db.update_generated_chapter(chapter.id, false)?;
     }
 
     combined_epub.generate(&mut combined_output)?;
@@ -209,45 +273,40 @@ fn generate_chapters(
 }
 
 fn generate_volume(
-    db_conn: &Connection,
-    volume: &db::Volume,
-    chapters: &Vec<db::Chapter>,
+    db: &SourceDatabase,
+    volume: &Volume,
+    chapters: &[Chapter],
     output_dir: &Path,
+    ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
 
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
-    epub.metadata("author", "pirate aba")?;
+    epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
-    epub.metadata("title", format!("The Wandering Inn {}", &volume.name))?;
+    epub.metadata("title", format!("{} {}", ctx.source.name, &volume.name))?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
-    let cover_img = generate_cover(&volume.name, &output_dir.join("..").join("covers"));
-    let img_file = ImageReader::open(cover_img?)?.decode()?;
-    let mut img_bytes = Vec::new();
-    img_file.write_to(
-        &mut Cursor::new(&mut img_bytes),
-        image::ImageOutputFormat::Png,
-    )?;
-    epub.add_cover_image(
-        output_dir.join(format!("{}.png", &volume.name)),
-        img_bytes.as_slice(),
-        "image/png",
-    )?;
+    if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &volume.name) {
+        epub.add_cover_image(
+            format!("{}.png", &volume.name),
+            img_bytes.as_slice(),
+            "image/png",
+        )?;
+    }
 
     epub.inline_toc();
 
     for chapter in chapters {
-        let mut raw_data = replace_mrsha_write(&db::get_chapter_data(db_conn, chapter.id)?);
-        if strip_colour {
-            raw_data = strip_chapter_colour(&raw_data);
-        }
+        let raw_data = db.get_chapter_data(chapter.id)?;
+        let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
+
         epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, chapter.name),
-                raw_data.as_bytes(),
+                processed_data.as_bytes(),
             )
             .title(&chapter.name),
         )?;
@@ -269,71 +328,93 @@ fn generate_volume(
     })
 }
 
-pub async fn generate_epubs(
-    db_conn: &Connection,
+/// Generate EPUBs for a specific source
+pub async fn generate_epubs_for_source(
+    db: &SourceDatabase,
     build_dir: &Path,
-    config: &config::Config,
+    config: &Config,
+    source: &SourceConfig,
+    processor_registry: &ProcessorRegistry,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = EpubContext {
+        source,
+        processor_registry,
+    };
+
+    // Create source-specific output directory
+    let source_dir = build_dir.join(&source.id);
+
     let mut vols = Vec::<Attachment>::new();
     let mut vols_stripped = Vec::<Attachment>::new();
     let mut chaps = Vec::<Attachment>::new();
     let mut chaps_stripped = Vec::<Attachment>::new();
 
     if config.epub_gen.volumes {
-        let volumes = db::get_volumes_to_regenerate(db_conn)?;
+        let volumes = db.get_volumes_to_regenerate()?;
 
         if volumes.is_empty() {
-            println!("No volumes to generate");
+            println!("({}) No volumes to generate", source.id);
         } else {
-            println!("Generating epubs for {} volumes", volumes.len());
+            println!(
+                "({}) Generating epubs for {} volumes",
+                source.id,
+                volumes.len()
+            );
         }
 
         for volume in volumes {
-            println!("Generating epub for {}", volume.name);
-            let chapters = db::get_chapters_by_volume(db_conn, volume.id)?;
+            println!("({}) Generating epub for {}", source.id, volume.name);
+            let chapters = db.get_chapters_by_volume(volume.id)?;
             if config.epub_gen.strip_colour {
-                vols.push(generate_volume(
-                    db_conn,
+                vols_stripped.push(generate_volume(
+                    db,
                     &volume,
                     &chapters,
-                    &build_dir.join("volumes_stripped_colour"),
+                    &source_dir.join("volumes_stripped_colour"),
+                    &ctx,
                     true,
                 )?);
             }
-            vols_stripped.push(generate_volume(
-                db_conn,
+            vols.push(generate_volume(
+                db,
                 &volume,
                 &chapters,
-                &build_dir.join("volumes"),
+                &source_dir.join("volumes"),
+                &ctx,
                 false,
             )?);
-            db::update_generated_volume(db_conn, volume.id, false)?;
+            db.update_generated_volume(volume.id, false)?;
         }
     } else {
-        println!("Skipping volume generation");
+        println!("({}) Skipping volume generation", source.id);
     }
 
     if config.epub_gen.chapters {
-        let chapters = db::get_chapters_to_regenerate(db_conn)?;
+        let chapters = db.get_chapters_to_regenerate()?;
         if chapters.is_empty() {
-            println!("No chapters to generate");
-            return Ok(());
+            println!("({}) No chapters to generate", source.id);
+        } else {
+            println!(
+                "({}) Generating epubs for {} chapters",
+                source.id,
+                chapters.len()
+            );
+            if config.epub_gen.strip_colour {
+                chaps_stripped = generate_chapters(
+                    db,
+                    &chapters,
+                    &source_dir.join("chapters_stripped_colour"),
+                    &ctx,
+                    true,
+                )?;
+            }
+            chaps = generate_chapters(db, &chapters, &source_dir.join("chapters"), &ctx, false)?;
         }
-        println!("Generating epubs for {} chapters", chapters.len());
-        if config.epub_gen.strip_colour {
-            chaps_stripped = generate_chapters(
-                db_conn,
-                &chapters,
-                &build_dir.join("chapters_stripped_colour"),
-                true,
-            )?;
-        }
-        chaps = generate_chapters(db_conn, &chapters, &build_dir.join("chapters"), false)?;
     } else {
-        println!("Skipping chapter generation");
+        println!("({}) Skipping chapter generation", source.id);
     }
 
-    send_epubs(&config.mail, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
+    send_epubs(&config.mail, &source.id, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
 
     Ok(())
 }

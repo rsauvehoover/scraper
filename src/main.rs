@@ -1,46 +1,151 @@
 use std::path::Path;
 
+use clap::Parser;
+
 mod config;
 mod db;
 mod epub;
+mod error;
 mod mail;
-mod scraper;
+mod postprocess;
+mod sources;
+
+use db::{migration, SourceDatabase};
+use postprocess::ProcessorRegistry;
+use sources::{ScraperClient, ScraperRegistry};
+
+/// Multi-source web serial scraper
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Process only the specified source ID
+    #[arg(short, long)]
+    source: Option<String>,
+
+    /// Skip downloading new chapters
+    #[arg(long)]
+    skip_download: bool,
+
+    /// Skip EPUB generation
+    #[arg(long)]
+    skip_epub: bool,
+
+    /// Skip index update
+    #[arg(long)]
+    skip_index: bool,
+}
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
     let config = config::load_config();
 
-    let conn = match db::open() {
-        Ok(conn) => conn,
-        Err(e) => {
-            panic!("Error opening database: {}", e);
+    // Migrate legacy database if needed
+    if migration::needs_migration() {
+        match migration::migrate_legacy_database() {
+            Ok(migrated) => {
+                if migrated {
+                    println!("Legacy database migrated successfully");
+                }
+            }
+            Err(e) => {
+                panic!("Error migrating legacy database: {}", e);
+            }
         }
+    }
+
+    // Initialize registries
+    let scraper_registry = ScraperRegistry::from_config(&config);
+    let processor_registry = ProcessorRegistry::new();
+    let client = ScraperClient::new().expect("Failed to create HTTP client");
+
+    // Determine which sources to process
+    let sources_to_process: Vec<_> = if let Some(ref source_id) = args.source {
+        config
+            .enabled_sources()
+            .filter(|s| s.id == *source_id)
+            .collect()
+    } else {
+        config.enabled_sources().collect()
     };
 
-    let client = match scraper::build_client().await {
-        Ok(client) => client,
-        Err(e) => panic!("Error building request client: {}", e),
-    };
-
-    match scraper::update_index(&conn, &config.toc_url, &client).await {
-        Ok(_) => (),
-        Err(e) => panic!("Error updating index: {}", e),
+    if sources_to_process.is_empty() {
+        if let Some(ref source_id) = args.source {
+            panic!("Source '{}' not found or not enabled", source_id);
+        } else {
+            println!("No enabled sources found");
+            return;
+        }
     }
 
-    match scraper::download_all_chapters(
-        &conn,
-        &config.request_delay,
-        &config.patreon_name,
-        &client,
-    )
-    .await
-    {
-        Ok(_) => (),
-        Err(e) => panic!("Error getting chapters: {}", e),
+    // Process each source
+    for source in sources_to_process {
+        println!(
+            "\n=== Processing source: {} ({}) ===",
+            source.name, source.id
+        );
+
+        // Open database for this source
+        let db = match SourceDatabase::open(&source.id) {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Error opening database for {}: {}", source.id, e);
+                continue;
+            }
+        };
+
+        // Get scraper for this source
+        let scraper = match scraper_registry.get(&source.id) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Error getting scraper for {}: {}", source.id, e);
+                continue;
+            }
+        };
+
+        // Update index
+        if !args.skip_index {
+            if let Err(e) = client.update_index(&scraper, &db).await {
+                println!("Error updating index for {}: {}", source.id, e);
+                continue;
+            }
+        } else {
+            println!("({}) Skipping index update", source.id);
+        }
+
+        // Download chapters
+        if !args.skip_download {
+            if let Err(e) = client
+                .download_all_chapters(&scraper, &db, config.request_delay)
+                .await
+            {
+                println!("Error downloading chapters for {}: {}", source.id, e);
+                continue;
+            }
+        } else {
+            println!("({}) Skipping chapter download", source.id);
+        }
+
+        // Generate EPUBs
+        if !args.skip_epub {
+            if let Err(e) = epub::generate_epubs_for_source(
+                &db,
+                Path::new("build/"),
+                &config,
+                source,
+                &processor_registry,
+            )
+            .await
+            {
+                println!("Error generating EPUBs for {}: {}", source.id, e);
+                continue;
+            }
+        } else {
+            println!("({}) Skipping EPUB generation", source.id);
+        }
+
+        println!("({}) Done", source.id);
     }
 
-    match epub::generate_epubs(&conn, Path::new("build/"), &config).await {
-        Ok(_) => (),
-        Err(e) => panic!("Error generating epubs: {}", e),
-    }
+    println!("\n=== All sources processed ===");
 }
