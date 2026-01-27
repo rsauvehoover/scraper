@@ -79,58 +79,87 @@ impl ScraperClient {
     }
 
     /// Download all missing chapters for a source
+    /// This function loops until no more chapters are discovered (for paginated TOC sources)
     pub async fn download_all_chapters(
         &self,
         scraper: &Arc<dyn SourceScraper>,
         db: &SourceDatabase,
         delay_ms: u64,
     ) -> ScrapeResult<()> {
-        let chapters = db.get_empty_chapters()?;
-
-        if chapters.is_empty() {
-            println!("({}) No chapters to download", scraper.source_id());
-            return Ok(());
-        }
-
-        println!(
-            "({}) Downloading {} missing chapters",
-            scraper.source_id(),
-            chapters.len()
-        );
-
         let auth_headers = scraper.build_auth_headers();
-        let mut count = 0;
+        let mut total_downloaded = 0;
+        let mut total_discovered = 0;
 
-        for chapter in chapters {
-            if count % 10 == 0 && count != 0 {
-                println!("({}) Downloaded {} chapters", scraper.source_id(), count);
+        loop {
+            let chapters = db.get_empty_chapters()?;
+
+            if chapters.is_empty() {
+                if total_downloaded == 0 {
+                    println!("({}) No chapters to download", scraper.source_id());
+                }
+                break;
             }
 
-            if count > 0 {
-                sleep(Duration::from_millis(delay_ms)).await;
-            }
+            println!(
+                "({}) Downloading {} missing chapters",
+                scraper.source_id(),
+                chapters.len()
+            );
 
-            match self
-                .download_chapter(scraper, db, &chapter, auth_headers.as_ref())
-                .await
-            {
-                Ok(_) => count += 1,
-                Err(e) => {
-                    println!(
-                        "({}) Error downloading '{}': {}",
-                        scraper.source_id(),
-                        chapter.name,
-                        e
-                    );
+            let mut batch_count = 0;
+            let mut batch_discovered = 0;
+
+            for chapter in chapters {
+                if batch_count % 10 == 0 && batch_count != 0 {
+                    println!("({}) Downloaded {} chapters", scraper.source_id(), batch_count);
+                }
+
+                if batch_count > 0 {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                match self
+                    .download_chapter(scraper, db, &chapter, auth_headers.as_ref())
+                    .await
+                {
+                    Ok(discovered) => {
+                        batch_count += 1;
+                        batch_discovered += discovered;
+                    }
+                    Err(e) => {
+                        println!(
+                            "({}) Error downloading '{}': {}",
+                            scraper.source_id(),
+                            chapter.name,
+                            e
+                        );
+                    }
                 }
             }
+
+            total_downloaded += batch_count;
+            total_discovered += batch_discovered;
+
+            // If we discovered new chapters, loop again to download them
+            if batch_discovered == 0 {
+                break;
+            }
+
+            println!(
+                "({}) Discovered {} new chapters, continuing download...",
+                scraper.source_id(),
+                batch_discovered
+            );
         }
 
-        println!(
-            "({}) Done downloading {} chapters",
-            scraper.source_id(),
-            count
-        );
+        if total_downloaded > 0 {
+            println!(
+                "({}) Done downloading {} chapters (discovered {} via next-chapter links)",
+                scraper.source_id(),
+                total_downloaded,
+                total_discovered
+            );
+        }
         Ok(())
     }
 
@@ -140,7 +169,7 @@ impl ScraperClient {
         db: &SourceDatabase,
         chapter: &crate::db::Chapter,
         auth_headers: Option<&Vec<(String, String)>>,
-    ) -> ScrapeResult<()> {
+    ) -> ScrapeResult<usize> {
         let html = self.get_html(&chapter.uri, auth_headers).await?;
         let content = scraper.parse_chapter(&html, &chapter.name).await?;
 
@@ -151,7 +180,7 @@ impl ScraperClient {
                 chapter.name
             );
             db.remove_chapter(chapter.id)?;
-            return Ok(());
+            return Ok(0);
         }
 
         // Apply strip-links post-processor during download
@@ -163,7 +192,42 @@ impl ScraperClient {
         };
 
         db.add_chapter_data(chapter.id, &processed_html)?;
-        Ok(())
+
+        // Handle chapter discovery: if there's a next chapter URL, add it to the database
+        let mut discovered = 0;
+        if let Some(next_url) = &content.next_chapter_url {
+            // Use the next chapter title if available, otherwise generate a placeholder
+            let next_title = content
+                .next_chapter_title
+                .clone()
+                .unwrap_or_else(|| format!("Chapter (discovered from {})", chapter.name));
+
+            // Get the volume name from the current chapter
+            let volume_name = db
+                .get_volume_name(chapter.volume_id)
+                .unwrap_or_else(|_| "Main Story".to_string());
+
+            match db.add_discovered_chapter(&next_title, next_url, &volume_name) {
+                Ok(true) => {
+                    println!(
+                        "({}) Discovered new chapter: {}",
+                        scraper.source_id(),
+                        next_url
+                    );
+                    discovered = 1;
+                }
+                Ok(false) => {} // Chapter already exists
+                Err(e) => {
+                    println!(
+                        "({}) Error adding discovered chapter: {}",
+                        scraper.source_id(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(discovered)
     }
 }
 

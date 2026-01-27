@@ -5,6 +5,7 @@ use crate::config::{Config, SourceConfig};
 use crate::error::{ScrapeError, ScrapeResult};
 
 use super::generic::GenericScraper;
+use super::royal_road::RoyalRoadScraper;
 use super::traits::SourceScraper;
 use super::wandering_inn::WanderingInnScraper;
 
@@ -37,6 +38,9 @@ impl ScraperRegistry {
     fn create_scraper(source: &SourceConfig) -> Arc<dyn SourceScraper> {
         match source.id.as_str() {
             "wandering-inn" => Arc::new(WanderingInnScraper::new(source.clone())),
+            id if id.starts_with("royal-road") => {
+                Arc::new(RoyalRoadScraper::new(source.clone()))
+            }
             _ => Arc::new(GenericScraper::new(source.clone())),
         }
     }
