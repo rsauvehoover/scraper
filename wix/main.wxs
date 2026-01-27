@@ -110,9 +110,6 @@
                             <File Id="stylesheet" Name="style.css" DiskId="1" Source="src\assets\style.css" KeyPath="yes" />
                         </Component>
 
-                        <Component Id="cover" Guid="*">
-                            <File Id="cover" Name="cover.png" DiskId="1" Source="src\assets\cover.png" KeyPath="yes" />
-                        </Component>
                       </Directory>
                     </Directory>
 
@@ -147,7 +144,6 @@
 
             <ComponentRef Id='stylesheet'/>
 
-            <ComponentRef Id='cover'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
