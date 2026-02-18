@@ -208,6 +208,18 @@ impl SourceScraper for RoyalRoadScraper {
             ScrapeError::ContentNotFound("Chapter content element not found".to_string())
         })?;
 
+        // Extract style tags that hide injected elements (Royal Road uses display:none to hide them)
+        let hidden_styles: String = soup
+            .tag("style")
+            .find_all()
+            .filter(|style| {
+                let text = style.text();
+                text.contains("display:none") || text.contains("display: none")
+            })
+            .map(|style| style.display())
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // Extract next chapter link from <link rel="next"> in head
         let next_chapter_url = soup
             .tag("link")
@@ -233,7 +245,7 @@ impl SourceScraper for RoyalRoadScraper {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| title.to_string());
 
-        // Build XHTML document
+        // Build XHTML document, including hidden style tags to suppress injected elements
         let header = format!(
             r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
@@ -244,9 +256,13 @@ impl SourceScraper for RoyalRoadScraper {
 <meta name="classification" content="Fantasy" />
 <title>{}</title>
 <link rel="stylesheet" href="style.css" type = "text/css" />
+{}
 </head>
 <body>"#,
-            self.config.metadata.author, self.config.metadata.description, self.config.name
+            self.config.metadata.author,
+            self.config.metadata.description,
+            self.config.name,
+            hidden_styles
         );
 
         let chapter_heading = format!("<h1>{}</h1>", chapter_title);

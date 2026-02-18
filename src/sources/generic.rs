@@ -174,7 +174,7 @@ impl SourceScraper for GenericScraper {
                     .as_millis();
 
                 let cookie = format!(
-                    "patreon_verified=1; patreon_verified_time={}; patreon_patron_status=active_patron; patreon_user_name={};",
+                    "patreon_tier_cents=500; patreon_verified=1; patreon_verified_time={}; patreon_patron_status=active_patron; patreon_user_name={};",
                     epoch_stamp, patreon_name
                 );
 

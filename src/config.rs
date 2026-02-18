@@ -363,7 +363,7 @@ pub fn load_config() -> Config {
                             config.epub_gen.chapters = true;
                         }
                     } else {
-                        for (source_id, _) in &dest.sources {
+                        for source_id in dest.sources.keys() {
                             let resolved = dest.source_config(source_id);
                             if resolved.strip_colour {
                                 config.epub_gen.strip_colour = true;
