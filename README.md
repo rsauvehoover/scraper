@@ -1,4 +1,4 @@
-# wandering_inn_scraper
+# scraper
 
 ## Description
 
