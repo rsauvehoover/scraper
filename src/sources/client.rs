@@ -93,6 +93,27 @@ impl ScraperClient {
         Ok(body)
     }
 
+    /// Fetch HTML like get_html, but fail on non-success HTTP status.
+    /// Used by the seed path, where the URL is user-typed.
+    async fn get_html_checked(
+        &self,
+        url: &str,
+        auth_headers: Option<&Vec<(String, String)>>,
+    ) -> ScrapeResult<String> {
+        let mut request = self.client.get(url).header(USER_AGENT, "reqwest");
+        if let Some(headers) = auth_headers {
+            for (name, value) in headers {
+                if name.to_lowercase() == "cookie" {
+                    request = request.header(COOKIE, HeaderValue::from_str(value).unwrap());
+                }
+            }
+        }
+        let resp = request.send().await.map_err(ScrapeError::Http)?;
+        let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
+        let body = resp.text().await.map_err(ScrapeError::Http)?;
+        Ok(body)
+    }
+
     /// Update the index (table of contents) for a source
     pub async fn update_index(
         &self,
@@ -148,14 +169,16 @@ impl ScraperClient {
             return Ok(());
         }
 
+        // Always fetch, even when a title override is supplied: this is the
+        // only validation that a user-typed URL actually resolves before we
+        // seed it into the download/epub/mail pipeline.
+        let html = self
+            .get_html_checked(url, scraper.build_auth_headers().as_ref())
+            .await?;
+
         let title = match title_override {
             Some(t) => t.to_string(),
-            None => {
-                let html = self
-                    .get_html(url, scraper.build_auth_headers().as_ref())
-                    .await?;
-                extract_page_title(&html).unwrap_or_else(|| title_from_slug(url))
-            }
+            None => extract_page_title(&html).unwrap_or_else(|| title_from_slug(url)),
         };
 
         let volume_name = match volume_override {
