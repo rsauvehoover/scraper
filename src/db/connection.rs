@@ -219,7 +219,7 @@ impl SourceDatabase {
         let existing: Option<(usize, String, Option<usize>)> = self
             .conn
             .query_row(
-                "SELECT id, name, volumeid FROM chapters WHERE uri IN (?1, ?2) LIMIT 1",
+                "SELECT id, name, volumeid FROM chapters WHERE uri IN (?1, ?2) ORDER BY id LIMIT 1",
                 [with_slash.as_str(), without_slash.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -489,5 +489,32 @@ mod tests {
         let rows = all_chapters(&db);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].4, 0);
+    }
+
+    #[test]
+    fn upsert_ignores_update_that_would_collide_with_unique_constraint() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        // Legacy duplicate rows: same uri and volume, distinct names, which
+        // the UNIQUE(name, uri, volumeid) constraint permits.
+        db.add_chapter("Chapter A", "https://example.com/chapter-1/", vol)
+            .unwrap();
+        db.add_chapter("Chapter B", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        // The lookup picks the lower-id row ("Chapter A"); renaming it to
+        // "Chapter B" would collide with the second row's UNIQUE tuple, so
+        // OR IGNORE must skip the update entirely.
+        db.upsert_chapter_from_toc("Chapter B", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 2, "no row should be inserted or removed");
+        assert_eq!(rows[0].0, "Chapter A", "collision must leave the row untouched");
+        assert_eq!(rows[1].0, "Chapter B");
+        for row in &rows {
+            assert!(row.3.is_none(), "no data should be attached");
+            assert_eq!(row.4, 0, "regenerate flag must not be set");
+        }
     }
 }
