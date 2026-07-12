@@ -66,7 +66,7 @@ impl ScraperClient {
 
         for chapter in chapters {
             let volume_id = db.add_volume(&chapter.volume_name)?;
-            db.add_chapter(&chapter.title, &chapter.uri, volume_id)?;
+            db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
             *volume_counts
                 .entry(chapter.volume_name.clone())
                 .or_insert(0) += 1;

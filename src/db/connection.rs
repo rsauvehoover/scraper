@@ -203,6 +203,45 @@ impl SourceDatabase {
         Ok(true)
     }
 
+    /// Insert a chapter from the TOC, or update the existing row with the
+    /// same URI (trailing-slash insensitive) in place.
+    ///
+    /// Preserves data_id and never touches regenerate_epub, so a
+    /// title/volume correction for a manually pulled or discovered chapter
+    /// does not trigger a re-download or re-send.
+    pub fn upsert_chapter_from_toc(
+        &self,
+        name: &str,
+        uri: &str,
+        volume_id: usize,
+    ) -> Result<()> {
+        let (with_slash, without_slash) = uri_variants(uri);
+        let existing: Option<(usize, String, Option<usize>)> = self
+            .conn
+            .query_row(
+                "SELECT id, name, volumeid FROM chapters WHERE uri IN (?1, ?2) LIMIT 1",
+                [with_slash.as_str(), without_slash.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        match existing {
+            Some((id, existing_name, existing_volume)) => {
+                if existing_name != name || existing_volume != Some(volume_id) {
+                    // OR IGNORE: pre-existing duplicate rows could collide
+                    // with UNIQUE(name, uri, volumeid)
+                    self.conn
+                        .prepare(
+                            "UPDATE OR IGNORE chapters SET name = ?1, volumeid = ?2 WHERE id = ?3",
+                        )?
+                        .execute((name, volume_id, id))?;
+                }
+                Ok(())
+            }
+            None => self.add_chapter(name, uri, volume_id),
+        }
+    }
+
     /// Add or update chapter data
     pub fn add_chapter_data(&self, chapter_id: usize, data: &str) -> Result<()> {
         let existing_data: String = self
@@ -369,5 +408,86 @@ mod tests {
 
         let latest = db.get_latest_volume().unwrap().unwrap();
         assert_eq!(latest.name, "Volume 2");
+    }
+
+    fn all_chapters(db: &SourceDatabase) -> Vec<(String, String, Option<usize>, Option<usize>, usize)> {
+        db.connection()
+            .prepare("SELECT name, uri, volumeid, data_id, regenerate_epub FROM chapters ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn upsert_inserts_when_uri_absent() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "Chapter 1");
+        assert_eq!(rows[0].2, Some(vol));
+    }
+
+    #[test]
+    fn upsert_updates_existing_row_without_resend() {
+        let db = test_db();
+        let vol1 = db.add_volume("Volume 1").unwrap();
+        // Simulate a manual pull: placeholder-ish title, trailing slash,
+        // guessed volume, content already downloaded and sent.
+        db.add_chapter("parsed title", "https://example.com/chapter-1/", vol1)
+            .unwrap();
+        let id: usize = db
+            .connection()
+            .query_row(
+                "SELECT id FROM chapters WHERE uri = ?1",
+                ["https://example.com/chapter-1/"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.add_chapter_data(id, "<html>content</html>").unwrap();
+        // Simulate the epub having been generated and sent already
+        db.update_generated_chapter(id, false).unwrap();
+        db.update_generated_volume(vol1, false).unwrap();
+
+        // TOC catches up: real title, no trailing slash, different volume
+        let vol2 = db.add_volume("Volume 2").unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1", vol2)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1, "TOC sync must not create a duplicate row");
+        let (name, _uri, volumeid, data_id, regenerate) = rows[0].clone();
+        assert_eq!(name, "Chapter 1");
+        assert_eq!(volumeid, Some(vol2));
+        assert!(data_id.is_some(), "downloaded content must be preserved");
+        assert_eq!(regenerate, 0, "correction must not trigger a re-send");
+    }
+
+    #[test]
+    fn upsert_is_noop_when_row_matches_toc() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].4, 0);
     }
 }
