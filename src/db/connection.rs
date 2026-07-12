@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 
 use super::models::{Chapter, Volume};
 
+/// Return both trailing-slash variants of a URI for slash-insensitive matching
+fn uri_variants(uri: &str) -> (String, String) {
+    let without = uri.trim_end_matches('/').to_string();
+    let with = format!("{}/", without);
+    (with, without)
+}
+
 /// Database connection for a specific source
 pub struct SourceDatabase {
     conn: Connection,
@@ -27,6 +34,19 @@ impl SourceDatabase {
             db_path,
         };
 
+        db.initialize_schema()?;
+        Ok(db)
+    }
+
+    /// Open an in-memory database for tests
+    #[cfg(test)]
+    pub fn open_in_memory(source_id: &str) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let db = SourceDatabase {
+            conn,
+            source_id: source_id.to_string(),
+            db_path: PathBuf::new(),
+        };
         db.initialize_schema()?;
         Ok(db)
     }
@@ -128,6 +148,22 @@ impl SourceDatabase {
         )
     }
 
+    /// Get the most recently added volume (highest id)
+    pub fn get_latest_volume(&self) -> Result<Option<Volume>> {
+        self.conn
+            .query_row(
+                "SELECT id, name FROM volumes ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(Volume {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     /// Add a chapter to the database
     pub fn add_chapter(&self, name: &str, uri: &str, volume_id: usize) -> Result<()> {
         self.conn
@@ -144,11 +180,12 @@ impl SourceDatabase {
         Ok(())
     }
 
-    /// Check if a chapter exists by URI
+    /// Check if a chapter exists by URI (trailing-slash insensitive)
     pub fn chapter_exists_by_uri(&self, uri: &str) -> Result<bool> {
+        let (with_slash, without_slash) = uri_variants(uri);
         let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chapters WHERE uri = ?1",
-            [uri],
+            "SELECT COUNT(*) FROM chapters WHERE uri IN (?1, ?2)",
+            [with_slash.as_str(), without_slash.as_str()],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -293,5 +330,44 @@ impl SourceDatabase {
                 })
             })?
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> SourceDatabase {
+        SourceDatabase::open_in_memory("test-source").unwrap()
+    }
+
+    #[test]
+    fn chapter_exists_by_uri_ignores_trailing_slash() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        assert!(db
+            .chapter_exists_by_uri("https://example.com/chapter-1/")
+            .unwrap());
+        assert!(db
+            .chapter_exists_by_uri("https://example.com/chapter-1")
+            .unwrap());
+        assert!(!db
+            .chapter_exists_by_uri("https://example.com/chapter-2")
+            .unwrap());
+    }
+
+    #[test]
+    fn get_latest_volume_returns_highest_id() {
+        let db = test_db();
+        assert!(db.get_latest_volume().unwrap().is_none());
+
+        db.add_volume("Volume 1").unwrap();
+        db.add_volume("Volume 2").unwrap();
+
+        let latest = db.get_latest_volume().unwrap().unwrap();
+        assert_eq!(latest.name, "Volume 2");
     }
 }
