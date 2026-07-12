@@ -2,11 +2,58 @@ use reqwest::{header::HeaderValue, header::COOKIE, header::USER_AGENT, Client};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use soup::prelude::*;
 
 use crate::db::SourceDatabase;
 use crate::error::{ScrapeError, ScrapeResult};
 
 use super::traits::SourceScraper;
+
+/// Extract a chapter title from a chapter page, best effort.
+/// The TOC upsert corrects the name later, so this only needs to be
+/// good enough for the immediately generated epub.
+fn extract_page_title(html: &str) -> Option<String> {
+    let soup = Soup::new(html);
+
+    // WordPress-style entry title (used by wanderinginn.com)
+    let entry_title = soup.tag("h1").find_all().find(|h| {
+        h.get("class")
+            .map_or(false, |c| c.split_whitespace().any(|c| c == "entry-title"))
+    });
+    if let Some(h1) = entry_title {
+        let title = h1.text().trim().to_string();
+        if !title.is_empty() {
+            return Some(title);
+        }
+    }
+
+    // Fall back to <title>, trimmed at the site-name separator
+    let page_title = soup.tag("title").find().map(|t| t.text())?;
+    let page_title = page_title.trim();
+    for sep in [" \u{2013} ", " \u{2014} ", " | ", " - "] {
+        if let Some(idx) = page_title.find(sep) {
+            let title = page_title[..idx].trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+
+    if page_title.is_empty() {
+        None
+    } else {
+        Some(page_title.to_string())
+    }
+}
+
+/// Derive a placeholder title from the last URL path segment
+fn title_from_slug(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(url)
+        .replace('-', " ")
+}
 
 /// HTTP client wrapper for scraping operations
 pub struct ScraperClient {
@@ -243,5 +290,46 @@ impl ScraperClient {
 impl Default for ScraperClient {
     fn default() -> Self {
         Self::new().expect("Failed to create scraper client")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_wordpress_entry_title() {
+        let html = r#"<html><head><title>10.69 IN – Test Serial</title></head>
+            <body><h1 class="entry-title">10.69 IN</h1></body></html>"#;
+        assert_eq!(extract_page_title(html), Some("10.69 IN".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_title_tag_trimmed_at_separator() {
+        let html =
+            "<html><head><title>Chapter 5 | Example Site</title></head><body></body></html>";
+        assert_eq!(extract_page_title(html), Some("Chapter 5".to_string()));
+    }
+
+    #[test]
+    fn uses_whole_title_tag_when_no_separator() {
+        let html = "<html><head><title>Chapter 5</title></head><body></body></html>";
+        assert_eq!(extract_page_title(html), Some("Chapter 5".to_string()));
+    }
+
+    #[test]
+    fn returns_none_without_any_title() {
+        assert_eq!(
+            extract_page_title("<html><body><p>hi</p></body></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn derives_placeholder_title_from_url_slug() {
+        assert_eq!(
+            title_from_slug("https://example.com/2026/07/05/10-69-in/"),
+            "10 69 in"
+        );
     }
 }
