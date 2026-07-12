@@ -30,6 +30,33 @@ cargo build --release
 cargo run --release
 ```
 
+## CLI flags
+
+Run with no flags to process every enabled source (index update, chapter download, EPUB generation, mail).
+
+| Flag | Description |
+|------|-------------|
+| `--source <id>` | Process only the specified source ID |
+| `--skip-download` | Skip downloading new chapters |
+| `--skip-epub` | Skip EPUB generation (also skips mail) |
+| `--skip-index` | Skip TOC index updates |
+| `--pull-chapter <URL>` | Seed a chapter that isn't on the TOC yet (requires `--source`) |
+| `--volume <NAME>` | Volume for `--pull-chapter` (default: latest volume in the DB) |
+| `--title <NAME>` | Title for `--pull-chapter` (default: parsed from the chapter page) |
+
+### Pulling a chapter early
+
+If a chapter is live but not yet listed on the source's table of contents, you can pull it directly:
+
+```bash
+cargo run --release -- --source my-serial --pull-chapter https://example.com/2026/07/05/chapter-10/
+```
+
+The chapter is downloaded, generated, and mailed like any other. When the TOC later lists it, the existing
+entry is matched by URL and updated in place, so the chapter is never duplicated or re-sent. Pass the URL
+in the same form the TOC will use (same scheme/host/path; a trailing-slash difference is tolerated).
+Re-running with an already-seeded URL is a no-op.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories
