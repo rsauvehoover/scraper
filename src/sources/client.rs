@@ -127,6 +127,57 @@ impl ScraperClient {
         Ok(())
     }
 
+    /// Seed a manually pulled chapter into the database ahead of the TOC.
+    /// The normal download/epub/mail pipeline picks it up afterwards; when
+    /// the TOC later lists the chapter, upsert_chapter_from_toc matches it
+    /// by URI so it is never duplicated or re-sent.
+    pub async fn seed_chapter(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
+        db: &SourceDatabase,
+        url: &str,
+        title_override: Option<&str>,
+        volume_override: Option<&str>,
+    ) -> ScrapeResult<()> {
+        if db.chapter_exists_by_uri(url)? {
+            println!(
+                "({}) Chapter already in database, skipping: {}",
+                scraper.source_id(),
+                url
+            );
+            return Ok(());
+        }
+
+        let title = match title_override {
+            Some(t) => t.to_string(),
+            None => {
+                let html = self
+                    .get_html(url, scraper.build_auth_headers().as_ref())
+                    .await?;
+                extract_page_title(&html).unwrap_or_else(|| title_from_slug(url))
+            }
+        };
+
+        let volume_name = match volume_override {
+            Some(v) => v.to_string(),
+            None => db
+                .get_latest_volume()?
+                .map(|v| v.name)
+                .unwrap_or_else(|| "Main Story".to_string()),
+        };
+
+        let volume_id = db.add_volume(&volume_name)?;
+        db.add_chapter(&title, url, volume_id)?;
+        println!(
+            "({}) Seeded chapter '{}' into {} ({})",
+            scraper.source_id(),
+            title,
+            volume_name,
+            url
+        );
+        Ok(())
+    }
+
     /// Download all missing chapters for a source
     /// This function loops until no more chapters are discovered (for paginated TOC sources)
     pub async fn download_all_chapters(
