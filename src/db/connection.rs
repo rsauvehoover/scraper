@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 
 use super::models::{Chapter, Volume};
 
+/// Return both trailing-slash variants of a URI for slash-insensitive matching
+fn uri_variants(uri: &str) -> (String, String) {
+    let without = uri.trim_end_matches('/').to_string();
+    let with = format!("{}/", without);
+    (with, without)
+}
+
 /// Database connection for a specific source
 pub struct SourceDatabase {
     conn: Connection,
@@ -27,6 +34,19 @@ impl SourceDatabase {
             db_path,
         };
 
+        db.initialize_schema()?;
+        Ok(db)
+    }
+
+    /// Open an in-memory database for tests
+    #[cfg(test)]
+    pub fn open_in_memory(source_id: &str) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let db = SourceDatabase {
+            conn,
+            source_id: source_id.to_string(),
+            db_path: PathBuf::new(),
+        };
         db.initialize_schema()?;
         Ok(db)
     }
@@ -128,6 +148,22 @@ impl SourceDatabase {
         )
     }
 
+    /// Get the most recently added volume (highest id)
+    pub fn get_latest_volume(&self) -> Result<Option<Volume>> {
+        self.conn
+            .query_row(
+                "SELECT id, name FROM volumes ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(Volume {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     /// Add a chapter to the database
     pub fn add_chapter(&self, name: &str, uri: &str, volume_id: usize) -> Result<()> {
         self.conn
@@ -144,11 +180,12 @@ impl SourceDatabase {
         Ok(())
     }
 
-    /// Check if a chapter exists by URI
+    /// Check if a chapter exists by URI (trailing-slash insensitive)
     pub fn chapter_exists_by_uri(&self, uri: &str) -> Result<bool> {
+        let (with_slash, without_slash) = uri_variants(uri);
         let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chapters WHERE uri = ?1",
-            [uri],
+            "SELECT COUNT(*) FROM chapters WHERE uri IN (?1, ?2)",
+            [with_slash.as_str(), without_slash.as_str()],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -164,6 +201,45 @@ impl SourceDatabase {
         let volume_id = self.add_volume(volume_name)?;
         self.add_chapter(name, uri, volume_id)?;
         Ok(true)
+    }
+
+    /// Insert a chapter from the TOC, or update the existing row with the
+    /// same URI (trailing-slash insensitive) in place.
+    ///
+    /// Preserves data_id and never touches regenerate_epub, so a
+    /// title/volume correction for a manually pulled or discovered chapter
+    /// does not trigger a re-download or re-send.
+    pub fn upsert_chapter_from_toc(
+        &self,
+        name: &str,
+        uri: &str,
+        volume_id: usize,
+    ) -> Result<()> {
+        let (with_slash, without_slash) = uri_variants(uri);
+        let existing: Option<(usize, String, Option<usize>)> = self
+            .conn
+            .query_row(
+                "SELECT id, name, volumeid FROM chapters WHERE uri IN (?1, ?2) ORDER BY id LIMIT 1",
+                [with_slash.as_str(), without_slash.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        match existing {
+            Some((id, existing_name, existing_volume)) => {
+                if existing_name != name || existing_volume != Some(volume_id) {
+                    // OR IGNORE: pre-existing duplicate rows could collide
+                    // with UNIQUE(name, uri, volumeid)
+                    self.conn
+                        .prepare(
+                            "UPDATE OR IGNORE chapters SET name = ?1, volumeid = ?2 WHERE id = ?3",
+                        )?
+                        .execute((name, volume_id, id))?;
+                }
+                Ok(())
+            }
+            None => self.add_chapter(name, uri, volume_id),
+        }
     }
 
     /// Add or update chapter data
@@ -293,5 +369,152 @@ impl SourceDatabase {
                 })
             })?
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> SourceDatabase {
+        SourceDatabase::open_in_memory("test-source").unwrap()
+    }
+
+    #[test]
+    fn chapter_exists_by_uri_ignores_trailing_slash() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        assert!(db
+            .chapter_exists_by_uri("https://example.com/chapter-1/")
+            .unwrap());
+        assert!(db
+            .chapter_exists_by_uri("https://example.com/chapter-1")
+            .unwrap());
+        assert!(!db
+            .chapter_exists_by_uri("https://example.com/chapter-2")
+            .unwrap());
+    }
+
+    #[test]
+    fn get_latest_volume_returns_highest_id() {
+        let db = test_db();
+        assert!(db.get_latest_volume().unwrap().is_none());
+
+        db.add_volume("Volume 1").unwrap();
+        db.add_volume("Volume 2").unwrap();
+
+        let latest = db.get_latest_volume().unwrap().unwrap();
+        assert_eq!(latest.name, "Volume 2");
+    }
+
+    fn all_chapters(db: &SourceDatabase) -> Vec<(String, String, Option<usize>, Option<usize>, usize)> {
+        db.connection()
+            .prepare("SELECT name, uri, volumeid, data_id, regenerate_epub FROM chapters ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn upsert_inserts_when_uri_absent() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "Chapter 1");
+        assert_eq!(rows[0].2, Some(vol));
+    }
+
+    #[test]
+    fn upsert_updates_existing_row_without_resend() {
+        let db = test_db();
+        let vol1 = db.add_volume("Volume 1").unwrap();
+        // Simulate a manual pull: placeholder-ish title, trailing slash,
+        // guessed volume, content already downloaded and sent.
+        db.add_chapter("parsed title", "https://example.com/chapter-1/", vol1)
+            .unwrap();
+        let id: usize = db
+            .connection()
+            .query_row(
+                "SELECT id FROM chapters WHERE uri = ?1",
+                ["https://example.com/chapter-1/"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.add_chapter_data(id, "<html>content</html>").unwrap();
+        // Simulate the epub having been generated and sent already
+        db.update_generated_chapter(id, false).unwrap();
+        db.update_generated_volume(vol1, false).unwrap();
+
+        // TOC catches up: real title, no trailing slash, different volume
+        let vol2 = db.add_volume("Volume 2").unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1", vol2)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1, "TOC sync must not create a duplicate row");
+        let (name, _uri, volumeid, data_id, regenerate) = rows[0].clone();
+        assert_eq!(name, "Chapter 1");
+        assert_eq!(volumeid, Some(vol2));
+        assert!(data_id.is_some(), "downloaded content must be preserved");
+        assert_eq!(regenerate, 0, "correction must not trigger a re-send");
+    }
+
+    #[test]
+    fn upsert_is_noop_when_row_matches_toc() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+        db.upsert_chapter_from_toc("Chapter 1", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].4, 0);
+    }
+
+    #[test]
+    fn upsert_ignores_update_that_would_collide_with_unique_constraint() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        // Legacy duplicate rows: same uri and volume, distinct names, which
+        // the UNIQUE(name, uri, volumeid) constraint permits.
+        db.add_chapter("Chapter A", "https://example.com/chapter-1/", vol)
+            .unwrap();
+        db.add_chapter("Chapter B", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        // The lookup picks the lower-id row ("Chapter A"); renaming it to
+        // "Chapter B" would collide with the second row's UNIQUE tuple, so
+        // OR IGNORE must skip the update entirely.
+        db.upsert_chapter_from_toc("Chapter B", "https://example.com/chapter-1/", vol)
+            .unwrap();
+
+        let rows = all_chapters(&db);
+        assert_eq!(rows.len(), 2, "no row should be inserted or removed");
+        assert_eq!(rows[0].0, "Chapter A", "collision must leave the row untouched");
+        assert_eq!(rows[1].0, "Chapter B");
+        for row in &rows {
+            assert!(row.3.is_none(), "no data should be attached");
+            assert_eq!(row.4, 0, "regenerate flag must not be set");
+        }
     }
 }

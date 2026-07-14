@@ -33,6 +33,18 @@ struct Args {
     /// Skip index update
     #[arg(long)]
     skip_index: bool,
+
+    /// Pull a chapter URL not yet on the TOC (requires --source)
+    #[arg(long, requires = "source", value_name = "URL")]
+    pull_chapter: Option<String>,
+
+    /// Volume name for --pull-chapter (default: latest volume in the DB)
+    #[arg(long, requires = "pull_chapter", value_name = "NAME")]
+    volume: Option<String>,
+
+    /// Chapter title for --pull-chapter (default: parsed from the page)
+    #[arg(long, requires = "pull_chapter", value_name = "NAME")]
+    title: Option<String>,
 }
 
 #[tokio::main]
@@ -111,6 +123,24 @@ async fn main() {
             }
         } else {
             println!("({}) Skipping index update", source.id);
+        }
+
+        // Seed a manually pulled chapter (--pull-chapter requires --source,
+        // so this loop only runs for that source)
+        if let Some(ref url) = args.pull_chapter {
+            if let Err(e) = client
+                .seed_chapter(
+                    &scraper,
+                    &db,
+                    url,
+                    args.title.as_deref(),
+                    args.volume.as_deref(),
+                )
+                .await
+            {
+                println!("Error pulling chapter for {}: {}", source.id, e);
+                continue;
+            }
         }
 
         // Download chapters

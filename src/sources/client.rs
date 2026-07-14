@@ -2,11 +2,58 @@ use reqwest::{header::HeaderValue, header::COOKIE, header::USER_AGENT, Client};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use soup::prelude::*;
 
 use crate::db::SourceDatabase;
 use crate::error::{ScrapeError, ScrapeResult};
 
 use super::traits::SourceScraper;
+
+/// Extract a chapter title from a chapter page, best effort.
+/// The TOC upsert corrects the name later, so this only needs to be
+/// good enough for the immediately generated epub.
+fn extract_page_title(html: &str) -> Option<String> {
+    let soup = Soup::new(html);
+
+    // WordPress-style entry title (used by wanderinginn.com)
+    let entry_title = soup.tag("h1").find_all().find(|h| {
+        h.get("class")
+            .map_or(false, |c| c.split_whitespace().any(|c| c == "entry-title"))
+    });
+    if let Some(h1) = entry_title {
+        let title = h1.text().trim().to_string();
+        if !title.is_empty() {
+            return Some(title);
+        }
+    }
+
+    // Fall back to <title>, trimmed at the site-name separator
+    let page_title = soup.tag("title").find().map(|t| t.text())?;
+    let page_title = page_title.trim();
+    for sep in [" \u{2013} ", " \u{2014} ", " | ", " - "] {
+        if let Some(idx) = page_title.find(sep) {
+            let title = page_title[..idx].trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+
+    if page_title.is_empty() {
+        None
+    } else {
+        Some(page_title.to_string())
+    }
+}
+
+/// Derive a placeholder title from the last URL path segment
+fn title_from_slug(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(url)
+        .replace('-', " ")
+}
 
 /// HTTP client wrapper for scraping operations
 pub struct ScraperClient {
@@ -46,6 +93,27 @@ impl ScraperClient {
         Ok(body)
     }
 
+    /// Fetch HTML like get_html, but fail on non-success HTTP status.
+    /// Used by the seed path, where the URL is user-typed.
+    async fn get_html_checked(
+        &self,
+        url: &str,
+        auth_headers: Option<&Vec<(String, String)>>,
+    ) -> ScrapeResult<String> {
+        let mut request = self.client.get(url).header(USER_AGENT, "reqwest");
+        if let Some(headers) = auth_headers {
+            for (name, value) in headers {
+                if name.to_lowercase() == "cookie" {
+                    request = request.header(COOKIE, HeaderValue::from_str(value).unwrap());
+                }
+            }
+        }
+        let resp = request.send().await.map_err(ScrapeError::Http)?;
+        let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
+        let body = resp.text().await.map_err(ScrapeError::Http)?;
+        Ok(body)
+    }
+
     /// Update the index (table of contents) for a source
     pub async fn update_index(
         &self,
@@ -66,7 +134,7 @@ impl ScraperClient {
 
         for chapter in chapters {
             let volume_id = db.add_volume(&chapter.volume_name)?;
-            db.add_chapter(&chapter.title, &chapter.uri, volume_id)?;
+            db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
             *volume_counts
                 .entry(chapter.volume_name.clone())
                 .or_insert(0) += 1;
@@ -77,6 +145,59 @@ impl ScraperClient {
         }
 
         println!("({}) Finished building index", scraper.source_id());
+        Ok(())
+    }
+
+    /// Seed a manually pulled chapter into the database ahead of the TOC.
+    /// The normal download/epub/mail pipeline picks it up afterwards; when
+    /// the TOC later lists the chapter, upsert_chapter_from_toc matches it
+    /// by URI so it is never duplicated or re-sent.
+    pub async fn seed_chapter(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
+        db: &SourceDatabase,
+        url: &str,
+        title_override: Option<&str>,
+        volume_override: Option<&str>,
+    ) -> ScrapeResult<()> {
+        if db.chapter_exists_by_uri(url)? {
+            println!(
+                "({}) Chapter already in database, skipping: {}",
+                scraper.source_id(),
+                url
+            );
+            return Ok(());
+        }
+
+        // Always fetch, even when a title override is supplied: this is the
+        // only validation that a user-typed URL actually resolves before we
+        // seed it into the download/epub/mail pipeline.
+        let html = self
+            .get_html_checked(url, scraper.build_auth_headers().as_ref())
+            .await?;
+
+        let title = match title_override {
+            Some(t) => t.to_string(),
+            None => extract_page_title(&html).unwrap_or_else(|| title_from_slug(url)),
+        };
+
+        let volume_name = match volume_override {
+            Some(v) => v.to_string(),
+            None => db
+                .get_latest_volume()?
+                .map(|v| v.name)
+                .unwrap_or_else(|| "Main Story".to_string()),
+        };
+
+        let volume_id = db.add_volume(&volume_name)?;
+        db.add_chapter(&title, url, volume_id)?;
+        println!(
+            "({}) Seeded chapter '{}' into {} ({})",
+            scraper.source_id(),
+            title,
+            volume_name,
+            url
+        );
         Ok(())
     }
 
@@ -243,5 +364,46 @@ impl ScraperClient {
 impl Default for ScraperClient {
     fn default() -> Self {
         Self::new().expect("Failed to create scraper client")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_wordpress_entry_title() {
+        let html = r#"<html><head><title>10.69 IN – Test Serial</title></head>
+            <body><h1 class="entry-title">10.69 IN</h1></body></html>"#;
+        assert_eq!(extract_page_title(html), Some("10.69 IN".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_title_tag_trimmed_at_separator() {
+        let html =
+            "<html><head><title>Chapter 5 | Example Site</title></head><body></body></html>";
+        assert_eq!(extract_page_title(html), Some("Chapter 5".to_string()));
+    }
+
+    #[test]
+    fn uses_whole_title_tag_when_no_separator() {
+        let html = "<html><head><title>Chapter 5</title></head><body></body></html>";
+        assert_eq!(extract_page_title(html), Some("Chapter 5".to_string()));
+    }
+
+    #[test]
+    fn returns_none_without_any_title() {
+        assert_eq!(
+            extract_page_title("<html><body><p>hi</p></body></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn derives_placeholder_title_from_url_slug() {
+        assert_eq!(
+            title_from_slug("https://example.com/2026/07/05/10-69-in/"),
+            "10 69 in"
+        );
     }
 }
