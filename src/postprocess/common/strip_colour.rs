@@ -1,4 +1,4 @@
-use color_name::Color;
+use color_name::css;
 use regex::Regex;
 
 use crate::postprocess::PostProcessor;
@@ -15,7 +15,7 @@ impl PostProcessor for StripColourProcessor {
         let re = Regex::new(r#"<span style="color:\s*(#......).*?">(.*?)</span>"#).unwrap();
         re.replace_all(content, |captures: &regex::Captures| {
             let colour_arr = hex::decode(&captures[1][1..]).unwrap();
-            let name = Color::similar([colour_arr[0], colour_arr[1], colour_arr[2]]);
+            let name = css::Color::similar([colour_arr[0], colour_arr[1], colour_arr[2]]);
             format!(
                 "<span>&lt;{a}|{b}|{a}&gt;</span>",
                 a = name,
