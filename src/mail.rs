@@ -28,6 +28,7 @@ async fn send_epub(config: &MailConfig, dest: &UserConfig, attachment: &Attachme
         );
 
     let res = SmtpClientBuilder::new(config.smtp_hostname.clone(), config.smtp_port)
+        .expect("Failed to create SMTP client")
         .implicit_tls(false)
         .credentials((config.address.clone(), config.password.clone()))
         .connect()
