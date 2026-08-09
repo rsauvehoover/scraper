@@ -20,7 +20,7 @@ opt-level = 2
 color-name = "1.1.0"
 epub-builder = "0.8.3"
 hex = "0.4.3"
-reqwest = { version = "0.12", features = ["cookies"] }
+reqwest = { version = "0.13", features = ["cookies"] }
 image = "0.24.7"
 imageproc = "0.23.0"
 mail-builder = "0.4.4"
