@@ -190,6 +190,10 @@ pub struct SourceConfig {
     pub enabled: bool,
     /// URL to the table of contents page
     pub toc_url: String,
+    /// Volume names to ignore on index
+    pub ignored_volumes: Vec<String>,
+    /// Chapter names to ignore on index
+    pub ignored_chapters: Vec<String>,
     /// HTML selectors for parsing
     pub selectors: Selectors,
     /// Authentication configuration
@@ -207,6 +211,8 @@ impl Default for SourceConfig {
             name: String::from("Unknown Source"),
             enabled: true,
             toc_url: String::new(),
+            ignored_volumes: Vec::new(),
+            ignored_chapters: Vec::new(),
             selectors: Selectors::default(),
             auth: AuthConfig::None,
             metadata: SourceMetadata::default(),
@@ -223,6 +229,8 @@ impl SourceConfig {
             name: String::from("The Wandering Inn"),
             enabled: true,
             toc_url: String::from("https://wanderinginn.com/table-of-contents/"),
+            ignored_volumes: vec![String::from("Volume 1"), String::from("Volume 2")],
+            ignored_chapters: vec![],
             selectors: Selectors::default(),
             auth: AuthConfig::None,
             metadata: SourceMetadata {
@@ -255,6 +263,8 @@ impl SourceConfig {
                 fiction_id,
                 slug_name(name)
             ),
+            ignored_volumes: vec![],
+            ignored_chapters: vec![],
             selectors: Selectors {
                 volume_wrapper: String::from("volume-selector"),
                 volume_title: String::from("h6"),

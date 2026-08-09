@@ -128,6 +128,8 @@ Create a `config.json` file with the following structure:
       "Name": "My Web Serial",            // Human-readable name
       "Enabled": true,
       "TocUrl": "https://example.com/table-of-contents/",
+      "IgnoredVolumes": ["Ignored Volume Title"],
+      "IgnoredChapters": ["Ignored Chapter Title"],
 
       // HTML selectors for parsing (required for generic sources)
       "Selectors": {

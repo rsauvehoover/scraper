@@ -117,7 +117,7 @@ async fn main() {
 
         // Update index
         if !args.skip_index {
-            if let Err(e) = client.update_index(&scraper, &db).await {
+            if let Err(e) = client.update_index(&scraper, &db, &source.ignored_volumes, &source.ignored_chapters).await {
                 println!("Error updating index for {}: {}", source.id, e);
                 continue;
             }

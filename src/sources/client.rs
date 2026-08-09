@@ -119,6 +119,8 @@ impl ScraperClient {
         &self,
         scraper: &Arc<dyn SourceScraper>,
         db: &SourceDatabase,
+        ignored_volumes: &Vec<String>,
+        ignored_chapters: &Vec<String>,
     ) -> ScrapeResult<()> {
         println!(
             "({}) Rebuilding index from {}",
@@ -133,6 +135,9 @@ impl ScraperClient {
             std::collections::HashMap::new();
 
         for chapter in chapters {
+            if ignored_volumes.contains(&chapter.volume_name) || ignored_chapters.contains(&chapter.title) {
+                continue
+            }
             let volume_id = db.add_volume(&chapter.volume_name)?;
             db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
             *volume_counts
