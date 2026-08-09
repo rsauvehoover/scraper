@@ -18,7 +18,7 @@ opt-level = 2
 
 [dependencies]
 color-name = "1.1.0"
-epub-builder = "0.7.1"
+epub-builder = "0.8.3"
 hex = "0.4.3"
 reqwest = { version = "0.12", features = ["cookies"] }
 image = "0.24.7"
