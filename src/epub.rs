@@ -299,8 +299,17 @@ fn generate_volume(
 
     epub.inline_toc();
 
+    let last_chapter_id = chapters.last().ok_or("No chapters found")?.id;
     for chapter in chapters {
-        let raw_data = db.get_chapter_data(chapter.id)?;
+        let raw_data = match db.get_chapter_data(chapter.id) {
+            Err(rusqlite::Error::QueryReturnedNoRows) if chapter.id == last_chapter_id => {
+                println!("  Failed to fetch data for last chapter ({}), assuming unreleased content.", chapter.name);
+                continue
+            },
+            Err(e) => return Err(e.into()),
+            Ok(data) => data,
+        };
+
         let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
         epub.add_content(
