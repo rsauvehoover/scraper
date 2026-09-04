@@ -1,0 +1,6 @@
+[workspace]
+# Binary crate, not published to crates.io
+publish = false
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
