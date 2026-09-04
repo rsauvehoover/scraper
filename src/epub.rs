@@ -128,6 +128,12 @@ fn generate_cover_with_text(
     Some(img_bytes)
 }
 
+/// Replace path separators so chapter/volume names can be used in filenames
+/// and zip-internal content paths.
+fn sanitize_filename(name: &str) -> String {
+    name.replace(['/', '\\'], "-")
+}
+
 fn load_stylesheet() -> String {
     let mut file = std::fs::File::open("src/assets/style.css").unwrap();
     let mut contents = String::new();
@@ -157,6 +163,7 @@ fn generate_chapter(
     let mut output = Vec::<u8>::new();
     std::fs::create_dir_all(output_dir.join("individual"))?;
 
+    let safe_name = sanitize_filename(&chapter.name);
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
     epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
@@ -165,7 +172,7 @@ fn generate_chapter(
 
     if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &chapter.name) {
         epub.add_cover_image(
-            format!("{}({}).png", chapter.id, chapter.name),
+            format!("{}({}).png", chapter.id, safe_name),
             img_bytes.as_slice(),
             "image/png",
         )?;
@@ -177,7 +184,7 @@ fn generate_chapter(
 
     epub.add_content(
         EpubContent::new(
-            format!("{}({}).xhtml", &chapter.id, &chapter.name),
+            format!("{}({}).xhtml", &chapter.id, &safe_name),
             processed_data.as_bytes(),
         )
         .title(&chapter.name),
@@ -185,7 +192,7 @@ fn generate_chapter(
 
     epub.generate(&mut output)?;
 
-    let filename = format!("{}({}).epub", &chapter.id, &chapter.name);
+    let filename = format!("{}({}).epub", &chapter.id, &safe_name);
 
     let mut file = std::fs::File::create(output_dir.join("individual").join(&filename))?;
     file.write_all(&output)?;
@@ -211,6 +218,8 @@ fn generate_chapters(
 
     let mut combined_output = Vec::<u8>::new();
     let last_chapter = chapters.last().unwrap();
+    let first_safe_name = sanitize_filename(&chapters[0].name);
+    let last_safe_name = sanitize_filename(&last_chapter.name);
     let mut combined_epub = EpubBuilder::new(ZipLibrary::new()?)?;
     combined_epub.metadata("author", &ctx.source.metadata.author)?;
     combined_epub.metadata("lang", "en")?;
@@ -231,7 +240,7 @@ fn generate_chapters(
         combined_epub.add_cover_image(
             format!(
                 "{}({})-{}({}).png",
-                chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
+                chapters[0].id, first_safe_name, last_chapter.id, last_safe_name
             ),
             img_bytes.as_slice(),
             "image/png",
@@ -247,7 +256,7 @@ fn generate_chapters(
 
         combined_epub.add_content(
             EpubContent::new(
-                format!("{}({}).xhtml", chapter.id, chapter.name),
+                format!("{}({}).xhtml", chapter.id, sanitize_filename(&chapter.name)),
                 processed_data.as_bytes(),
             )
             .title(&chapter.name),
@@ -266,7 +275,7 @@ fn generate_chapters(
 
     let mut file = std::fs::File::create(output_dir.join("combined").join(format!(
         "{}({})-{}({}).epub",
-        chapters[0].id, chapters[0].name, last_chapter.id, last_chapter.name
+        chapters[0].id, first_safe_name, last_chapter.id, last_safe_name
     )))?;
     file.write_all(&combined_output)?;
     Ok(attachments)
@@ -282,6 +291,7 @@ fn generate_volume(
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
 
+    let safe_volume_name = sanitize_filename(&volume.name);
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
     epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
@@ -291,7 +301,7 @@ fn generate_volume(
 
     if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &volume.name) {
         epub.add_cover_image(
-            format!("{}.png", &volume.name),
+            format!("{}.png", &safe_volume_name),
             img_bytes.as_slice(),
             "image/png",
         )?;
@@ -314,7 +324,7 @@ fn generate_volume(
 
         epub.add_content(
             EpubContent::new(
-                format!("{}({}).xhtml", chapter.id, chapter.name),
+                format!("{}({}).xhtml", chapter.id, sanitize_filename(&chapter.name)),
                 processed_data.as_bytes(),
             )
             .title(&chapter.name),
@@ -325,9 +335,9 @@ fn generate_volume(
 
     std::fs::create_dir_all(output_dir)?;
 
-    let filename = format!("{}.epub", volume.name);
+    let filename = format!("{}.epub", safe_volume_name);
 
-    let mut file = std::fs::File::create(output_dir.join(format!("{}.epub", volume.name)))?;
+    let mut file = std::fs::File::create(output_dir.join(&filename))?;
     file.write_all(&output)?;
 
     Ok(Attachment {
@@ -426,4 +436,19 @@ pub async fn generate_epubs_for_source(
     send_epubs(&config.mail, &source.id, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_filename_replaces_path_separators() {
+        assert_eq!(
+            sanitize_filename("Chapter 1 — Title// with slashes"),
+            "Chapter 1 — Title-- with slashes"
+        );
+        assert_eq!(sanitize_filename("back\\slash"), "back-slash");
+        assert_eq!(sanitize_filename("plain name"), "plain name");
+    }
 }
