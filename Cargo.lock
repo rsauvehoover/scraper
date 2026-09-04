@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "wandering_inn_scraper"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "async-trait",
  "clap",
