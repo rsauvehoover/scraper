@@ -30,6 +30,7 @@ pub trait SourceScraper: Send + Sync {
     fn source_id(&self) -> &str;
 
     /// Get the human-readable source name
+    #[allow(dead_code)]
     fn source_name(&self) -> &str;
 
     /// Get the table of contents URL
@@ -51,9 +52,11 @@ pub trait SourceScraper: Send + Sync {
     }
 
     /// Get the author for EPUB metadata
+    #[allow(dead_code)]
     fn author(&self) -> &str;
 
     /// Get the description for EPUB metadata
+    #[allow(dead_code)]
     fn description(&self) -> &str;
 
     /// Get the list of post-processor names to apply

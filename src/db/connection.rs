@@ -129,7 +129,7 @@ impl SourceDatabase {
     }
 
     /// Add a volume to the database
-    pub fn add_volume(&self, name: &str) -> Result<usize> {
+    pub fn add_volume(&self, name: &str) -> Result<isize> {
         self.conn
             .prepare("INSERT OR IGNORE INTO volumes(name) VALUES(?1)")?
             .execute([name])?;
@@ -140,7 +140,7 @@ impl SourceDatabase {
     }
 
     /// Get a volume name by ID
-    pub fn get_volume_name(&self, volume_id: usize) -> Result<String> {
+    pub fn get_volume_name(&self, volume_id: isize) -> Result<String> {
         self.conn.query_row(
             "SELECT name FROM volumes WHERE id = ?1",
             [volume_id],
@@ -165,7 +165,7 @@ impl SourceDatabase {
     }
 
     /// Add a chapter to the database
-    pub fn add_chapter(&self, name: &str, uri: &str, volume_id: usize) -> Result<()> {
+    pub fn add_chapter(&self, name: &str, uri: &str, volume_id: isize) -> Result<()> {
         self.conn
             .prepare("INSERT OR IGNORE INTO chapters(name, uri, volumeid) VALUES(?1, ?2, ?3)")?
             .execute((name, uri, volume_id))?;
@@ -173,7 +173,7 @@ impl SourceDatabase {
     }
 
     /// Remove a chapter from the database
-    pub fn remove_chapter(&self, chapter_id: usize) -> Result<()> {
+    pub fn remove_chapter(&self, chapter_id: isize) -> Result<()> {
         self.conn
             .prepare("DELETE FROM chapters WHERE id = ?1")?
             .execute([chapter_id])?;
@@ -213,10 +213,10 @@ impl SourceDatabase {
         &self,
         name: &str,
         uri: &str,
-        volume_id: usize,
+        volume_id: isize,
     ) -> Result<()> {
         let (with_slash, without_slash) = uri_variants(uri);
-        let existing: Option<(usize, String, Option<usize>)> = self
+        let existing: Option<(isize, String, Option<isize>)> = self
             .conn
             .query_row(
                 "SELECT id, name, volumeid FROM chapters WHERE uri IN (?1, ?2) ORDER BY id LIMIT 1",
@@ -243,7 +243,7 @@ impl SourceDatabase {
     }
 
     /// Add or update chapter data
-    pub fn add_chapter_data(&self, chapter_id: usize, data: &str) -> Result<()> {
+    pub fn add_chapter_data(&self, chapter_id: isize, data: &str) -> Result<()> {
         let existing_data: String = self
             .conn
             .query_row(
@@ -259,7 +259,7 @@ impl SourceDatabase {
             .execute((data, chapter_id))?;
 
         let regenerate = !existing_data.eq(data);
-        let data_id: usize =
+        let data_id: isize =
             self.conn
                 .query_row("SELECT id FROM raw_data WHERE data = ?1", [data], |row| {
                     row.get(0)
@@ -267,9 +267,9 @@ impl SourceDatabase {
 
         self.conn
             .prepare("UPDATE chapters SET data_id = ?1, regenerate_epub = ?2 WHERE id = ?3")?
-            .execute([data_id, regenerate as usize, chapter_id])?;
+            .execute([data_id, regenerate as isize, chapter_id])?;
 
-        let volume_id: usize = self.conn.query_row(
+        let volume_id: isize = self.conn.query_row(
             "SELECT volumeid FROM chapters WHERE id = ?1",
             [chapter_id],
             |row| row.get(0),
@@ -277,13 +277,13 @@ impl SourceDatabase {
 
         self.conn
             .prepare("UPDATE volumes SET regenerate_epub = ?1 WHERE id = ?2")?
-            .execute([regenerate as usize, volume_id])?;
+            .execute([regenerate as isize, volume_id])?;
 
         Ok(())
     }
 
     /// Get chapter data by chapter ID
-    pub fn get_chapter_data(&self, chapter_id: usize) -> Result<String> {
+    pub fn get_chapter_data(&self, chapter_id: isize) -> Result<String> {
         self.conn.query_row(
             "SELECT data FROM raw_data WHERE chapter_id = ?1",
             [chapter_id],
@@ -292,7 +292,7 @@ impl SourceDatabase {
     }
 
     /// Get all chapters for a volume
-    pub fn get_chapters_by_volume(&self, volume_id: usize) -> Result<Vec<Chapter>> {
+    pub fn get_chapters_by_volume(&self, volume_id: isize) -> Result<Vec<Chapter>> {
         self.chapter_query(
             "SELECT id, name, uri, volumeid, data_id FROM chapters WHERE volumeid = ?1",
             [volume_id],
@@ -321,18 +321,18 @@ impl SourceDatabase {
     }
 
     /// Update volume regeneration flag
-    pub fn update_generated_volume(&self, id: usize, regenerate: bool) -> Result<()> {
+    pub fn update_generated_volume(&self, id: isize, regenerate: bool) -> Result<()> {
         self.conn
             .prepare("UPDATE volumes SET regenerate_epub = ?1 WHERE id = ?2")?
-            .execute([regenerate as usize, id])?;
+            .execute([regenerate as isize, id])?;
         Ok(())
     }
 
     /// Update chapter regeneration flag
-    pub fn update_generated_chapter(&self, id: usize, regenerate: bool) -> Result<()> {
+    pub fn update_generated_chapter(&self, id: isize, regenerate: bool) -> Result<()> {
         self.conn
             .prepare("UPDATE chapters SET regenerate_epub = ?1 WHERE id = ?2")?
-            .execute([regenerate as usize, id])?;
+            .execute([regenerate as isize, id])?;
         Ok(())
     }
 
@@ -349,7 +349,7 @@ impl SourceDatabase {
                     name: row.get(1)?,
                     uri: row.get(2)?,
                     volume_id: row.get(3)?,
-                    data_id: row.get::<_, Option<usize>>(4)?,
+                    data_id: row.get::<_, Option<isize>>(4)?,
                 })
             })?
             .collect()
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(latest.name, "Volume 2");
     }
 
-    fn all_chapters(db: &SourceDatabase) -> Vec<(String, String, Option<usize>, Option<usize>, usize)> {
+    fn all_chapters(db: &SourceDatabase) -> Vec<(String, String, Option<isize>, Option<isize>, isize)> {
         db.connection()
             .prepare("SELECT name, uri, volumeid, data_id, regenerate_epub FROM chapters ORDER BY id")
             .unwrap()
@@ -450,7 +450,7 @@ mod tests {
         // guessed volume, content already downloaded and sent.
         db.add_chapter("parsed title", "https://example.com/chapter-1/", vol1)
             .unwrap();
-        let id: usize = db
+        let id: isize = db
             .connection()
             .query_row(
                 "SELECT id FROM chapters WHERE uri = ?1",
