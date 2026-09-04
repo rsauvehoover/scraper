@@ -1,6 +1,6 @@
 [package]
 name = "wandering_inn_scraper"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2018"
 description = "A scraper for the web serial The Wandering Inn"
 authors = ["Frederic Sauve-Hoover"]
