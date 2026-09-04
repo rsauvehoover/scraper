@@ -23,8 +23,8 @@ hex = "0.4.3"
 reqwest = { version = "0.13", features = ["cookies"] }
 image = "0.24.7"
 imageproc = "0.23.0"
-mail-builder = "0.4.4"
-mail-send = "0.6.1"
+mail-builder = "0.5.0"
+mail-send = "0.6.2"
 regex = "1.9.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusttype = "0.9.3"
