@@ -1,0 +1,98 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Keeps a release PR open with the version bump and changelog.
+  release-plz-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Tags and creates the GitHub release once the release PR is merged.
+  # The release PR is opened by GITHUB_TOKEN, so CI does not run on it;
+  # tests run here as the gate before releasing instead.
+  release-plz-release:
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.release.outputs.releases_created == 'true' && fromJSON(steps.release.outputs.releases)[0].tag || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --verbose
+      - uses: MarcoIeni/release-plz-action@v0.5
+        id: release
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  bundle-linux:
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-plz-release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+      - name: Build
+        run: cargo bundle --release
+      - name: Tar bundle
+        run: |
+          deb_file=$(basename target/release/bundle/deb/*.deb)
+          tar -czvf "$deb_file.tar.gz" -C target/release/bundle/deb "$deb_file"
+          echo "ARTIFACT_NAME=$deb_file.tar.gz" >> "$GITHUB_ENV"
+      - name: Upload linux artifact
+        run: gh release upload "$TAG" "./$ARTIFACT_NAME"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-plz-release.outputs.tag }}
+
+  bundle-windows:
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-plz-release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-wix
+        run: cargo install cargo-wix
+      - name: Build
+        run: cargo wix -v
+      - name: Upload windows artifact
+        shell: bash
+        run: gh release upload "$TAG" ./target/wix/*.msi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-plz-release.outputs.tag }}
