@@ -45,31 +45,50 @@ pub fn read_redacted(path: &Path) -> io::Result<Value> {
 ///
 /// A blank or absent `Mail.Password` means "leave unchanged". The editor's
 /// password field is write-only, so this is the normal path, not the exception.
-pub fn merge_password(candidate: &mut Value, current: &Value) {
-    let supplied = candidate
-        .get("Mail")
-        .and_then(|m| m.get("Password"))
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
-
-    if !supplied.is_empty() {
-        // Caller supplied a new password; keep it.
-        if let Some(mail) = candidate.get_mut("Mail").and_then(|m| m.as_object_mut()) {
-            mail.remove("PasswordSet");
+///
+/// A candidate with no `Mail` object at all is rejected when the current
+/// config has one. Both `Config` and `MailConfig` are `#[serde(default)]`, so
+/// such a body validates cleanly and would replace the live sender address,
+/// destinations and password with defaults — the whole mail section deleted
+/// by an omission, reported as a successful save.
+pub fn merge_password(candidate: &mut Value, current: &Value) -> Result<(), String> {
+    let Some(mail) = candidate.get_mut("Mail").and_then(|m| m.as_object_mut()) else {
+        if current.get("Mail").map(Value::is_object) == Some(true) {
+            return Err("configuration has no Mail object; \
+                        saving it would delete the current mail settings"
+                .to_string());
         }
-        return;
+        return Ok(());
+    };
+
+    // The client never receives the stored password, so it cannot echo it
+    // back; a non-empty value here is always a new one the operator typed.
+    let supplied_new_password = mail
+        .get("Password")
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| !p.is_empty());
+
+    // `read_redacted` puts this in; it is a rendering detail and must never
+    // reach disk.
+    mail.remove("PasswordSet");
+
+    if supplied_new_password {
+        return Ok(());
     }
 
-    let existing = current
-        .get("Mail")
-        .and_then(|m| m.get("Password"))
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
-
-    if let Some(mail) = candidate.get_mut("Mail").and_then(|m| m.as_object_mut()) {
-        mail.remove("PasswordSet");
-        mail.insert("Password".to_string(), existing);
+    match current.get("Mail").and_then(|m| m.get("Password")) {
+        Some(existing) => {
+            mail.insert("Password".to_string(), existing.clone());
+        }
+        // Nothing stored to preserve. Leave the key out rather than writing
+        // an empty string, which `read_redacted` would then report as "no
+        // password set" anyway.
+        None => {
+            mail.remove("Password");
+        }
     }
+
+    Ok(())
 }
 
 /// Prove the scraper could load this config.
@@ -92,9 +111,22 @@ fn validate(candidate: &Value) -> Result<(), String> {
 /// client-supplied secret into an error string. Merging first guarantees the
 /// field is a well-formed `String` before validation ever looks at it.
 pub fn prepare_for_write(mut candidate: Value, current: &Value) -> Result<Value, String> {
-    merge_password(&mut candidate, current);
+    merge_password(&mut candidate, current)?;
     validate(&candidate)?;
     Ok(candidate)
+}
+
+/// Read the config that is about to be replaced.
+///
+/// Separate from `read_redacted` because the caller needs the real password,
+/// not the `PasswordSet` flag. The error is deliberately not swallowed: a
+/// caller that treats an unreadable or malformed `config.json` as an empty
+/// object hands `merge_password` nothing to preserve, and the write that
+/// follows replaces a live credential with an empty string over a
+/// now-syntactically-valid file.
+pub fn read_current(path: &Path) -> io::Result<Value> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Top-level keys whose contents differ. Names only — never values.
@@ -293,7 +325,7 @@ mod tests {
         let mut candidate = sample();
         candidate["Mail"]["Password"] = json!("");
 
-        merge_password(&mut candidate, &current);
+        merge_password(&mut candidate, &current).unwrap();
 
         assert_eq!(candidate["Mail"]["Password"], json!("abcdefghijklmnop"));
     }
@@ -304,9 +336,34 @@ mod tests {
         let mut candidate = sample();
         candidate["Mail"].as_object_mut().unwrap().remove("Password");
 
-        merge_password(&mut candidate, &current);
+        merge_password(&mut candidate, &current).unwrap();
 
         assert_eq!(candidate["Mail"]["Password"], json!("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn a_candidate_without_mail_is_refused_when_one_is_stored() {
+        // Config and MailConfig are both #[serde(default)], so this body would
+        // otherwise validate and write a config with no mail section at all.
+        let current = sample();
+        let mut candidate = sample();
+        candidate.as_object_mut().unwrap().remove("Mail");
+
+        let err = merge_password(&mut candidate, &current)
+            .expect_err("dropping the stored mail settings must not be silent");
+        assert!(err.contains("Mail"), "the error must say what is missing: {}", err);
+    }
+
+    #[test]
+    fn a_candidate_without_mail_is_allowed_when_none_is_stored() {
+        // Nothing to lose: refusing here would block a legitimate save on a
+        // config that never had a mail section.
+        let mut current = sample();
+        current.as_object_mut().unwrap().remove("Mail");
+        let mut candidate = sample();
+        candidate.as_object_mut().unwrap().remove("Mail");
+
+        assert!(merge_password(&mut candidate, &current).is_ok());
     }
 
     #[test]
@@ -315,7 +372,7 @@ mod tests {
         let mut candidate = sample();
         candidate["Mail"]["Password"] = json!("qrstuvwxyz012345");
 
-        merge_password(&mut candidate, &current);
+        merge_password(&mut candidate, &current).unwrap();
 
         assert_eq!(candidate["Mail"]["Password"], json!("qrstuvwxyz012345"));
     }
