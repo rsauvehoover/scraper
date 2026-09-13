@@ -481,8 +481,16 @@ mod tests {
         )
     }
 
+    // `build_volume_epub` takes no path parameter, so the no-write guarantee
+    // is primarily structural: there is nothing to write through today. This
+    // test guards against that guarantee being eroded by a *relative*-path
+    // write creeping back in (e.g. `File::create("out.epub")` or a stray
+    // `create_dir_all`) — it does not, and cannot, prove the function writes
+    // nowhere on the filesystem in general, since an absolute path is not
+    // ruled out by this check.
+    #[serial]
     #[test]
-    fn build_volume_epub_writes_nothing_to_disk() {
+    fn build_volume_epub_writes_no_files_in_cwd() {
         let (db, volume, chapters) = fixture_db();
         let source = crate::config::SourceConfig::default();
         let registry = ProcessorRegistry::new();
@@ -492,12 +500,16 @@ mod tests {
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let before: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
 
-        let attachment = build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+        let result = build_volume_epub(&db, &volume, &chapters, &ctx, false);
+
+        std::env::set_current_dir(original).unwrap();
 
         let after: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
-        assert_eq!(before.len(), after.len(), "build must not create files");
+        let attachment = result.unwrap();
+        assert_eq!(after.len(), 0, "build must not create files in cwd");
         assert_eq!(attachment.filename, "Volume 1.epub");
         assert!(!attachment.bytes.is_empty());
         // EPUBs are ZIP archives.
