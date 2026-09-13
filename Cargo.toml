@@ -20,8 +20,10 @@ path = "src/lib.rs"
 # repository would accept it. `dpkg -i` is lenient enough to install it
 # anyway, which is how it went unnoticed.
 #
-# Verified against cargo-bundle 0.6.0 source, because the three names this
-# affects are NOT the same name:
+# The three names this affects are NOT the same name. Line numbers below are
+# cargo-bundle 0.6.0, which is only where the behaviour was read; it was then
+# confirmed empirically against a 0.11.0 build, so treat the mapping as the
+# durable part and the line numbers as a pointer that may drift:
 #   deb_bundle.rs:145  Package: field  <- bundle_name()  = this setting
 #   deb_bundle.rs:60   usr/bin/<name>  <- binary_name()  = the CRATE name
 #   deb_bundle.rs:45   .deb filename   <- binary_name()  = the CRATE name
