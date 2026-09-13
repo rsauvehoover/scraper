@@ -13,6 +13,24 @@ name = "wandering_inn_scraper"
 path = "src/lib.rs"
 
 [package.metadata.bundle]
+# Debian package names permit only lowercase alphanumerics, '-', '+' and '.'.
+# Without this the package inherits the crate name, `wandering_inn_scraper`,
+# whose underscores dpkg-deb rejects outright — so the .deb cargo-bundle
+# writes cannot be rebuilt or repacked by standard Debian tooling, and no
+# repository would accept it. `dpkg -i` is lenient enough to install it
+# anyway, which is how it went unnoticed.
+#
+# Verified against cargo-bundle 0.6.0 source, because the three names this
+# affects are NOT the same name:
+#   deb_bundle.rs:145  Package: field  <- bundle_name()  = this setting
+#   deb_bundle.rs:60   usr/bin/<name>  <- binary_name()  = the CRATE name
+#   deb_bundle.rs:45   .deb filename   <- binary_name()  = the CRATE name
+# So this fixes the control file, which is what dpkg-deb validates, and
+# leaves the installed binary at /usr/bin/wandering_inn_scraper, which the
+# scheduled job invokes by path. The built .deb FILE also keeps the crate
+# name, so the filename and the package it contains disagree. Cosmetic, but
+# surprising enough to write down.
+name = "scraper"
 identifier = "rsauvehoover/wandering-inn-scraper"
 resources = ["src/assets", "src/font"]
 linux_use_terminal = true
