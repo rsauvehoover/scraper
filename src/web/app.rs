@@ -613,4 +613,65 @@ mod tests {
         assert!(!text.contains("<iframe"), "iframe survived into the response");
         assert!(text.contains("prose"), "prose must survive");
     }
+
+    /// A pending chapter (TOC-listed, not yet downloaded) has `words: 0`,
+    /// exactly like a genuinely empty chapter would. The rendered TOC must
+    /// not present them identically — otherwise "pending" is indistinguishable
+    /// from "the scraper downloaded an empty chapter", which it never does.
+    #[tokio::test]
+    async fn toc_distinguishes_pending_chapters_from_downloaded_ones() {
+        let state = test_state();
+
+        {
+            let entry = state.registry.get("test-source").expect("fixture source");
+            let db = entry.db();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Downloaded Chapter", "https://example.com/c1", vol)
+                .unwrap();
+            db.add_chapter("Pending Chapter", "https://example.com/c2", vol)
+                .unwrap();
+            let chapters = db.get_chapters_by_volume(vol).unwrap();
+            let downloaded = chapters
+                .iter()
+                .find(|c| c.name == "Downloaded Chapter")
+                .unwrap();
+            // "Pending Chapter" is deliberately left without a raw_data row.
+            db.add_chapter_data(downloaded.id, "<p>one two three</p>")
+                .unwrap();
+        }
+
+        let token = state.sessions.create();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/source/test-source")
+                    .header("cookie", format!("scraper_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(
+            text.contains("pending"),
+            "the pending chapter must be marked pending, not 0 words: {}",
+            text
+        );
+        assert!(
+            text.contains("3 words"),
+            "the downloaded chapter must still show its real word count: {}",
+            text
+        );
+        assert!(
+            !text.contains("0 words"),
+            "a pending chapter must never render as \"0 words\": {}",
+            text
+        );
+    }
 }

@@ -46,7 +46,15 @@ pub async fn source_toc(
                                 a href={ "/source/" (source_id) "/chapter/" (chapter.id) } {
                                     (chapter.name)
                                 }
-                                span class="words" { (format_thousands(chapter.words)) " words" }
+                                // A pending chapter has `words: 0`, same as a
+                                // genuinely empty one — `downloaded` is what
+                                // tells them apart, so the TOC must not
+                                // render both as "0 words".
+                                @if chapter.downloaded {
+                                    span class="words" { (format_thousands(chapter.words)) " words" }
+                                } @else {
+                                    span class="words pending" { "pending" }
+                                }
                                 @if let Some(published) = &chapter.published {
                                     span class="date" { (published) }
                                 }
@@ -71,12 +79,19 @@ pub async fn chapter_page(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
 
-    let name: Result<String, _> = entry.db().connection().query_row(
-        "SELECT name FROM chapters WHERE id = ?1",
+    // LEFT JOIN, not a second query: a chapter the TOC lists but the scraper
+    // has not downloaded yet has no `raw_data` row, and that must be known
+    // before deciding whether to embed the reader iframe (its `/raw` source
+    // would otherwise 404 with no explanation).
+    let row: Result<(String, bool), _> = entry.db().connection().query_row(
+        "SELECT c.name, rd.data IS NOT NULL
+         FROM chapters c
+         LEFT JOIN raw_data rd ON rd.chapter_id = c.id
+         WHERE c.id = ?1",
         [chapter_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     );
-    let Ok(name) = name else {
+    let Ok((name, downloaded)) = row else {
         return (StatusCode::NOT_FOUND, "Unknown chapter").into_response();
     };
 
@@ -88,13 +103,20 @@ pub async fn chapter_page(
                 " · "
                 a href={ "/source/" (source_id) } { "Back to contents" }
             }
-            // The chapter body is upstream-authored. It renders in a sandbox
-            // without allow-scripts or allow-same-origin, so even if the
-            // sanitiser missed something it cannot reach this origin.
-            iframe
-                class="reader"
-                sandbox=""
-                src={ "/source/" (source_id) "/chapter/" (chapter_id) "/raw" } {}
+            @if downloaded {
+                // The chapter body is upstream-authored. It renders in a sandbox
+                // without allow-scripts or allow-same-origin, so even if the
+                // sanitiser missed something it cannot reach this origin.
+                iframe
+                    class="reader"
+                    sandbox=""
+                    src={ "/source/" (source_id) "/chapter/" (chapter_id) "/raw" } {}
+            } @else {
+                p class="pending" {
+                    "This chapter is listed in the table of contents but has not "
+                    "been downloaded yet. Run the scraper, then reload this page."
+                }
+            }
         },
     )
     .into_response()

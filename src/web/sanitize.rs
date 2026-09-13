@@ -30,12 +30,34 @@ fn cleaner() -> &'static Builder<'static> {
         .collect();
         builder.tags(tags);
 
-        // `style` is allowed because colour carries meaning in these serials
-        // and the strip-colour processor is an explicit opt-in elsewhere.
-        // ammonia parses and filters style values; it does not pass them through.
+        // Inline `style` is allowed because colour carries meaning in these
+        // serials, and the strip-colour processor is an explicit opt-in
+        // elsewhere. Ammonia does NOT filter style values unless asked, so the
+        // allowlist below is what makes that safe: it admits only properties
+        // that cannot carry a `url()`, `expression()` or `behavior`, which are
+        // the vectors that would otherwise fetch or execute from inside a
+        // chapter. Without this call, `style` would be passed through verbatim
+        // and the CSP would be the only thing standing between a stored
+        // payload and the reader.
         let mut attrs = HashSet::new();
         attrs.insert("style");
         builder.generic_attributes(attrs);
+
+        builder.filter_style_properties(
+            [
+                "color",
+                "background-color",
+                "font-weight",
+                "font-style",
+                "font-variant",
+                "text-decoration",
+                "text-align",
+                "letter-spacing",
+            ]
+            .iter()
+            .copied()
+            .collect(),
+        );
 
         let mut img_attrs = HashSet::new();
         img_attrs.insert("src");
@@ -117,5 +139,16 @@ mod tests {
     fn is_idempotent() {
         let once = sanitize_chapter("<p>text</p><script>x</script>");
         assert_eq!(sanitize_chapter(&once), once);
+    }
+
+    #[test]
+    fn strips_style_properties_that_can_fetch_or_execute() {
+        let out = sanitize_chapter(
+            r#"<span style="background: url(https://evil.example/p.png); color: red; behavior:url(x.htc)">text</span>"#,
+        );
+        assert!(!out.contains("url("), "style url() survived: {}", out);
+        assert!(!out.contains("behavior"), "behavior survived: {}", out);
+        assert!(out.contains("color"), "colour must still survive: {}", out);
+        assert!(out.contains("text"));
     }
 }

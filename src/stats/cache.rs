@@ -22,6 +22,11 @@ pub struct ChapterStat {
     /// `YYYY-MM-DD`, only where the source's URIs carry one. `None` for
     /// Royal Road, which has no date anywhere in the stored data.
     pub published: Option<String>,
+    /// Whether this chapter has a `raw_data` row yet. `false` for a chapter
+    /// the TOC lists but the scraper has not downloaded — that case also has
+    /// `words: 0`, so callers must check this field rather than `words == 0`
+    /// to tell "not downloaded" apart from a genuinely empty chapter.
+    pub downloaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +138,7 @@ fn compute(entry: &SourceEntry) -> SourceStat {
 
         for (id, name, uri, data) in rows {
             let published = published_from_uri(&uri);
+            let downloaded = data.is_some();
             let words = match &data {
                 Some(html) => count_words(html),
                 None => {
@@ -147,6 +153,7 @@ fn compute(entry: &SourceEntry) -> SourceStat {
                 uri,
                 words,
                 published,
+                downloaded,
             });
         }
 
