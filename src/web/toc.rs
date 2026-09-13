@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use maud::{html, PreEscaped};
+use serde::Deserialize;
 
 use crate::web::app::AppState;
 use crate::web::sanitize::sanitize_chapter;
@@ -190,6 +191,7 @@ pub async fn chapter_page(
 pub async fn chapter_raw(
     State(state): State<Arc<AppState>>,
     AxumPath((source_id, chapter_id)): AxumPath<(String, i64)>,
+    Query(query): Query<ReaderQuery>,
 ) -> Response {
     let Some(entry) = state.registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
@@ -222,7 +224,7 @@ pub async fn chapter_raw(
         html {
             head {
                 meta charset="utf-8";
-                style { (PreEscaped(READER_CSS)) }
+                style { (PreEscaped(reader_css(query.theme()))) }
             }
             body { (PreEscaped(body)) }
         }
@@ -251,10 +253,77 @@ pub async fn chapter_raw(
         .into_response()
 }
 
-const READER_CSS: &str = r#"
+/// `?theme=` on the reader URL.
+///
+/// The frame is served into `sandbox=""` with no `allow-same-origin`, so it
+/// cannot read the parent's `localStorage`, and the parent's stylesheet does
+/// not cross into it either. The URL is the only channel left. It is also
+/// attacker-influenced in the ordinary way a query string is, and the reader's
+/// CSP permits inline `<style>` — so the value is matched against a closed set
+/// and never reaches the document. `reader_css` returns one of three fixed
+/// strings; nothing from the request is interpolated into CSS or markup.
+#[derive(Deserialize, Default)]
+pub struct ReaderQuery {
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+impl ReaderQuery {
+    fn theme(&self) -> ReaderTheme {
+        match self.theme.as_deref() {
+            Some("light") => ReaderTheme::Light,
+            Some("dark") => ReaderTheme::Dark,
+            // Absent or unrecognised. Anything the parent did not send is
+            // treated as "no preference expressed" rather than an error: the
+            // frame still has to render a readable chapter.
+            _ => ReaderTheme::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReaderTheme {
+    Auto,
+    Light,
+    Dark,
+}
+
+/// The reader stylesheet for one theme.
+///
+/// The light palette is always emitted first, so no colour is defined only
+/// inside a media query or only in an override block — same rule as the
+/// parent's `PALETTE`. `Auto` adds the `prefers-color-scheme` block; `Dark`
+/// adds the same values unconditionally, because an explicit choice must beat
+/// the system preference in both directions.
+fn reader_css(theme: ReaderTheme) -> String {
+    let palette = match theme {
+        ReaderTheme::Auto => READER_AUTO_DARK,
+        ReaderTheme::Light => "",
+        ReaderTheme::Dark => READER_DARK,
+    };
+    format!("{}{}{}", READER_LIGHT, palette, READER_BASE)
+}
+
+const READER_LIGHT: &str = r#"
+:root { --reader-fg:#1c1c1c; --reader-bg:#ffffff; --reader-accent:#3a5a8c; }
+"#;
+
+const READER_DARK: &str = r#"
+:root { --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
+"#;
+
+const READER_AUTO_DARK: &str = r#"
+@media (prefers-color-scheme: dark) {
+  :root { --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
+}
+"#;
+
+const READER_BASE: &str = r#"
 body { font-family: Georgia, 'Times New Roman', serif; line-height: 1.7;
-       max-width: 40rem; margin: 0 auto; padding: 2rem 1rem; color: #1c1c1c; }
+       max-width: 40rem; margin: 0 auto; padding: 2rem 1rem;
+       color: var(--reader-fg); background: var(--reader-bg); }
 img { max-width: 100%; height: auto; }
+a { color: var(--reader-accent); }
 "#;
 
 /// 1234567 -> "1,234,567".
@@ -369,6 +438,133 @@ mod tests {
             "a downloaded chapter must still offer its EPUB: {}",
             body
         );
+    }
+
+    /// The sandboxed reader cannot read the parent's storage, so the theme
+    /// arrives in the URL. An explicit choice has to beat the frame's own
+    /// `prefers-color-scheme`, in both directions.
+    #[tokio::test]
+    async fn reader_honours_an_explicit_theme() {
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test());
+        let (downloaded, _) = seed_one_downloaded_one_pending(&state);
+
+        let dark = body_of(
+            super::chapter_raw(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), downloaded)),
+                Query(super::ReaderQuery { theme: Some("dark".to_string()) }),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !dark.contains("prefers-color-scheme"),
+            "an explicit choice must not be left to the system preference: {}",
+            dark
+        );
+        assert!(
+            dark.contains("--reader-bg:#1f1f24"),
+            "?theme=dark must serve the dark palette: {}",
+            dark
+        );
+
+        let light = body_of(
+            super::chapter_raw(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), downloaded)),
+                Query(super::ReaderQuery { theme: Some("light".to_string()) }),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !light.contains("prefers-color-scheme") && !light.contains("--reader-bg:#1f1f24"),
+            "?theme=light must stay light on a dark desktop: {}",
+            light
+        );
+    }
+
+    /// The reader's CSP allows inline `<style>`, so a query value reaching the
+    /// stylesheet would be a live injection. Nothing from the request is
+    /// interpolated: an unrecognised value is simply not a choice, and the
+    /// frame falls back to `prefers-color-scheme` exactly as when the
+    /// parameter is absent.
+    #[tokio::test]
+    async fn reader_ignores_an_unrecognised_theme() {
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test());
+        let (downloaded, _) = seed_one_downloaded_one_pending(&state);
+
+        let hostile = "purple} body{display:none} :root{";
+        let rejected = body_of(
+            super::chapter_raw(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), downloaded)),
+                Query(super::ReaderQuery { theme: Some(hostile.to_string()) }),
+            )
+            .await,
+        )
+        .await;
+        let absent = body_of(
+            super::chapter_raw(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), downloaded)),
+                Query(super::ReaderQuery::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert!(
+            !rejected.contains("purple") && !rejected.contains("display:none"),
+            "a query value must never reach the document: {}",
+            rejected
+        );
+        assert_eq!(
+            rejected, absent,
+            "an unrecognised theme must behave exactly as no theme at all"
+        );
+        assert!(
+            absent.contains("prefers-color-scheme"),
+            "with no choice expressed the frame follows the system preference: {}",
+            absent
+        );
+    }
+
+    /// The reader's whole defence is that CSP. `img-src data:` also keeps the
+    /// reader's address off upstream hosts. Adding a theme parameter must not
+    /// have loosened either, and `no-referrer` keeps the chapter id out of any
+    /// request the document manages to make.
+    #[tokio::test]
+    async fn reader_keeps_its_content_security_policy() {
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test());
+        let (downloaded, _) = seed_one_downloaded_one_pending(&state);
+
+        let response = super::chapter_raw(
+            State(Arc::clone(&state)),
+            AxumPath(("test-source".to_string(), downloaded)),
+            Query(super::ReaderQuery { theme: Some("dark".to_string()) }),
+        )
+        .await;
+
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+            "the reader's CSP must not be weakened"
+        );
+        assert_eq!(response.headers().get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "SAMEORIGIN");
     }
 
     #[test]

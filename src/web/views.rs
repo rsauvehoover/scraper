@@ -14,8 +14,41 @@ use crate::stats::cache::SourceStat;
 use crate::web::app::AppState;
 use crate::web::toc::format_thousands;
 
-const STYLE: &str = r#"
-:root { --fg:#1c1c1c; --muted:#666; --line:#e2e2e2; --accent:#3a5a8c; --bg:#fdfdfc; }
+/// Every colour in the interface, and nothing else.
+///
+/// Three blocks, deliberately: bare `:root` carries the complete light
+/// palette, so no colour has its only definition inside a media query — a
+/// browser that never matches one still gets a full set. The
+/// `prefers-color-scheme` block is guarded with `:not([data-theme="light"])`
+/// so an operator who explicitly picks light keeps it on a dark desktop, and
+/// `[data-theme="dark"]` repeats the dark values unguarded so the toggle wins
+/// in the other direction too. Dropping either guard makes the toggle a
+/// one-way door on a machine whose system preference disagrees.
+///
+/// `BASE` below must contain no literal colour: a hardcoded one survives the
+/// swap and is wrong in whichever theme it was not written for. There is a
+/// test for that.
+const PALETTE: &str = r#"
+:root {
+  --fg:#1c1c1c; --muted:#666666; --line:#e2e2e2; --accent:#3a5a8c;
+  --bg:#fdfdfc; --surface:#ffffff; --on-accent:#ffffff;
+  --note-bg:#fff8e6; --note-line:#f0dca0; --error:#a3272c; --ok:#2a7a3f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --fg:#e4e4e2; --muted:#9b9b97; --line:#33333a; --accent:#8ab0e4;
+    --bg:#17171a; --surface:#1f1f24; --on-accent:#10131a;
+    --note-bg:#2d2718; --note-line:#5c4f26; --error:#ef8a8f; --ok:#79c98d;
+  }
+}
+:root[data-theme="dark"] {
+  --fg:#e4e4e2; --muted:#9b9b97; --line:#33333a; --accent:#8ab0e4;
+  --bg:#17171a; --surface:#1f1f24; --on-accent:#10131a;
+  --note-bg:#2d2718; --note-line:#5c4f26; --error:#ef8a8f; --ok:#79c98d;
+}
+"#;
+
+const BASE: &str = r#"
 * { box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
        margin:0; background:var(--bg); color:var(--fg); line-height:1.55; }
@@ -23,6 +56,9 @@ header { border-bottom:1px solid var(--line); padding:0.85rem 1.5rem;
          display:flex; gap:1.25rem; align-items:baseline; }
 header a { color:var(--accent); text-decoration:none; font-weight:500; }
 header .spacer { margin-left:auto; }
+button.theme { margin:0; padding:0.2rem 0.7rem; background:transparent; color:var(--accent);
+               border:1px solid var(--line); border-radius:3px; font-size:0.85rem;
+               align-self:center; }
 main { max-width:62rem; margin:0 auto; padding:1.5rem; }
 h1 { font-size:1.5rem; margin:0 0 0.35rem; }
 h2 { font-size:1.15rem; margin:1.75rem 0 0.35rem; }
@@ -40,20 +76,92 @@ ol.chapters .words, ol.chapters .date { color:var(--muted); font-size:0.82rem;
                                         font-variant-numeric:tabular-nums; }
 ol.chapters .dl { color:var(--accent); font-size:0.82rem; text-decoration:none; }
 iframe.reader { width:100%; height:78vh; border:1px solid var(--line);
-                background:#fff; border-radius:3px; }
+                background:var(--surface); border-radius:3px; }
 form.login { max-width:20rem; margin:5rem auto; display:flex; flex-direction:column; gap:0.5rem; }
 label { font-size:0.85rem; color:var(--muted); margin-top:0.5rem; }
-input, textarea { font:inherit; padding:0.45rem 0.6rem; border:1px solid var(--line);
-                  border-radius:3px; background:#fff; width:100%; }
+input, textarea, select { font:inherit; padding:0.45rem 0.6rem; border:1px solid var(--line);
+                  border-radius:3px; background:var(--surface); color:var(--fg); width:100%; }
 textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.82rem; }
 button { font:inherit; margin-top:0.85rem; padding:0.45rem 1.1rem; border:0; border-radius:3px;
-         background:var(--accent); color:#fff; cursor:pointer; align-self:flex-start; }
-.note { background:#fff8e6; border:1px solid #f0dca0; padding:0.6rem 0.8rem;
+         background:var(--accent); color:var(--on-accent); cursor:pointer; align-self:flex-start; }
+.note { background:var(--note-bg); border:1px solid var(--note-line); padding:0.6rem 0.8rem;
         border-radius:3px; font-size:0.88rem; }
-.error { color:#a3272c; } .ok { color:#2a7a3f; }
+.error { color:var(--error); } .ok { color:var(--ok); }
 footer.version { color:var(--muted); font-size:0.75rem; text-align:right;
                  padding:1rem 1.5rem; font-variant-numeric:tabular-nums; }
 #status { margin-left:0.75rem; font-size:0.88rem; }
+"#;
+
+/// Runs in `<head>`, before the body is parsed, so the stored choice is on the
+/// document element by the time anything paints. Deferring this to the script
+/// at the end of the page would render one frame of the wrong theme on every
+/// load. `localStorage` throws outright in a blocked-site-data or private
+/// context rather than returning null, so the read is wrapped — a page that
+/// cannot remember the choice must still render.
+const PREPAINT_SCRIPT: &str = r#"
+(function () {
+  var t = null;
+  try { t = window.localStorage.getItem('scraper-theme'); } catch (e) { t = null; }
+  if (t === 'light' || t === 'dark') {
+    document.documentElement.setAttribute('data-theme', t);
+  }
+})();
+"#;
+
+/// The toggle, plus the one thing the toggle cannot do with CSS alone.
+///
+/// `iframe.reader` is a separate document served by `chapter_raw` inside
+/// `sandbox=""` with no `allow-same-origin`, so it cannot read this origin's
+/// `localStorage` and no stylesheet here reaches inside it. The theme
+/// therefore travels in its URL. The server renders the frame with a bare
+/// `src`, which means "follow `prefers-color-scheme`" — so the frame is only
+/// re-pointed when an explicit choice actually disagrees with the system
+/// preference, and the common case costs no second fetch.
+const THEME_SCRIPT: &str = r#"
+(function () {
+  var KEY = 'scraper-theme';
+  var root = document.documentElement;
+  var btn = document.getElementById('theme-toggle');
+
+  function systemTheme() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark' : 'light';
+  }
+  // The attribute is authoritative: the pre-paint script has already copied
+  // storage into it, and it keeps working for the rest of the page even when
+  // localStorage refuses every write.
+  function resolved() {
+    var a = root.getAttribute('data-theme');
+    if (a === 'light' || a === 'dark') return a;
+    return systemTheme();
+  }
+  function relabel() {
+    if (!btn) return;
+    var dark = resolved() === 'dark';
+    btn.textContent = dark ? 'Light mode' : 'Dark mode';
+    btn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+  }
+  function syncReader() {
+    var frame = document.querySelector('iframe.reader');
+    if (!frame || !frame.src) return;
+    var base = frame.src.split('?')[0];
+    var theme = resolved();
+    var want = theme === systemTheme() ? base : base + '?theme=' + theme;
+    if (frame.src !== want) frame.src = want;
+  }
+
+  if (btn) {
+    btn.addEventListener('click', function () {
+      var next = resolved() === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { window.localStorage.setItem(KEY, next); } catch (e) {}
+      relabel();
+      syncReader();
+    });
+  }
+  relabel();
+  syncReader();
+})();
 "#;
 
 /// Shared chrome. Every page goes through here.
@@ -65,7 +173,9 @@ pub fn page(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Scraper" }
-                style { (PreEscaped(STYLE)) }
+                style { (PreEscaped(PALETTE)) (PreEscaped(BASE)) }
+                // Before <body>, on purpose. See PREPAINT_SCRIPT.
+                script { (PreEscaped(PREPAINT_SCRIPT)) }
             }
             body {
                 header {
@@ -73,6 +183,12 @@ pub fn page(title: &str, body: Markup) -> Markup {
                     a href="/stats" { "Statistics" }
                     a href="/config" { "Configuration" }
                     span class="spacer" {}
+                    // Labelled by THEME_SCRIPT once it knows which way round
+                    // the toggle currently sits; the static text is what a
+                    // browser with scripting off is left holding.
+                    button type="button" id="theme-toggle" class="theme" aria-pressed="false" {
+                        "Dark mode"
+                    }
                     a href="/logout" { "Sign out" }
                 }
                 // The single h1 lives here, not in each handler. Task 10's
@@ -86,6 +202,7 @@ pub fn page(title: &str, body: Markup) -> Markup {
                 // process still serves the old from memory. Reporting the built
                 // version makes that skew visible rather than inferred.
                 footer class="version" { "v" (env!("CARGO_PKG_VERSION")) }
+                script { (PreEscaped(THEME_SCRIPT)) }
             }
         }
     }
@@ -269,4 +386,133 @@ pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
         },
     )
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page, BASE, PALETTE, PREPAINT_SCRIPT, THEME_SCRIPT};
+
+    /// A colour left hardcoded in the rules is simply wrong in one of the two
+    /// themes, and the mistake is invisible to whoever is looking at the theme
+    /// it was written for. Every colour belongs in `PALETTE`, which is the only
+    /// place the swap happens.
+    #[test]
+    fn no_rule_outside_the_palette_carries_a_literal_colour() {
+        let bytes: Vec<char> = BASE.chars().collect();
+        for (i, c) in bytes.iter().enumerate() {
+            if *c != '#' {
+                continue;
+            }
+            // `#status` is an id selector, not a colour.
+            let next = bytes.get(i + 1).copied().unwrap_or(' ');
+            assert!(
+                !next.is_ascii_hexdigit(),
+                "hardcoded colour in BASE near byte {}: {}",
+                i,
+                &BASE[i.saturating_sub(40)..(i + 40).min(BASE.len())]
+            );
+        }
+        assert!(
+            !BASE.contains("rgb(") && !BASE.contains("hsl("),
+            "BASE must express colour only through custom properties: {}",
+            BASE
+        );
+    }
+
+    /// Bare `:root` has to carry the whole light palette, the media query has
+    /// to be guarded against an explicit light choice, and the dark values have
+    /// to exist outside the media query too or the toggle is a one-way door on
+    /// a machine whose system preference is dark.
+    #[test]
+    fn palette_defines_light_dark_and_both_overrides() {
+        assert!(PALETTE.contains("\n:root {"), "bare :root light palette missing: {}", PALETTE);
+        assert!(
+            PALETTE.contains(":root:not([data-theme=\"light\"])"),
+            "the prefers-color-scheme block must not override an explicit light choice: {}",
+            PALETTE
+        );
+        assert!(
+            PALETTE.contains(":root[data-theme=\"dark\"]"),
+            "an explicit dark choice must win without a media query: {}",
+            PALETTE
+        );
+        // Every property named once in the light block must be redefined in
+        // both override blocks, or it keeps its light value in dark mode.
+        let light = PALETTE.split("@media").next().unwrap();
+        let dark_blocks: Vec<&str> = PALETTE.match_indices(":root[data-theme=\"dark\"]").map(|(i, _)| &PALETTE[i..]).collect();
+        let media = PALETTE.split("@media").nth(1).unwrap();
+        for property in light.split("--").skip(1) {
+            let name = property.split(':').next().unwrap();
+            assert!(
+                media.contains(&format!("--{}:", name)),
+                "--{} has no dark value in the media query",
+                name
+            );
+            assert!(
+                dark_blocks[0].contains(&format!("--{}:", name)),
+                "--{} has no dark value in the data-theme block",
+                name
+            );
+        }
+    }
+
+    /// The stored choice has to be on the document element before the body is
+    /// parsed. Running it at the end of the page renders one frame of the wrong
+    /// theme on every single load.
+    #[test]
+    fn the_theme_script_runs_before_the_body() {
+        let rendered = page("Sources", maud::html! {}).into_string();
+        let prepaint = rendered.find("scraper-theme").expect("pre-paint script is rendered");
+        let body = rendered.find("<body").expect("the page has a body");
+        assert!(
+            prepaint < body,
+            "the theme must be applied before the body renders: {}",
+            rendered
+        );
+    }
+
+    /// The toggle is in the header, next to Sign out, and every storage access
+    /// is guarded — blocked site data throws on access rather than returning
+    /// null, and an exception there would take the rest of the script with it.
+    #[test]
+    fn the_header_carries_a_guarded_theme_toggle() {
+        let rendered = page("Sources", maud::html! {}).into_string();
+        assert!(
+            rendered.contains(r#"id="theme-toggle""#),
+            "the header must offer a theme toggle: {}",
+            rendered
+        );
+        let toggle = rendered.find("theme-toggle").expect("toggle is rendered");
+        let sign_out = rendered.find("/logout").expect("sign out is rendered");
+        assert!(
+            toggle < sign_out,
+            "the toggle belongs beside Sign out on the right: {}",
+            rendered
+        );
+
+        for script in &[PREPAINT_SCRIPT, THEME_SCRIPT] {
+            // The trailing dot counts accesses, not the word: the scripts
+            // also mention localStorage in a comment.
+            let reads = script.matches("localStorage.").count();
+            assert!(reads > 0, "script must consult localStorage: {}", script);
+            assert_eq!(
+                script.matches("try {").count(),
+                reads,
+                "every localStorage access must be wrapped in try/catch: {}",
+                script
+            );
+        }
+    }
+
+    /// The sandboxed reader cannot read this origin's storage, so the toggle
+    /// has to re-point its URL. Losing this line leaves a light chapter body
+    /// inside a dark page.
+    #[test]
+    fn the_toggle_repoints_the_reader_frame() {
+        assert!(
+            THEME_SCRIPT.contains("iframe.reader") && THEME_SCRIPT.contains("?theme="),
+            "the toggle must carry the theme into the sandboxed reader: {}",
+            THEME_SCRIPT
+        );
+    }
 }
