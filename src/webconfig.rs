@@ -75,10 +75,26 @@ pub fn merge_password(candidate: &mut Value, current: &Value) {
 /// Prove the scraper could load this config.
 ///
 /// Parses into the typed `Config`; the `Value` is what actually gets written.
-pub fn validate(candidate: &Value) -> Result<(), String> {
+/// Private: see `prepare_for_write` for why this must not be called on its own.
+fn validate(candidate: &Value) -> Result<(), String> {
     serde_json::from_value::<Config>(candidate.clone())
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Merge the stored password into a candidate config and prove the scraper
+/// could load the result.
+///
+/// A single entry point on purpose. `validate` alone is not public, because the
+/// two steps are order-dependent in a way nothing else enforces: serde's
+/// deserialisation errors quote the offending field's value, so validating a
+/// candidate whose `Mail.Password` has not yet been reconciled would put a
+/// client-supplied secret into an error string. Merging first guarantees the
+/// field is a well-formed `String` before validation ever looks at it.
+pub fn prepare_for_write(mut candidate: Value, current: &Value) -> Result<Value, String> {
+    merge_password(&mut candidate, current);
+    validate(&candidate)?;
+    Ok(candidate)
 }
 
 /// Top-level keys whose contents differ. Names only — never values.
@@ -108,13 +124,20 @@ pub fn changed_keys(before: &Value, after: &Value) -> Vec<String> {
 /// panics on a malformed file but silently falls back to defaults on a missing
 /// one, which would scrape with the wrong settings and mail the results.
 ///
-/// The temp file name includes the process id, which is enough to avoid
-/// collisions between separate runs of this process but not between two
-/// concurrent writers racing each other, and a crash between creating the
-/// temp file and the rename leaves it behind uncollected. Both are accepted
-/// for this single-writer deployment rather than left unstated.
+/// The temp file name is derived from the target's own file name plus the
+/// process id, which is enough to avoid collisions between separate runs of
+/// this process but not between two concurrent writers racing each other, and
+/// a crash between creating the temp file and the rename leaves it behind
+/// uncollected. Both are accepted for this single-writer deployment rather
+/// than left unstated.
 pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // `Path::parent()` returns `Some("")` for a bare relative filename like
+    // "config.json" (not `None`), so the empty case must be filtered
+    // explicitly — `unwrap_or_else` alone does not catch it.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
     // Preserve the previous file before replacing it.
     if path.exists() {
@@ -129,7 +152,12 @@ pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
 
     let existing_mode = current_mode(path);
 
-    let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
+    let file_name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("config.json"));
+    let tmp = dir.join(format!(
+        "{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
     {
         let mut file = open_private(&tmp)?;
         let body = serde_json::to_string_pretty(value)
@@ -158,6 +186,9 @@ fn current_mode(path: &Path) -> Option<u32> {
         .map(|m| m.permissions().mode() & 0o777)
 }
 
+// This crate also ships a Windows MSI (`cargo wix`), so this arm is live
+// code, not dead code. Windows has no unix mode bits and an ACL story is out
+// of scope here, so permissions are left to OS defaults on non-unix targets.
 #[cfg(not(unix))]
 fn current_mode(_path: &Path) -> Option<u32> {
     None
@@ -174,6 +205,8 @@ fn open_private(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+// Permissions are left to OS defaults on non-unix targets; see the note on
+// `current_mode` above.
 #[cfg(not(unix))]
 fn open_private(path: &Path) -> io::Result<std::fs::File> {
     std::fs::File::create(path)
@@ -186,6 +219,8 @@ fn apply_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+// Permissions are left to OS defaults on non-unix targets; see the note on
+// `current_mode` above.
 #[cfg(not(unix))]
 fn apply_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
@@ -347,6 +382,27 @@ mod tests {
     #[test]
     fn validate_accepts_the_real_shape() {
         assert!(validate(&sample()).is_ok());
+    }
+
+    #[test]
+    fn prepare_for_write_restores_a_blank_password_and_validates() {
+        let current = sample();
+        let mut candidate = sample();
+        candidate["Mail"]["Password"] = json!("");
+
+        let prepared = prepare_for_write(candidate, &current).unwrap();
+
+        assert_eq!(prepared["Mail"]["Password"], json!("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_a_structurally_invalid_config() {
+        let current = sample();
+        let mut broken = sample();
+        broken["Sources"] = json!("not an array");
+        broken["Mail"]["Password"] = json!("");
+
+        assert!(prepare_for_write(broken, &current).is_err());
     }
 
     #[test]

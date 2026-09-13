@@ -16,14 +16,28 @@ pub struct MailConfig {
 impl std::fmt::Debug for MailConfig {
     /// Deliberately hand-written. `Mail.Password` is a live Gmail app password;
     /// a derived `Debug` puts it in any log line that formats a Config.
+    ///
+    /// Destructured, not field-accessed, on purpose: a field added to
+    /// `MailConfig` later must not be able to reach `Debug` output without
+    /// someone here choosing where it goes. Field access would let it vanish
+    /// silently; destructuring makes the compiler refuse to build until this
+    /// impl says what happens to it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MailConfig {
+            name,
+            address,
+            password: _,
+            smtp_hostname,
+            smtp_port,
+            destinations,
+        } = self;
         f.debug_struct("MailConfig")
-            .field("name", &self.name)
-            .field("address", &self.address)
+            .field("name", name)
+            .field("address", address)
             .field("password", &"<redacted>")
-            .field("smtp_hostname", &self.smtp_hostname)
-            .field("smtp_port", &self.smtp_port)
-            .field("destinations", &self.destinations)
+            .field("smtp_hostname", smtp_hostname)
+            .field("smtp_port", smtp_port)
+            .field("destinations", destinations)
             .finish()
     }
 }
