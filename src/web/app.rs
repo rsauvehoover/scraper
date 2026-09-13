@@ -547,4 +547,70 @@ mod tests {
             "a distinct forwarded client must get its own bucket"
         );
     }
+
+    #[tokio::test]
+    async fn chapter_raw_sets_a_locking_csp_and_strips_script() {
+        let state = test_state();
+
+        // Seed a chapter whose stored HTML contains active content, so this test
+        // exercises the real path. Without seeding, /raw can only 404 and the
+        // header assertions below would never run.
+        {
+            let entry = state.registry.get("test-source").expect("fixture source");
+            let db = entry.db();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+            let chapters = db.get_chapters_by_volume(vol).unwrap();
+            db.add_chapter_data(
+                chapters[0].id,
+                "<p>prose</p><script>alert(1)</script><iframe src=\"https://evil.example/\"></iframe>",
+            )
+            .unwrap();
+        }
+
+        let chapter_id = {
+            let entry = state.registry.get("test-source").unwrap();
+            let db = entry.db();
+            let v = db.get_latest_volume().unwrap().unwrap();
+            db.get_chapters_by_volume(v.id).unwrap()[0].id
+        };
+
+        let token = state.sessions.create();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/source/test-source/chapter/{}/raw", chapter_id))
+                    .header("cookie", format!("scraper_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "seeded chapter must render");
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("chapter body must carry a CSP")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "csp: {}", csp);
+        assert!(csp.contains("img-src data:"), "csp: {}", csp);
+        assert!(!csp.contains("script-src"), "csp must not permit script: {}", csp);
+
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("<script"), "script survived into the response");
+        assert!(!text.contains("<iframe"), "iframe survived into the response");
+        assert!(text.contains("prose"), "prose must survive");
+    }
 }
