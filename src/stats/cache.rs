@@ -3,12 +3,12 @@
 //! The frontend never writes, so there is no `word_count` column to read: every
 //! figure here is derived from `raw_data.data` on demand and memoised. A full
 //! recompute of the largest source takes a few seconds, and the scraper only
-//! touches a source when it has new chapters, so a cache keyed on the database
-//! file's mtime is enough.
+//! touches a source when it has new chapters, so a cache keyed on a cheap
+//! change-detection token (see `data_version` below — deliberately not the
+//! database file's mtime) is enough.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use crate::db::SourceEntry;
 use crate::stats::wordcount::count_words;
@@ -186,14 +186,31 @@ fn compute(entry: &SourceEntry) -> SourceStat {
     }
 }
 
+/// Cheap change-detection token for a source's database.
+///
+/// NOT the file mtime: under WAL, commits land in the `-wal` sidecar and the
+/// main database file is only touched at checkpoint. This process holds a
+/// long-lived reader per source, so the "checkpoint on last close" path never
+/// runs, and a routine scrape will not cross the auto-checkpoint threshold —
+/// an mtime-keyed cache would serve pre-scrape numbers indefinitely, with no
+/// error. `data_version` changes whenever another connection commits, which is
+/// exactly the scraper-writes-while-we-read case.
+fn data_version(entry: &SourceEntry) -> Option<i64> {
+    entry
+        .db()
+        .connection()
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .ok()
+}
+
 struct Cached {
-    mtime: Option<SystemTime>,
+    version: Option<i64>,
     stat: Arc<SourceStat>,
 }
 
-/// Memoises `SourceStat` per source, invalidating when the database file's
-/// mtime changes. The scraper runs hourly and usually touches one or two
-/// sources, so most refreshes are free.
+/// Memoises `SourceStat` per source, invalidating when `PRAGMA data_version`
+/// changes for that source's database. The scraper runs hourly and usually
+/// touches one or two sources, so most refreshes are free.
 pub struct StatsCache {
     inner: Mutex<HashMap<String, Cached>>,
 }
@@ -206,22 +223,36 @@ impl StatsCache {
     }
 
     pub fn get(&self, entry: &SourceEntry) -> Arc<SourceStat> {
-        let mtime = std::fs::metadata(entry.db().db_path())
-            .and_then(|m| m.modified())
-            .ok();
+        let version = data_version(entry);
 
-        let mut guard = self.inner.lock().expect("stats cache poisoned");
-        if let Some(cached) = guard.get(&entry.config.id) {
-            if cached.mtime == mtime {
-                return Arc::clone(&cached.stat);
+        // Check under the lock, then release it before the scan: a cache
+        // miss for one source recomputing a full table scan must not block
+        // every other source's statistics request for the duration.
+        {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.get(&entry.config.id) {
+                if cached.version == version {
+                    return Arc::clone(&cached.stat);
+                }
             }
         }
 
+        // Computed WITHOUT the map lock held. Two callers racing a miss on
+        // the same source may each compute once; that is idempotent and far
+        // cheaper than serialising every request behind one scan.
         let stat = Arc::new(compute(entry));
+
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(
             entry.config.id.clone(),
             Cached {
-                mtime,
+                version,
                 stat: Arc::clone(&stat),
             },
         );
@@ -238,6 +269,29 @@ impl Default for StatsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Restores the process cwd on drop, including on unwind from a panic.
+    /// Mirrors `db::connection`'s test helper of the same name; duplicated
+    /// here rather than shared across modules since it is a handful of
+    /// lines and not worth exposing from a non-test build.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(dir: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
 
     #[test]
     fn parses_wandering_inn_date_from_uri() {
@@ -320,5 +374,84 @@ mod tests {
             stat.mean_chapter_words, 3,
             "mean must divide by downloaded chapters, not all listed chapters"
         );
+    }
+
+    /// What this proves: with a real, file-backed database and TWO real
+    /// connections -- a writer (`SourceDatabase::open`, which enables WAL)
+    /// and a separate, long-lived reader (`SourceDatabase::open_query_only`,
+    /// exactly what `SourceRegistry` holds for the process's lifetime) -- a
+    /// commit through the writer is visible to a `StatsCache::get` call
+    /// through the reader on the very next call, with no checkpoint and no
+    /// process restart. That is the actual mechanism `data_version` is
+    /// chosen for: it is the scraper's connection committing while the web
+    /// process's reader looks on, under the same WAL journal mode this
+    /// project always runs.
+    ///
+    /// What this does NOT prove: that an mtime-keyed cache would have
+    /// served the stale answer here. That would need asserting the main
+    /// database file's mtime is unchanged across the writer's commit, which
+    /// is true in this project's WAL setup but is a filesystem-timing
+    /// claim this test does not make (mtime resolution and OS behaviour
+    /// vary, and the point stands without asserting it: this test would
+    /// pass or fail identically regardless of what mtime does, because it
+    /// never reads mtime at all). The reasoning for why mtime doesn't move
+    /// under WAL is documented on `data_version` above and is not
+    /// re-verified here.
+    #[test]
+    #[serial]
+    fn stats_cache_reflects_writer_commit_under_wal() {
+        use crate::config::SourceConfig;
+        use crate::db::{SourceDatabase, SourceEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+
+        let writer = SourceDatabase::open("t").unwrap();
+        let vol = writer.add_volume("Volume 1").unwrap();
+        writer
+            .add_chapter("Chapter 1", "https://example.com/c1", vol)
+            .unwrap();
+        let ch1 = writer.get_chapters_by_volume(vol).unwrap()[0].id;
+        writer
+            .add_chapter_data(ch1, "<p>one two three</p>")
+            .unwrap();
+
+        let reader = SourceDatabase::open_query_only("t").unwrap();
+        let entry = SourceEntry::for_test(
+            SourceConfig {
+                id: "t".to_string(),
+                name: "T".to_string(),
+                ..SourceConfig::default()
+            },
+            reader,
+        );
+
+        let cache = StatsCache::new();
+        let first = cache.get(&entry);
+        assert_eq!(first.total_chapters, 1);
+        assert_eq!(first.total_words, 3);
+
+        // Written through the WRITER connection, not the one the cache
+        // reads through -- the same shape as the scraper's own connection
+        // writing while the web process's long-lived reader looks on.
+        writer
+            .add_chapter("Chapter 2", "https://example.com/c2", vol)
+            .unwrap();
+        let ch2 = writer
+            .get_chapters_by_volume(vol)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "Chapter 2")
+            .unwrap()
+            .id;
+        writer.add_chapter_data(ch2, "<p>four five</p>").unwrap();
+
+        let second = cache.get(&entry);
+        assert_eq!(
+            second.total_chapters, 2,
+            "cache must observe the writer's commit, not serve stale data"
+        );
+        assert_eq!(second.total_words, 5);
     }
 }

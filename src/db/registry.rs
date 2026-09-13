@@ -36,6 +36,22 @@ impl SourceEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Test seam: wrap an already-open `SourceDatabase`.
+    ///
+    /// Unlike `from_config_for_test`, this lets a test open a real,
+    /// file-backed database directly (e.g. via `SourceDatabase::open` /
+    /// `open_query_only`) so a second connection to the same file can
+    /// commit concurrently — the shape needed to exercise WAL visibility
+    /// between a long-lived reader and a writer, which an in-memory
+    /// database cannot do.
+    #[cfg(test)]
+    pub fn for_test(config: SourceConfig, db: SourceDatabase) -> Self {
+        SourceEntry {
+            config,
+            db: Mutex::new(db),
+        }
+    }
 }
 
 pub struct SourceRegistry {
