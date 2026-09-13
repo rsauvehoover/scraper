@@ -77,6 +77,36 @@ fn epub_response(filename: &str, bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// A generic message shown to the client whenever the cause is a database or
+/// build fault rather than "this row does not exist". The real cause is
+/// never put in the response body — it can carry schema names, file paths or
+/// driver detail — so it is `eprintln!`ed at the point it is known instead.
+const INTERNAL_ERROR_MARKER: &str = "internal_error";
+const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
+/// Turn the closure's `Result<(filename, bytes), String>` (as returned by
+/// `spawn_blocking`, the build's attachment already broken into its two
+/// fields so this stays independent of where that type is defined) into a
+/// response. The error string is either `"not_found:<message safe to show
+/// the client>"` or the fixed `INTERNAL_ERROR_MARKER` — never a raw driver or
+/// build error, which is logged server-side at the point it occurred
+/// instead.
+fn build_task_response(
+    result: Result<Result<(String, Vec<u8>), String>, tokio::task::JoinError>,
+) -> Response {
+    match result {
+        Ok(Ok((filename, bytes))) => epub_response(&filename, bytes),
+        Ok(Err(marker)) => match marker.strip_prefix("not_found:") {
+            Some(msg) => (StatusCode::NOT_FOUND, msg.to_string()).into_response(),
+            None => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response(),
+        },
+        Err(e) => {
+            eprintln!("epub build task panicked: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response()
+        }
+    }
+}
+
 pub async fn volume_epub(
     State(state): State<Arc<AppState>>,
     AxumPath((source_id, volume_id)): AxumPath<(String, i64)>,
@@ -105,18 +135,45 @@ pub async fn volume_epub(
     let result = tokio::task::spawn_blocking(move || {
         // A fresh query-only handle: rusqlite Connections are not Sync, so the
         // blocking task opens its own rather than borrowing the registry's.
-        let db = crate::db::SourceDatabase::open_query_only(&db_source_id)
-            .map_err(|e| e.to_string())?;
+        let db = match crate::db::SourceDatabase::open_query_only(&db_source_id) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("opening database for {} failed: {}", db_source_id, e);
+                return Err(INTERNAL_ERROR_MARKER.to_string());
+            }
+        };
 
-        let volume_name = db
-            .get_volume_name(volume_id as isize)
-            .map_err(|_| "Unknown volume".to_string())?;
+        // `QueryReturnedNoRows` means the volume genuinely does not exist —
+        // any other error is a real backend fault (locked file, corruption,
+        // I/O) and must not be reported to the client as "not found", which
+        // would send whoever debugs it looking for a missing row instead of
+        // the actual failure.
+        let volume_name = match db.get_volume_name(volume_id as isize) {
+            Ok(name) => name,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err("not_found:Unknown volume".to_string())
+            }
+            Err(e) => {
+                eprintln!(
+                    "volume lookup failed for {}/{}: {}",
+                    db_source_id, volume_id, e
+                );
+                return Err(INTERNAL_ERROR_MARKER.to_string());
+            }
+        };
 
-        let chapters = db
-            .get_chapters_by_volume(volume_id as isize)
-            .map_err(|e| e.to_string())?;
+        let chapters = match db.get_chapters_by_volume(volume_id as isize) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "chapter list failed for {}/{}: {}",
+                    db_source_id, volume_id, e
+                );
+                return Err(INTERNAL_ERROR_MARKER.to_string());
+            }
+        };
         if chapters.is_empty() {
-            return Err("Volume has no chapters".to_string());
+            return Err("not_found:Volume has no chapters".to_string());
         }
 
         let volume = crate::db::Volume {
@@ -128,22 +185,19 @@ pub async fn volume_epub(
             source: &source,
             processor_registry: &registry,
         };
-        build_volume_epub(&db, &volume, &chapters, &ctx, strip_colour).map_err(|e| e.to_string())
+        build_volume_epub(&db, &volume, &chapters, &ctx, strip_colour)
+            .map(|a| (a.filename, a.bytes))
+            .map_err(|e| {
+                eprintln!(
+                    "building volume epub failed for {}/{}: {}",
+                    db_source_id, volume_id, e
+                );
+                INTERNAL_ERROR_MARKER.to_string()
+            })
     })
     .await;
 
-    match result {
-        Ok(Ok(attachment)) => epub_response(&attachment.filename, attachment.bytes),
-        Ok(Err(e)) if e == "Unknown volume" || e == "Volume has no chapters" => {
-            (StatusCode::NOT_FOUND, e).into_response()
-        }
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("build panicked: {}", e),
-        )
-            .into_response(),
-    }
+    build_task_response(result)
 }
 
 pub async fn chapter_epub(
@@ -166,15 +220,43 @@ pub async fn chapter_epub(
     // inside the blocking task alongside the build.
     let db_source_id = source_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let db = crate::db::SourceDatabase::open_query_only(&db_source_id)
-            .map_err(|e| e.to_string())?;
+        let db = match crate::db::SourceDatabase::open_query_only(&db_source_id) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("opening database for {} failed: {}", db_source_id, e);
+                return Err(INTERNAL_ERROR_MARKER.to_string());
+            }
+        };
 
-        let row: Result<(String, String, isize), _> = db.connection().query_row(
-            "SELECT name, uri, volumeid FROM chapters WHERE id = ?1",
+        // A LEFT JOIN, not a second query: a chapter the TOC lists but the
+        // scraper has not downloaded yet has no `raw_data` row. That must be
+        // known here — before `build_chapter_epub` is ever called — or the
+        // missing row surfaces from inside the build as an opaque 500
+        // instead of the 404 a pending chapter actually is.
+        let row: Result<(String, String, isize, bool), _> = db.connection().query_row(
+            "SELECT c.name, c.uri, c.volumeid, rd.data IS NOT NULL
+             FROM chapters c
+             LEFT JOIN raw_data rd ON rd.chapter_id = c.id
+             WHERE c.id = ?1",
             [chapter_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         );
-        let (name, uri, volume_id) = row.map_err(|_| "Unknown chapter".to_string())?;
+        let (name, uri, volume_id, downloaded) = match row {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err("not_found:Unknown chapter".to_string())
+            }
+            Err(e) => {
+                eprintln!(
+                    "chapter lookup failed for {}/{}: {}",
+                    db_source_id, chapter_id, e
+                );
+                return Err(INTERNAL_ERROR_MARKER.to_string());
+            }
+        };
+        if !downloaded {
+            return Err("not_found:Chapter has not been downloaded yet".to_string());
+        }
 
         let chapter = crate::db::Chapter {
             id: chapter_id as isize,
@@ -188,20 +270,19 @@ pub async fn chapter_epub(
             source: &source,
             processor_registry: &registry,
         };
-        build_chapter_epub(&db, &chapter, &ctx, strip_colour).map_err(|e| e.to_string())
+        build_chapter_epub(&db, &chapter, &ctx, strip_colour)
+            .map(|a| (a.filename, a.bytes))
+            .map_err(|e| {
+                eprintln!(
+                    "building chapter epub failed for {}/{}: {}",
+                    db_source_id, chapter_id, e
+                );
+                INTERNAL_ERROR_MARKER.to_string()
+            })
     })
     .await;
 
-    match result {
-        Ok(Ok(attachment)) => epub_response(&attachment.filename, attachment.bytes),
-        Ok(Err(e)) if e == "Unknown chapter" => (StatusCode::NOT_FOUND, e).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("build panicked: {}", e),
-        )
-            .into_response(),
-    }
+    build_task_response(result)
 }
 
 #[cfg(test)]
@@ -279,7 +360,7 @@ mod tests {
         ] {
             let response = volume_epub(
                 State(Arc::clone(&state)),
-                AxumPath((hostile.to_string(), 1)),
+                AxumPath((hostile.to_owned(), 1)),
                 Query(DownloadQuery::default()),
             )
             .await;
@@ -293,7 +374,7 @@ mod tests {
 
             let response = chapter_epub(
                 State(Arc::clone(&state)),
-                AxumPath((hostile.to_string(), 1)),
+                AxumPath((hostile.to_owned(), 1)),
                 Query(DownloadQuery::default()),
             )
             .await;
@@ -305,5 +386,86 @@ mod tests {
                 response.status()
             );
         }
+    }
+
+    /// Restores the process cwd on drop, including on unwind from a panic.
+    /// `open_query_only` resolves its path relative to the cwd, so a test
+    /// that needs a real file-backed database (the registry's in-memory
+    /// fixture and the handler's own `open_query_only` call are two
+    /// different connections and cannot share state otherwise) must point
+    /// the cwd at a scratch directory for its duration. Mirrors the same
+    /// guard in `src/db/connection.rs`.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(dir: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    /// A chapter the TOC lists but the scraper has not downloaded yet has no
+    /// `raw_data` row. Hitting its EPUB link directly must 404 with an
+    /// explanation, not 500 with `build_chapter_epub`'s internal
+    /// `QueryReturnedNoRows` propagating as an opaque failure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_chapter_download_is_404_not_500() {
+        use super::{chapter_epub, DownloadQuery};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+
+        let chapter_id = {
+            // A real, file-backed database: `open_query_only` inside the
+            // handler opens its own connection to this same file, which an
+            // in-memory fixture cannot be reached through.
+            let db = crate::db::SourceDatabase::open("test-source").unwrap();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Pending Chapter", "https://example.com/c1", vol)
+                .unwrap();
+            // Deliberately no `add_chapter_data` call — this chapter is
+            // listed but not downloaded.
+            db.get_chapters_by_volume(vol).unwrap()[0].id
+        };
+
+        let state = Arc::new(AppState::for_test());
+
+        let response = chapter_epub(
+            State(Arc::clone(&state)),
+            AxumPath(("test-source".to_string(), chapter_id as i64)),
+            Query(DownloadQuery::default()),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a pending chapter's EPUB must 404, not 500"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("not been downloaded"),
+            "the body must explain why, not show a raw database error: {}",
+            text
+        );
     }
 }

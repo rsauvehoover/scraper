@@ -622,7 +622,7 @@ mod tests {
     async fn toc_distinguishes_pending_chapters_from_downloaded_ones() {
         let state = test_state();
 
-        {
+        let (downloaded_id, pending_id) = {
             let entry = state.registry.get("test-source").expect("fixture source");
             let db = entry.db();
             let vol = db.add_volume("Volume 1").unwrap();
@@ -635,10 +635,15 @@ mod tests {
                 .iter()
                 .find(|c| c.name == "Downloaded Chapter")
                 .unwrap();
+            let pending = chapters
+                .iter()
+                .find(|c| c.name == "Pending Chapter")
+                .unwrap();
             // "Pending Chapter" is deliberately left without a raw_data row.
             db.add_chapter_data(downloaded.id, "<p>one two three</p>")
                 .unwrap();
-        }
+            (downloaded.id, pending.id)
+        };
 
         let token = state.sessions.create();
         let app = router(Arc::clone(&state));
@@ -671,6 +676,20 @@ mod tests {
         assert!(
             !text.contains("0 words"),
             "a pending chapter must never render as \"0 words\": {}",
+            text
+        );
+
+        // The download link would 404 for a chapter with no `raw_data` row
+        // (`chapter_epub` rejects it deliberately) — the TOC must not offer
+        // a link that cannot work.
+        assert!(
+            text.contains(&format!("/source/test-source/chapter/{}/epub", downloaded_id)),
+            "the downloaded chapter must still offer its EPUB link: {}",
+            text
+        );
+        assert!(
+            !text.contains(&format!("/source/test-source/chapter/{}/epub", pending_id)),
+            "a pending chapter must not offer an EPUB link that can only 404: {}",
             text
         );
     }

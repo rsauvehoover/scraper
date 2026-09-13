@@ -58,9 +58,15 @@ pub async fn source_toc(
                                 @if let Some(published) = &chapter.published {
                                     span class="date" { (published) }
                                 }
-                                a class="dl" href={
-                                    "/source/" (source_id) "/chapter/" (chapter.id) "/epub"
-                                } { "EPUB" }
+                                // A pending chapter has no `raw_data` row, so
+                                // its EPUB link would 404 (`chapter_epub`
+                                // rejects it deliberately) — don't offer a
+                                // link that cannot work.
+                                @if chapter.downloaded {
+                                    a class="dl" href={
+                                        "/source/" (source_id) "/chapter/" (chapter.id) "/epub"
+                                    } { "EPUB" }
+                                }
                             }
                         }
                     }
