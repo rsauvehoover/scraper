@@ -371,67 +371,75 @@ impl Config {
 }
 
 pub fn load_config() -> Config {
-    if !std::path::Path::new("config.json").exists() {
-        println!("No config.json found, using default values");
+    load_config_from(std::path::Path::new("config.json"))
+}
+
+/// Load config from an explicit path. `load_config()` is this with
+/// `config.json`, preserved so the CLI is unchanged.
+pub fn load_config_from(path: &std::path::Path) -> Config {
+    if !path.exists() {
+        println!("No {} found, using default values", path.display());
         println!("Request delay is 1000ms");
         return Config::default();
     }
 
-    match std::fs::read_to_string("config.json") {
-        Ok(str) => match serde_json::from_str::<Config>(&str) {
-            Ok(mut config) => {
-                println!("Loaded config");
-                println!("Delay is {}ms", config.request_delay);
-                println!(
-                    "Sending from <{}> at <{}>",
-                    config.mail.name, config.mail.address
-                );
-                for dest in &config.mail.destinations {
-                    println!("Sending to <{}> at <{}>", dest.name, dest.email);
-                }
+    match std::fs::read_to_string(path) {
+        Ok(str) => parse_and_migrate(&str),
+        Err(e) => panic!("{}", e),
+    }
+}
 
-                for dest in &config.mail.destinations {
-                    if dest.sources.is_empty() {
-                        // User receives all sources — use top-level defaults
-                        if dest.strip_colour {
+fn parse_and_migrate(raw: &str) -> Config {
+    match serde_json::from_str::<Config>(raw) {
+        Ok(mut config) => {
+            println!("Loaded config");
+            println!("Delay is {}ms", config.request_delay);
+            println!(
+                "Sending from <{}> at <{}>",
+                config.mail.name, config.mail.address
+            );
+            for dest in &config.mail.destinations {
+                println!("Sending to <{}> at <{}>", dest.name, dest.email);
+            }
+
+            for dest in &config.mail.destinations {
+                if dest.sources.is_empty() {
+                    // User receives all sources — use top-level defaults
+                    if dest.strip_colour {
+                        config.epub_gen.strip_colour = true;
+                    }
+                    if dest.send_full_volumes {
+                        config.epub_gen.volumes = true;
+                    }
+                    if dest.send_individual_chapters {
+                        config.epub_gen.chapters = true;
+                    }
+                } else {
+                    for source_id in dest.sources.keys() {
+                        let resolved = dest.source_config(source_id);
+                        if resolved.strip_colour {
                             config.epub_gen.strip_colour = true;
                         }
-                        if dest.send_full_volumes {
+                        if resolved.send_full_volumes {
                             config.epub_gen.volumes = true;
                         }
-                        if dest.send_individual_chapters {
+                        if resolved.send_individual_chapters {
                             config.epub_gen.chapters = true;
-                        }
-                    } else {
-                        for source_id in dest.sources.keys() {
-                            let resolved = dest.source_config(source_id);
-                            if resolved.strip_colour {
-                                config.epub_gen.strip_colour = true;
-                            }
-                            if resolved.send_full_volumes {
-                                config.epub_gen.volumes = true;
-                            }
-                            if resolved.send_individual_chapters {
-                                config.epub_gen.chapters = true;
-                            }
                         }
                     }
                 }
-
-                // Backward compatibility: migrate legacy config to multi-source format
-                config = migrate_legacy_config(config);
-
-                // Print enabled sources
-                for source in config.enabled_sources() {
-                    println!("Source enabled: {} ({})", source.name, source.id);
-                }
-
-                config
             }
-            Err(e) => {
-                panic!("{}", e);
+
+            // Backward compatibility: migrate legacy config to multi-source format
+            config = migrate_legacy_config(config);
+
+            // Print enabled sources
+            for source in config.enabled_sources() {
+                println!("Source enabled: {} ({})", source.name, source.id);
             }
-        },
+
+            config
+        }
         Err(e) => {
             panic!("{}", e);
         }
