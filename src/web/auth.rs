@@ -60,14 +60,54 @@ pub fn load_credential(path: &Path) -> Result<String, String> {
     Ok(parsed.argon2)
 }
 
-/// Write the credential file at mode 600.
+/// Write the credential file at mode 600, atomically.
+///
+/// Temp file beside the target, then rename — matching
+/// `webconfig::write_atomic`'s shape, and for the same reason: a crash
+/// between truncating and writing must never leave a half-written or empty
+/// credential file in place. An empty file is worse here than in
+/// `webconfig.rs`, because `load_credential` treats an empty hash as an
+/// error — that would lock the operator out of their own admin UI with no
+/// way back in except editing the file by hand.
+///
+/// The mode is forced unconditionally after writing rather than relied on
+/// from `OpenOptions::mode`, because POSIX `open()` only applies the mode
+/// argument when it actually creates the inode (`O_CREAT` on a path that did
+/// not exist). The temp path here is always new, so that part is fine; the
+/// unconditional `set_permissions` matters when this whole file is a rename
+/// target that itself might have started life some other way (a backup
+/// restore, a hand copy) before ever going through this function once.
 pub fn store_credential(path: &Path, phc: &str) -> io::Result<()> {
     let body = serde_json::to_string_pretty(&CredentialFile {
         argon2: phc.to_string(),
     })
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    write_private(path, body.as_bytes())
+    // `Path::parent()` returns `Some("")` for a bare relative filename, not
+    // `None` — see the identical note in `webconfig::write_atomic`.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("web-auth.json"));
+    let tmp = dir.join(format!(
+        "{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    write_private(&tmp, body.as_bytes())?;
+    force_private_mode(&tmp)?;
+    std::fs::rename(&tmp, path)?;
+
+    // Durability of the rename itself, as in `webconfig::write_atomic`.
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -87,6 +127,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+#[cfg(unix)]
+fn force_private_mode(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+// This crate also ships a Windows MSI (`cargo wix`), so this arm is live
+// code, not dead code. Windows has no unix mode bits, so permissions are
+// left to OS defaults on non-unix targets, matching `webconfig.rs`.
+#[cfg(not(unix))]
+fn force_private_mode(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn random_token() -> String {
@@ -243,6 +297,24 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "credential file must not be readable by others");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_credential_is_tightened_when_the_file_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.json");
+
+        // A pre-existing, world-readable file: a backup restore, a hand copy,
+        // or an earlier tool. Rotation must tighten it, not inherit it.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        store_credential(&path, &hash_password("hunter2hunter2").unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rotation must tighten an existing file, got {mode:o}");
     }
 
     #[test]
