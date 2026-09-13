@@ -41,9 +41,18 @@ pub struct WebArgs {
     #[arg(long, default_value = "config.json")]
     pub config_file: PathBuf,
 
-    /// Set the Secure flag on the session cookie. Off by default because a
-    /// deployment may terminate TLS at a proxy and reach this service over
-    /// plain HTTP. Turn on when TLS reaches this service directly.
+    /// Set the Secure flag on the session cookie, which stops the browser
+    /// from sending it over plain HTTP.
+    ///
+    /// Turn this on whenever browsers reach the site over HTTPS — including
+    /// when TLS terminates at a reverse proxy and the hop from that proxy to
+    /// this service is plaintext. The attribute constrains the browser's leg
+    /// of the connection, the only leg the browser can see; where TLS
+    /// terminates behind the proxy does not enter into it.
+    ///
+    /// Off by default because it fails closed on a plain-HTTP deployment:
+    /// the browser withholds the cookie, so a correct password appears to
+    /// log in and then bounce straight back to the login form.
     #[arg(long)]
     pub secure_cookies: bool,
 
