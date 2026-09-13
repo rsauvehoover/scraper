@@ -43,7 +43,8 @@ impl SourceDatabase {
     /// Deliberately NOT `SQLITE_OPEN_READ_ONLY`: a WAL reader must be able to
     /// write the `-shm` index, so a read-only handle fails against exactly the
     /// databases this project uses. `PRAGMA query_only` enforces the guarantee
-    /// at the SQLite level instead. The process still needs group write on `db/`.
+    /// at the SQLite level instead. The process still needs filesystem write
+    /// permission on `db/` even though it never writes through SQLite.
     ///
     /// Does not call `initialize_schema`: schema creation is a write, and this
     /// handle cannot write.
@@ -93,10 +94,10 @@ impl SourceDatabase {
 
     /// Initialize the database schema
     fn initialize_schema(&self) -> Result<()> {
-        // WAL lets the frontend read while the hourly cron job writes: readers
-        // never block the writer and the writer never blocks readers. The setting
-        // is persistent in the file header, so the scraper applies it once and the
-        // frontend inherits it.
+        // WAL lets the web process read while a scheduled scraper run writes:
+        // readers never block the writer and the writer never blocks readers. The
+        // setting is persistent in the file header, so the scraper applies it once
+        // and the web process inherits it.
         //
         // `PRAGMA journal_mode=WAL` returns the resulting mode as a row, so it
         // cannot be issued through `pragma_update` (which expects no rows and

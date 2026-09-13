@@ -141,4 +141,15 @@ mod tests {
         let entry = registry.get("wandering-inn").expect("configured id resolves");
         assert_eq!(entry.config.id, "wandering-inn");
     }
+
+    /// `SourceRegistry` goes into `Arc<AppState>` as axum state, which requires
+    /// `Send + Sync`. `rusqlite::Connection` wraps a `RefCell` and is not
+    /// `Sync`, so `SourceEntry.db` must stay wrapped in a `Mutex`. This fails
+    /// to compile if that wrapper is ever removed.
+    #[test]
+    fn registry_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SourceRegistry>();
+        assert_send_sync::<SourceEntry>();
+    }
 }
