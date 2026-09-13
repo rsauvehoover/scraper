@@ -38,6 +38,28 @@ impl SourceDatabase {
         Ok(db)
     }
 
+    /// Open a source database for reading only.
+    ///
+    /// Deliberately NOT `SQLITE_OPEN_READ_ONLY`: a WAL reader must be able to
+    /// write the `-shm` index, so a read-only handle fails against exactly the
+    /// databases this project uses. `PRAGMA query_only` enforces the guarantee
+    /// at the SQLite level instead. The process still needs group write on `db/`.
+    ///
+    /// Does not call `initialize_schema`: schema creation is a write, and this
+    /// handle cannot write.
+    pub fn open_query_only(source_id: &str) -> Result<Self> {
+        let db_dir = Path::new("db");
+        let db_path = db_dir.join(format!("{}.db", source_id));
+        let conn = Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(SourceDatabase {
+            conn,
+            source_id: source_id.to_string(),
+            db_path,
+        })
+    }
+
     /// Open an in-memory database for tests
     #[cfg(test)]
     pub fn open_in_memory(source_id: &str) -> Result<Self> {
@@ -71,6 +93,26 @@ impl SourceDatabase {
 
     /// Initialize the database schema
     fn initialize_schema(&self) -> Result<()> {
+        // WAL lets the frontend read while the hourly cron job writes: readers
+        // never block the writer and the writer never blocks readers. The setting
+        // is persistent in the file header, so the scraper applies it once and the
+        // frontend inherits it.
+        //
+        // `PRAGMA journal_mode=WAL` returns the resulting mode as a row, so it
+        // cannot be issued through `pragma_update` (which expects no rows and
+        // errors with `ExecuteReturnedResults`). An in-memory database cannot
+        // use WAL and reports "memory" instead; a file-backed database reports
+        // "wal". Both are success — anything else is a genuine failure and
+        // propagates.
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        debug_assert!(
+            mode == "wal" || mode == "memory",
+            "unexpected journal_mode after WAL request: {}",
+            mode
+        );
+
         // Source metadata table
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS source_metadata(
@@ -374,10 +416,83 @@ impl SourceDatabase {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     fn test_db() -> SourceDatabase {
         SourceDatabase::open_in_memory("test-source").unwrap()
+    }
+
+    /// Restores the process cwd on drop, including on unwind from a panic.
+    /// Without this, a failed assertion partway through a cwd-mutating test
+    /// would leave the process in the tempdir for every test that runs next.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(dir: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn wal_mode_engages_on_file_backed_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = {
+            let _cwd = CwdGuard::change_to(dir.path());
+            SourceDatabase::open("t").unwrap()
+        };
+
+        let mode: String = db
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    #[serial]
+    fn query_only_connection_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ro = {
+            let _cwd = CwdGuard::change_to(dir.path());
+            std::fs::create_dir_all("db").unwrap();
+
+            // Create and populate through a normal handle.
+            {
+                let db = SourceDatabase::open("t").unwrap();
+                let vol = db.add_volume("Volume 1").unwrap();
+                db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+            }
+
+            SourceDatabase::open_query_only("t").unwrap()
+        };
+
+        // Reads work.
+        let vols = ro
+            .connection()
+            .prepare("SELECT COUNT(*) FROM volumes")
+            .unwrap()
+            .query_row([], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(vols, 1);
+
+        // Writes do not.
+        let err = ro
+            .connection()
+            .execute("INSERT INTO volumes(name) VALUES ('Volume 2')", []);
+        assert!(err.is_err(), "query_only handle must reject writes");
     }
 
     #[test]
