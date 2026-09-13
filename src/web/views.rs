@@ -834,7 +834,7 @@ mod tests {
             credential: hash_password("hunter2-hunter2").unwrap(),
             config_path: std::path::PathBuf::from("config.json"),
             secure_cookies: false,
-            trust_forwarded_for: false,
+            client_ip_from: crate::web::app::ClientIpSource::Peer,
             epub_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }

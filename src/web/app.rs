@@ -68,13 +68,45 @@ pub struct WebArgs {
     #[arg(long)]
     pub set_password: bool,
 
-    /// Trust `X-Forwarded-For` for the client address used by login rate
-    /// limiting. Off by default: the header is client-controlled, so honouring
-    /// it on a directly-reachable service lets an attacker rotate it for
-    /// unlimited attempts. Turn it on only when a reverse proxy in front of
-    /// this service overwrites the header.
-    #[arg(long)]
-    pub trust_forwarded_for: bool,
+    /// Where to read the client address used for login rate limiting.
+    ///
+    /// Defaults to the connection's peer address, which a client cannot
+    /// forge. Behind a reverse proxy that address is the PROXY for every
+    /// request, so all clients collapse into a single bucket and anyone who
+    /// can reach the login page can exhaust it and lock the operator out.
+    /// A proxied deployment should name the header its proxy sets.
+    #[arg(long, value_enum, default_value = "peer")]
+    pub client_ip_from: ClientIpSource,
+}
+
+/// Where `login_submit` reads the client address it rate-limits on.
+///
+/// One setting with three values rather than a flag per header: the sources
+/// are mutually exclusive, and a bool per header makes "both set" a state
+/// someone has to invent a precedence rule for.
+///
+/// Every header option is a statement by the operator that their proxy
+/// controls that header. Getting that wrong is not a small mistake — a
+/// client-settable value here hands an attacker a fresh bucket per request
+/// and the limiter stops existing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ClientIpSource {
+    /// The TCP peer address. Unforgeable, and right for a service clients
+    /// reach directly. Wrong behind a proxy, for the reason above.
+    Peer,
+    /// The LAST entry of `X-Forwarded-For`.
+    ///
+    /// Last, not first. The common nginx idiom
+    /// (`$proxy_add_x_forwarded_for`) APPENDS, so a client that sends its
+    /// own `X-Forwarded-For` keeps that value at the head of the list and
+    /// only the final entry was written by the proxy itself. Keying on the
+    /// first entry would therefore read attacker-controlled text. The last
+    /// entry is also correct for a proxy that overwrites rather than
+    /// appends, since then it is the only entry.
+    XForwardedFor,
+    /// `X-Real-IP`, whole. Carries one value with no list semantics, so a
+    /// proxy that sets it necessarily overwrites it.
+    XRealIp,
 }
 
 pub struct AppState {
@@ -85,9 +117,9 @@ pub struct AppState {
     pub credential: String,
     pub config_path: PathBuf,
     pub secure_cookies: bool,
-    /// Whether `X-Forwarded-For` is trusted for login rate limiting. See
-    /// `WebArgs::trust_forwarded_for`.
-    pub trust_forwarded_for: bool,
+    /// Where the login rate limiter reads the client address. See
+    /// `WebArgs::client_ip_from`.
+    pub client_ip_from: ClientIpSource,
     /// EPUB generation is CPU-bound and each build holds several megabytes,
     /// so concurrent builds are capped rather than unbounded.
     pub epub_permits: Arc<Semaphore>,
@@ -112,7 +144,7 @@ impl AppState {
             credential: hash_password("hunter2").unwrap(),
             config_path: PathBuf::from("config.json"),
             secure_cookies: false,
-            trust_forwarded_for: false,
+            client_ip_from: ClientIpSource::Peer,
             epub_permits: Arc::new(Semaphore::new(2)),
         }
     }
@@ -176,20 +208,30 @@ async fn login_submit(
     headers: HeaderMap,
     axum::Form(form): axum::Form<LoginForm>,
 ) -> Response {
-    // The peer address cannot be forged by the client. X-Forwarded-For can, so
-    // it is consulted only when the operator has asserted a proxy overwrites
-    // it. Keyed on the IP, not the full socket address — the source port
-    // changes per connection, so including it would give every attempt its
-    // own bucket and defeat the limiter entirely.
-    let client = if state.trust_forwarded_for {
-        headers
+    // Keyed on the IP, not the full socket address — the source port changes
+    // per connection, so including it would give every attempt its own bucket
+    // and defeat the limiter entirely.
+    //
+    // A header is read only because the operator named it, and an absent or
+    // empty one falls back to the peer address: keying on "" would drop every
+    // header-less request into one shared bucket, which is the lockout this
+    // setting exists to prevent.
+    let client = match state.client_ip_from {
+        ClientIpSource::Peer => peer.ip().to_string(),
+        ClientIpSource::XForwardedFor => headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
+            // Last entry: see `ClientIpSource::XForwardedFor`.
+            .and_then(|v| v.rsplit(',').next())
             .map(|v| v.trim().to_string())
-            .unwrap_or_else(|| peer.ip().to_string())
-    } else {
-        peer.ip().to_string()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| peer.ip().to_string()),
+        ClientIpSource::XRealIp => headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| peer.ip().to_string()),
     };
 
     if !state.limiter.check(&client) {
@@ -288,7 +330,7 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
         credential,
         config_path: args.config_file.clone(),
         secure_cookies: args.secure_cookies,
-        trust_forwarded_for: args.trust_forwarded_for,
+        client_ip_from: args.client_ip_from,
         epub_permits: Arc::new(Semaphore::new(2)),
     });
 
@@ -369,13 +411,19 @@ mod tests {
     /// RFC 5737) throughout these tests, so the fixture is obviously
     /// synthetic.
     fn login_request(peer: SocketAddr, forwarded_for: &str) -> Request<Body> {
-        let mut req = Request::builder()
+        login_request_with(peer, &[("x-forwarded-for", forwarded_for)])
+    }
+
+    /// The same, with an explicit header set — including none at all.
+    fn login_request_with(peer: SocketAddr, extra: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder()
             .method("POST")
             .uri("/login")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("x-forwarded-for", forwarded_for)
-            .body(Body::from("password=wrong"))
-            .unwrap();
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder.body(Body::from("password=wrong")).unwrap();
         req.extensions_mut().insert(ConnectInfo(peer));
         req
     }
@@ -499,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_for_cannot_bypass_the_rate_limit_when_untrusted() {
-        // `trust_forwarded_for` defaults to `false`.
+        // `client_ip_from` defaults to `Peer`.
         let state = test_state();
         let app = router(Arc::clone(&state));
         let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
@@ -536,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn forwarded_for_gives_separate_buckets_when_trusted() {
         let mut state = AppState::for_test();
-        state.trust_forwarded_for = true;
+        state.client_ip_from = ClientIpSource::XForwardedFor;
         let state = Arc::new(state);
         let app = router(Arc::clone(&state));
         let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
@@ -575,6 +623,191 @@ mod tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "a distinct forwarded client must get its own bucket"
+        );
+    }
+
+    /// The spoofing case the LAST-entry rule exists for.
+    ///
+    /// nginx's `$proxy_add_x_forwarded_for` appends, so a client that sends
+    /// its own `X-Forwarded-For` keeps that forged value at the HEAD of the
+    /// list while the proxy's own observation lands at the tail. Keying on
+    /// the head would mint a fresh bucket per request and the limiter would
+    /// never fire. This is the exact proxy configuration deployed in front
+    /// of this service, so it is not a hypothetical.
+    #[tokio::test]
+    async fn forwarded_for_ignores_a_forged_leading_entry() {
+        let mut state = AppState::for_test();
+        state.client_ip_from = ClientIpSource::XForwardedFor;
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
+
+        // A different forged head every time; the tail — what the proxy
+        // appended — is one client throughout.
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request(
+                    peer,
+                    &format!("198.51.100.{i}, 203.0.113.7"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(login_request(peer, "198.51.100.99, 203.0.113.7"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a forged leading entry must not mint a fresh bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_ip_gives_separate_buckets() {
+        let mut state = AppState::for_test();
+        state.client_ip_from = ClientIpSource::XRealIp;
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
+
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request_with(peer, &[("x-real-ip", "203.0.113.1")]))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(login_request_with(peer, &[("x-real-ip", "203.0.113.1")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the exhausted client must now be blocked"
+        );
+
+        // Same peer (the proxy), different real client: its own bucket.
+        let response = app
+            .clone()
+            .oneshot(login_request_with(peer, &[("x-real-ip", "203.0.113.2")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a distinct real client must get its own bucket"
+        );
+    }
+
+    /// A header-less request must not key on the empty string. If it did,
+    /// every such request would share one bucket and ten of them would lock
+    /// out the very clients this setting is meant to separate.
+    #[tokio::test]
+    async fn a_missing_real_ip_header_falls_back_to_the_peer() {
+        let mut state = AppState::for_test();
+        state.client_ip_from = ClientIpSource::XRealIp;
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
+        let other_peer = SocketAddr::from(([192, 0, 2, 2], 1234));
+
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request_with(peer, &[]))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(login_request_with(peer, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "with no header present the peer address must still bound attempts"
+        );
+
+        // Proof the fallback key is the peer and not one shared bucket.
+        let response = app
+            .clone()
+            .oneshot(login_request_with(other_peer, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a different peer must not inherit the exhausted bucket"
+        );
+    }
+
+    /// The header PRESENT but empty, which is the case the emptiness filter
+    /// actually covers — an absent header never reaches it. Without the
+    /// filter both peers below would key on "" and share one bucket.
+    #[tokio::test]
+    async fn an_empty_real_ip_header_falls_back_to_the_peer() {
+        let mut state = AppState::for_test();
+        state.client_ip_from = ClientIpSource::XRealIp;
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 3], 1234));
+        let other_peer = SocketAddr::from(([192, 0, 2, 4], 1234));
+
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request_with(peer, &[("x-real-ip", "")]))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(login_request_with(peer, &[("x-real-ip", "")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an empty header must still bound attempts by peer"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(login_request_with(other_peer, &[("x-real-ip", "")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an empty header must not collapse distinct peers into one bucket"
         );
     }
 
