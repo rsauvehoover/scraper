@@ -39,8 +39,16 @@ tokio = { version = "1.29.1", features = ["full"] }
 thiserror = "2.0"
 async-trait = "0.1"
 clap = { version = "4.4", features = ["derive"] }
+axum = "0.8.9"
+tower-http = { version = "0.7.1", features = ["fs", "trace", "limit"] }
+maud = { version = "0.27.0", features = ["axum"] }
+ammonia = "4.1.4"
+argon2 = "0.6.0"
+rand = "0.10.2"
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serial_test = "4.0.1"
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }

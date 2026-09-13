@@ -11,4 +11,5 @@ pub mod mail;
 pub mod postprocess;
 pub mod sources;
 pub mod stats;
+pub mod web;
 pub mod webconfig;
