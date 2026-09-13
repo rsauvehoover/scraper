@@ -4,7 +4,7 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 use rusttype::{Font, Scale};
 use std::{
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     path::Path,
 };
 
@@ -21,8 +21,8 @@ pub struct EpubContext<'a> {
 
 /// Load font for cover text rendering
 fn load_font() -> Option<Font<'static>> {
-    let font_data = std::fs::read("src/font/RobotoSlab-VariableFont_wght.ttf").ok()?;
-    Font::try_from_vec(font_data)
+    const FONT_DATA: &[u8] = include_bytes!("font/RobotoSlab-VariableFont_wght.ttf");
+    Font::try_from_bytes(FONT_DATA)
 }
 
 /// Calculate the width of rendered text
@@ -134,11 +134,8 @@ fn sanitize_filename(name: &str) -> String {
     name.replace(['/', '\\'], "-")
 }
 
-fn load_stylesheet() -> String {
-    let mut file = std::fs::File::open("src/assets/style.css").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    contents
+fn load_stylesheet() -> &'static str {
+    include_str!("assets/style.css")
 }
 
 fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -> String {
@@ -441,6 +438,7 @@ pub async fn generate_epubs_for_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn sanitize_filename_replaces_path_separators() {
@@ -450,5 +448,24 @@ mod tests {
         );
         assert_eq!(sanitize_filename("back\\slash"), "back-slash");
         assert_eq!(sanitize_filename("plain name"), "plain name");
+    }
+
+    #[serial]
+    #[test]
+    fn assets_load_without_filesystem_access() {
+        // Changing to a directory with no src/ must not panic. This is the
+        // regression guard for the cwd-relative .unwrap() that made
+        // /opt/scraper/src a required symlink.
+        let tmp = std::env::temp_dir();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let css = load_stylesheet();
+        let font = load_font();
+
+        std::env::set_current_dir(original).unwrap();
+
+        assert!(!css.is_empty(), "stylesheet must be embedded");
+        assert!(font.is_some(), "font must be embedded");
     }
 }
