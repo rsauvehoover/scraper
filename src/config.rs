@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MailConfig {
     pub name: String,
@@ -12,6 +12,22 @@ pub struct MailConfig {
     pub smtp_port: u16,
     pub destinations: Vec<UserConfig>,
 }
+
+impl std::fmt::Debug for MailConfig {
+    /// Deliberately hand-written. `Mail.Password` is a live Gmail app password;
+    /// a derived `Debug` puts it in any log line that formats a Config.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailConfig")
+            .field("name", &self.name)
+            .field("address", &self.address)
+            .field("password", &"<redacted>")
+            .field("smtp_hostname", &self.smtp_hostname)
+            .field("smtp_port", &self.smtp_port)
+            .field("destinations", &self.destinations)
+            .finish()
+    }
+}
+
 impl Default for MailConfig {
     fn default() -> Self {
         MailConfig {
@@ -439,4 +455,20 @@ fn migrate_legacy_config(mut config: Config) -> Config {
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_the_password() {
+        let mail = MailConfig {
+            password: "abcdefghijklmnop".to_string(),
+            ..MailConfig::default()
+        };
+        let rendered = format!("{:?}", mail);
+        assert!(!rendered.contains("abcdefghijklmnop"));
+        assert!(rendered.contains("<redacted>"));
+    }
 }
