@@ -30,6 +30,9 @@ pub struct VolumeStat {
     pub name: String,
     pub chapters: Vec<ChapterStat>,
     pub words: usize,
+    /// Chapters in `chapters` that the TOC lists but the scraper has not
+    /// downloaded yet (no `raw_data` row). See `SourceStat::pending_chapters`.
+    pub pending_chapters: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,15 @@ pub struct SourceStat {
     pub volumes: Vec<VolumeStat>,
     pub total_words: usize,
     pub total_chapters: usize,
+    /// Chapters the TOC lists but the scraper has not downloaded yet (no
+    /// `raw_data` row). Between `update_index` and `download_all_chapters`,
+    /// and for any chapter whose download fails, such rows exist. They are
+    /// kept in `VolumeStat::chapters` (with `words: 0`) so the TOC listing
+    /// stays complete, but excluded from `total_words`, `total_chapters`,
+    /// and `mean_chapter_words` — folding a pending chapter in as a
+    /// zero-word chapter would make these statistics disagree with
+    /// `wordcount.py`, which inner-joins `raw_data` and never sees it.
+    pub pending_chapters: usize,
     pub mean_chapter_words: usize,
     pub latest_published: Option<String>,
 }
@@ -94,6 +106,9 @@ fn compute(entry: &SourceEntry) -> SourceStat {
         .collect();
 
     for (vol_id, vol_name) in vol_rows {
+        // LEFT JOIN, not INNER: a chapter the TOC lists but the scraper has
+        // not downloaded yet still needs a row here, for the TOC listing.
+        // It is kept out of the word/chapter totals below instead.
         let mut ch_stmt = conn
             .prepare(
                 "SELECT c.id, c.name, c.uri, rd.data
@@ -104,33 +119,55 @@ fn compute(entry: &SourceEntry) -> SourceStat {
             )
             .expect("chapters query");
 
-        let chapters: Vec<ChapterStat> = ch_stmt
+        let rows: Vec<(isize, String, String, Option<String>)> = ch_stmt
             .query_map([vol_id], |r| {
-                let data: Option<String> = r.get(3)?;
-                let uri: String = r.get(2)?;
-                Ok(ChapterStat {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    published: published_from_uri(&uri),
-                    uri,
-                    words: data.as_deref().map(count_words).unwrap_or(0),
-                })
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .expect("chapters query")
             .filter_map(|r| r.ok())
             .collect();
 
-        let words = chapters.iter().map(|c| c.words).sum();
+        let mut chapters: Vec<ChapterStat> = Vec::with_capacity(rows.len());
+        let mut volume_words = 0usize;
+        let mut volume_pending = 0usize;
+
+        for (id, name, uri, data) in rows {
+            let published = published_from_uri(&uri);
+            let words = match &data {
+                Some(html) => count_words(html),
+                None => {
+                    volume_pending += 1;
+                    0
+                }
+            };
+            volume_words += words;
+            chapters.push(ChapterStat {
+                id,
+                name,
+                uri,
+                words,
+                published,
+            });
+        }
+
         volumes.push(VolumeStat {
             id: vol_id,
             name: vol_name,
+            words: volume_words,
+            pending_chapters: volume_pending,
             chapters,
-            words,
         });
     }
 
     let total_words: usize = volumes.iter().map(|v| v.words).sum();
-    let total_chapters: usize = volumes.iter().map(|v| v.chapters.len()).sum();
+    let pending_chapters: usize = volumes.iter().map(|v| v.pending_chapters).sum();
+    // Downloaded chapters only, matching wordcount.py's inner join on
+    // raw_data — a pending chapter is listed (see `chapters` above) but
+    // does not count toward totals until it has content.
+    let total_chapters: usize = volumes
+        .iter()
+        .map(|v| v.chapters.len() - v.pending_chapters)
+        .sum();
     let latest_published = volumes
         .iter()
         .flat_map(|v| v.chapters.iter())
@@ -142,6 +179,7 @@ fn compute(entry: &SourceEntry) -> SourceStat {
         name: entry.config.name.clone(),
         total_words,
         total_chapters,
+        pending_chapters,
         mean_chapter_words: mean_words(total_words, total_chapters),
         latest_published,
         volumes,
@@ -233,5 +271,54 @@ mod tests {
         assert_eq!(mean_words(0, 0), 0);
         assert_eq!(mean_words(10, 0), 0);
         assert_eq!(mean_words(100, 4), 25);
+    }
+
+    #[test]
+    fn pending_chapter_is_excluded_from_totals_but_listed() {
+        use crate::config::{Config, SourceConfig};
+        use crate::db::SourceRegistry;
+
+        let mut config = Config::default();
+        config.sources = vec![SourceConfig {
+            id: "test-pending".to_string(),
+            name: "Test Pending".to_string(),
+            enabled: true,
+            ..SourceConfig::default()
+        }];
+        let registry = SourceRegistry::from_config_for_test(&config);
+        let entry = registry.get("test-pending").expect("configured source resolves");
+
+        {
+            let db = entry.db();
+            let vol_id = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", vol_id)
+                .unwrap();
+            db.add_chapter("Chapter 2", "https://example.com/c2", vol_id)
+                .unwrap();
+            let chapters = db.get_chapters_by_volume(vol_id).unwrap();
+            let downloaded = chapters
+                .iter()
+                .find(|c| c.name == "Chapter 1")
+                .expect("chapter 1 exists");
+            // Chapter 2 is left without a `raw_data` row: a chapter the TOC
+            // has listed but the scraper has not downloaded yet.
+            db.add_chapter_data(downloaded.id, "<p>one two three</p>")
+                .unwrap();
+        }
+
+        let stat = compute(entry);
+
+        assert_eq!(stat.total_chapters, 1, "pending chapter must not count toward the total");
+        assert_eq!(stat.pending_chapters, 1);
+        assert_eq!(stat.total_words, 3);
+        assert_eq!(
+            stat.volumes[0].chapters.len(),
+            2,
+            "the pending chapter must still appear in the TOC listing"
+        );
+        assert_eq!(
+            stat.mean_chapter_words, 3,
+            "mean must divide by downloaded chapters, not all listed chapters"
+        );
     }
 }
