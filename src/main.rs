@@ -2,17 +2,11 @@ use std::path::Path;
 
 use clap::Parser;
 
-mod config;
-mod db;
-mod epub;
-mod error;
-mod mail;
-mod postprocess;
-mod sources;
-
-use db::{migration, SourceDatabase};
-use postprocess::ProcessorRegistry;
-use sources::{ScraperClient, ScraperRegistry};
+use wandering_inn_scraper::config;
+use wandering_inn_scraper::db::{migration, SourceDatabase};
+use wandering_inn_scraper::epub;
+use wandering_inn_scraper::postprocess::ProcessorRegistry;
+use wandering_inn_scraper::sources::{ScraperClient, ScraperRegistry};
 
 /// Multi-source web serial scraper
 #[derive(Parser, Debug)]
