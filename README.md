@@ -57,14 +57,124 @@ entry is matched by URL and updated in place, so the chapter is never duplicated
 in the same form the TOC will use (same scheme/host/path; a trailing-slash difference is tolerated).
 Re-running with an already-seeded URL is a no-op.
 
+## Web frontend
+
+`wandering_inn_scraper web` serves a read-only view of the scraped data plus a
+configuration editor. It runs alongside the scraper and never writes to the
+databases through SQLite.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bind` | `127.0.0.1:8080` | Address to listen on |
+| `--auth-file` | `web-auth.json` | Admin credential (argon2id), mode 600 |
+| `--config-file` | `config.json` | The configuration this service edits |
+| `--secure-cookies` | off | Set the Secure flag on the session cookie; turn on when TLS reaches this service directly |
+| `--trust-forwarded-for` | off | Trust `X-Forwarded-For` for login rate limiting; only enable behind a reverse proxy that overwrites the header |
+| `--set-password` | | Prompt for a new admin password, write it, and exit |
+
+The server is a subcommand of the scraper binary, not a separate one:
+`wandering_inn_scraper web`. The packaging step produces one binary per
+invocation, so a second binary would mean a second package to build, ship,
+and version — the subcommand keeps it to one.
+
+Set a password before the first run; the server refuses to start without one:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+The admin credential is deliberately kept out of `config.json`, because this
+service can rewrite `config.json`.
+
+Run it from the same working directory as the scraper: `config.json`, `db/`
+and `build/` are all resolved relative to the process's current directory,
+not the binary's location.
+
+It opens the databases with `PRAGMA query_only`, so it never writes through
+SQLite. It still needs filesystem **write** permission on `db/` — that is not
+a mistake: SQLite's WAL mode requires even a read-only connection to be able
+to create and update the `-shm` shared-memory index file, so a reader that
+cannot write to the directory cannot open the database at all.
+
+It never creates a database, though, so a source that is configured but has
+never been scraped has no `db/{source-id}.db` for it to read. Such a source is
+skipped at startup with a warning on stderr and does not appear in the UI;
+run the scraper for it once and restart. The same applies to a database that
+exists but has no tables. One unreadable source never stops the server from
+starting.
+
+The admin password is read once at process startup and held in memory for
+the life of the process. Rotating it with `--set-password` writes the new
+credential to `--auth-file` immediately, but the running server keeps using
+the old one until it is restarted. If the old password still works after a
+rotation, that means "restart pending", not "rotation failed".
+
+The configuration editor writes `config.json` immediately, and the next
+scraper run reads the new file, but this server reads the source list once at
+startup. Adding, removing or renaming a source therefore does not change what
+the UI shows until the web service is restarted — the save confirmation says
+so. Mail and EPUB settings have no such caveat: only the scraper reads those,
+and it reads them per run.
+
+The server and the scraper are one binary, so a binary upgrade replaces the
+file on disk without restarting whatever process is already running it.
+After upgrading, restart the web service explicitly and check the version in
+the page footer rather than trusting the installed package version.
+
+### Running as a service
+
+The server reads the admin credential at startup and refuses to serve without
+one. Set it before enabling a service unit:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+Enabling the unit first is not harmful, but the service exits immediately with
+an error naming the missing file, and a unit with `Restart=on-failure` repeats
+that every few seconds until the credential exists.
+
+`config.json`, `db/` and the credential file are all resolved relative to the
+process working directory, so a unit must set its working directory to the
+scraper's data directory. A service started anywhere else starts cleanly and
+reports every configured source as configured but not yet scraped — that is
+the signature of a wrong working directory, not of missing databases.
+
+### Operational notes
+
+Sessions and login rate-limit state are held in memory, so a restart drops
+both. Every upgrade therefore signs all users out, and so does every password
+rotation, because `--set-password` only takes effect on restart. Dropping the
+rate-limit state also means a restart clears an active lockout.
+
+While the service runs it holds each database open, so SQLite never
+checkpoints and `db/*.db-wal` and `db/*.db-shm` persist at rest. They do not
+appear when only the scraper runs, which checkpoints and closes. Anything
+copying `db/` must take the `-wal` sibling along with its `.db`, or go through
+`sqlite3 <file> ".backup <dest>"`; copying the `.db` alone can capture an
+inconsistent database.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories
 
 ### Linux/MacOS
 ```bash
-cargo bundle --release
+cargo bundle --release --format deb
 ```
+
+On Linux, a bare `cargo bundle --release` also attempts an AppImage, which
+needs `mksquashfs` from `squashfs-tools`. Without it the command exits 1
+*after* it has already written a complete `.deb`, so a script or CI job that
+trusts the exit code throws away a good package. `--format deb` avoids that;
+installing `squashfs-tools` also works.
+
+The `.deb` filename is built from the crate name while the package inside is
+named by `[package.metadata.bundle] name`, so the two disagree:
+`wandering_inn_scraper_<version>_<arch>.deb` contains the package `scraper`.
+Confirm with `dpkg-deb -f <file> Package`. Renaming the package also means a
+new install does not upgrade an older one in place — both ship the same
+binary path, so remove the old package before installing the new one.
 
 ### Windows
 NOTE: `cargo wix` doesn't show any output by default, run with `-v` and `--nocapture` flags to see verbose output.

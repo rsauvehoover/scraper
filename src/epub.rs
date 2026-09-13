@@ -4,7 +4,7 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 use rusttype::{Font, Scale};
 use std::{
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     path::Path,
 };
 
@@ -21,8 +21,8 @@ pub struct EpubContext<'a> {
 
 /// Load font for cover text rendering
 fn load_font() -> Option<Font<'static>> {
-    let font_data = std::fs::read("src/font/RobotoSlab-VariableFont_wght.ttf").ok()?;
-    Font::try_from_vec(font_data)
+    const FONT_DATA: &[u8] = include_bytes!("font/RobotoSlab-VariableFont_wght.ttf");
+    Font::try_from_bytes(FONT_DATA)
 }
 
 /// Calculate the width of rendered text
@@ -134,11 +134,8 @@ fn sanitize_filename(name: &str) -> String {
     name.replace(['/', '\\'], "-")
 }
 
-fn load_stylesheet() -> String {
-    let mut file = std::fs::File::open("src/assets/style.css").unwrap();
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    contents
+fn load_stylesheet() -> &'static str {
+    include_str!("assets/style.css")
 }
 
 fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -> String {
@@ -153,17 +150,16 @@ fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -
     processed
 }
 
-fn generate_chapter(
+/// Build a single-chapter EPUB in memory. Touches no filesystem path.
+pub fn build_chapter_epub(
     db: &SourceDatabase,
     chapter: &Chapter,
-    output_dir: &Path,
     ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
-    std::fs::create_dir_all(output_dir.join("individual"))?;
-
     let safe_name = sanitize_filename(&chapter.name);
+
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
     epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
@@ -192,15 +188,25 @@ fn generate_chapter(
 
     epub.generate(&mut output)?;
 
-    let filename = format!("{}({}).epub", &chapter.id, &safe_name);
-
-    let mut file = std::fs::File::create(output_dir.join("individual").join(&filename))?;
-    file.write_all(&output)?;
     Ok(Attachment {
-        filename,
+        filename: format!("{}({}).epub", &chapter.id, &safe_name),
         mime: String::from("application/epub+zip"),
         bytes: output,
     })
+}
+
+fn generate_chapter(
+    db: &SourceDatabase,
+    chapter: &Chapter,
+    output_dir: &Path,
+    ctx: &EpubContext,
+    strip_colour: bool,
+) -> Result<Attachment, Box<dyn std::error::Error>> {
+    let attachment = build_chapter_epub(db, chapter, ctx, strip_colour)?;
+    std::fs::create_dir_all(output_dir.join("individual"))?;
+    let mut file = std::fs::File::create(output_dir.join("individual").join(&attachment.filename))?;
+    file.write_all(&attachment.bytes)?;
+    Ok(attachment)
 }
 
 fn generate_chapters(
@@ -281,11 +287,11 @@ fn generate_chapters(
     Ok(attachments)
 }
 
-fn generate_volume(
+/// Build a volume EPUB in memory. Touches no filesystem path.
+pub fn build_volume_epub(
     db: &SourceDatabase,
     volume: &Volume,
     chapters: &[Chapter],
-    output_dir: &Path,
     ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
@@ -313,9 +319,12 @@ fn generate_volume(
     for chapter in chapters {
         let raw_data = match db.get_chapter_data(chapter.id) {
             Err(rusqlite::Error::QueryReturnedNoRows) if chapter.id == last_chapter_id => {
-                println!("  Failed to fetch data for last chapter ({}), assuming unreleased content.", chapter.name);
-                continue
-            },
+                println!(
+                    "  Failed to fetch data for last chapter ({}), assuming unreleased content.",
+                    chapter.name
+                );
+                continue;
+            }
             Err(e) => return Err(e.into()),
             Ok(data) => data,
         };
@@ -333,18 +342,27 @@ fn generate_volume(
 
     epub.generate(&mut output)?;
 
-    std::fs::create_dir_all(output_dir)?;
-
-    let filename = format!("{}.epub", safe_volume_name);
-
-    let mut file = std::fs::File::create(output_dir.join(&filename))?;
-    file.write_all(&output)?;
-
     Ok(Attachment {
-        filename,
+        filename: format!("{}.epub", safe_volume_name),
         mime: String::from("application/epub+zip"),
         bytes: output,
     })
+}
+
+/// Build a volume EPUB and persist it under `output_dir`. CLI path only.
+fn generate_volume(
+    db: &SourceDatabase,
+    volume: &Volume,
+    chapters: &[Chapter],
+    output_dir: &Path,
+    ctx: &EpubContext,
+    strip_colour: bool,
+) -> Result<Attachment, Box<dyn std::error::Error>> {
+    let attachment = build_volume_epub(db, volume, chapters, ctx, strip_colour)?;
+    std::fs::create_dir_all(output_dir)?;
+    let mut file = std::fs::File::create(output_dir.join(&attachment.filename))?;
+    file.write_all(&attachment.bytes)?;
+    Ok(attachment)
 }
 
 /// Generate EPUBs for a specific source
@@ -441,6 +459,78 @@ pub async fn generate_epubs_for_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SourceDatabase;
+    use serial_test::serial;
+
+    fn fixture_db() -> (SourceDatabase, Volume, Vec<Chapter>) {
+        let db = SourceDatabase::open_in_memory("test-source").unwrap();
+        let vol_id = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("Chapter One", "https://example.com/c1", vol_id)
+            .unwrap();
+        let chapters = db.get_chapters_by_volume(vol_id).unwrap();
+        db.add_chapter_data(chapters[0].id, "<h1>Chapter One</h1><p>body text</p>")
+            .unwrap();
+        let chapters = db.get_chapters_by_volume(vol_id).unwrap();
+        (
+            db,
+            Volume {
+                id: vol_id,
+                name: "Volume 1".to_string(),
+            },
+            chapters,
+        )
+    }
+
+    // `build_volume_epub` takes no path parameter, so the no-write guarantee
+    // is primarily structural: there is nothing to write through today. This
+    // test guards against that guarantee being eroded by a *relative*-path
+    // write creeping back in (e.g. `File::create("out.epub")` or a stray
+    // `create_dir_all`) — it does not, and cannot, prove the function writes
+    // nowhere on the filesystem in general, since an absolute path is not
+    // ruled out by this check.
+    #[serial]
+    #[test]
+    fn build_volume_epub_writes_no_files_in_cwd() {
+        let (db, volume, chapters) = fixture_db();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = build_volume_epub(&db, &volume, &chapters, &ctx, false);
+
+        std::env::set_current_dir(original).unwrap();
+
+        let after: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        let attachment = result.unwrap();
+        assert_eq!(after.len(), 0, "build must not create files in cwd");
+        assert_eq!(attachment.filename, "Volume 1.epub");
+        assert!(!attachment.bytes.is_empty());
+        // EPUBs are ZIP archives.
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+    }
+
+    #[test]
+    fn build_chapter_epub_returns_bytes() {
+        let (db, _volume, chapters) = fixture_db();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        let attachment = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        assert!(attachment.filename.ends_with(".epub"));
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+        assert_eq!(attachment.mime, "application/epub+zip");
+    }
 
     #[test]
     fn sanitize_filename_replaces_path_separators() {
@@ -450,5 +540,24 @@ mod tests {
         );
         assert_eq!(sanitize_filename("back\\slash"), "back-slash");
         assert_eq!(sanitize_filename("plain name"), "plain name");
+    }
+
+    #[serial]
+    #[test]
+    fn assets_load_without_filesystem_access() {
+        // Changing to a directory with no src/ must not panic. This is the
+        // regression guard for the cwd-relative .unwrap() that forced deployments
+        // to symlink a src/ directory next to the working directory.
+        let tmp = std::env::temp_dir();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        let css = load_stylesheet();
+        let font = load_font();
+
+        std::env::set_current_dir(original).unwrap();
+
+        assert!(!css.is_empty(), "stylesheet must be embedded");
+        assert!(font.is_some(), "font must be embedded");
     }
 }

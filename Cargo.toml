@@ -1,6 +1,6 @@
 [package]
 name = "wandering_inn_scraper"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2018"
 description = "A scraper for the web serial The Wandering Inn"
 authors = ["Frederic Sauve-Hoover"]
@@ -8,7 +8,31 @@ license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "wandering_inn_scraper"
+path = "src/lib.rs"
+
 [package.metadata.bundle]
+# Debian package names permit only lowercase alphanumerics, '-', '+' and '.'.
+# Without this the package inherits the crate name, `wandering_inn_scraper`,
+# whose underscores dpkg-deb rejects outright — so the .deb cargo-bundle
+# writes cannot be rebuilt or repacked by standard Debian tooling, and no
+# repository would accept it. `dpkg -i` is lenient enough to install it
+# anyway, which is how it went unnoticed.
+#
+# The three names this affects are NOT the same name. Line numbers below are
+# cargo-bundle 0.6.0, which is only where the behaviour was read; it was then
+# confirmed empirically against a 0.11.0 build, so treat the mapping as the
+# durable part and the line numbers as a pointer that may drift:
+#   deb_bundle.rs:145  Package: field  <- bundle_name()  = this setting
+#   deb_bundle.rs:60   usr/bin/<name>  <- binary_name()  = the CRATE name
+#   deb_bundle.rs:45   .deb filename   <- binary_name()  = the CRATE name
+# So this fixes the control file, which is what dpkg-deb validates, and
+# leaves the installed binary at /usr/bin/wandering_inn_scraper, which the
+# scheduled job invokes by path. The built .deb FILE also keeps the crate
+# name, so the filename and the package it contains disagree. Cosmetic, but
+# surprising enough to write down.
+name = "scraper"
 identifier = "rsauvehoover/wandering-inn-scraper"
 resources = ["src/assets", "src/font"]
 linux_use_terminal = true
@@ -35,3 +59,16 @@ tokio = { version = "1.29.1", features = ["full"] }
 thiserror = "2.0"
 async-trait = "0.1"
 clap = { version = "4.4", features = ["derive"] }
+axum = "0.8.9"
+tower-http = { version = "0.7.1", features = ["fs", "trace", "limit"] }
+maud = { version = "0.27.0", features = ["axum"] }
+ammonia = "4.1.4"
+argon2 = "0.6.0"
+rand = "0.10.2"
+percent-encoding = "2.3.2"
+
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serial_test = "4.0.1"
+tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }

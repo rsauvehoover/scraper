@@ -38,6 +38,80 @@ impl SourceDatabase {
         Ok(db)
     }
 
+    /// Open an existing source database for reading only.
+    ///
+    /// Deliberately NOT `SQLITE_OPEN_READ_ONLY`: a WAL reader must be able to
+    /// write the `-shm` index, so a read-only handle fails against exactly the
+    /// databases this project uses. `PRAGMA query_only` enforces the guarantee
+    /// at the SQLite level instead. The process still needs filesystem write
+    /// permission on `db/` even though it never writes through SQLite.
+    ///
+    /// `SQLITE_OPEN_CREATE` is left out on purpose. `Connection::open` sets it,
+    /// and it creates a zero-byte file for a database that does not exist —
+    /// which would make this process write to `db/` after all, contradicting
+    /// what the README promises, and would turn "this source has never been
+    /// scraped" into a silently empty database instead of an error. Without
+    /// the flag, a missing file is `SqliteFailure(14, "unable to open database
+    /// file")` and the caller decides what to do about it.
+    ///
+    /// Does not call `initialize_schema`: schema creation is a write, and this
+    /// handle cannot write. A database that opens is therefore not necessarily
+    /// one the scraper has ever populated — see `has_scraper_schema`.
+    ///
+    /// Deliberately `pub(crate)`, not `pub`. `source_id` is interpolated into
+    /// a path with no validation here, so this function does nothing to stop a
+    /// traversal on its own — what stops it is that both callers
+    /// (`SourceRegistry::from_config`, and `web::download`'s blocking tasks,
+    /// which run only after `SourceRegistry::get` has matched the id against
+    /// the configured list) pass a string that has already been compared
+    /// against the configured IDs. That is a convention this signature cannot
+    /// enforce; keeping the constructor crate-private keeps the set of places
+    /// that have to honour it small enough to check by reading them.
+    pub(crate) fn open_query_only(source_id: &str) -> Result<Self> {
+        use rusqlite::OpenFlags;
+
+        let db_path = Self::path_for(source_id);
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(SourceDatabase {
+            conn,
+            source_id: source_id.to_string(),
+            db_path,
+        })
+    }
+
+    /// Where `open_query_only` would look for `source_id`'s database, without
+    /// opening it.
+    ///
+    /// Exists so a caller that just got an open failure can tell "the file
+    /// isn't there yet" (a source added to config but never scraped) apart
+    /// from any other reason the open could fail, by checking this path
+    /// itself — without duplicating the `db/{id}.db` convention at the call
+    /// site.
+    pub(crate) fn path_for(source_id: &str) -> PathBuf {
+        Path::new("db").join(format!("{}.db", source_id))
+    }
+
+    /// Whether this database carries the tables `initialize_schema` creates.
+    ///
+    /// A query-only handle cannot create them, so a source that has been added
+    /// to `config.json` but never scraped opens fine and then fails every
+    /// query with "no such table". Callers use this to tell that apart from a
+    /// database that is merely empty.
+    pub(crate) fn has_scraper_schema(&self) -> Result<bool> {
+        let found: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('volumes', 'chapters', 'raw_data')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(found == 3)
+    }
+
     /// Open an in-memory database for tests
     #[cfg(test)]
     pub fn open_in_memory(source_id: &str) -> Result<Self> {
@@ -71,6 +145,34 @@ impl SourceDatabase {
 
     /// Initialize the database schema
     fn initialize_schema(&self) -> Result<()> {
+        // WAL lets the web process read while a scheduled scraper run writes:
+        // readers never block the writer and the writer never blocks readers. The
+        // setting is persistent in the file header, so the scraper applies it once
+        // and the web process inherits it.
+        //
+        // `PRAGMA journal_mode=WAL` returns the resulting mode as a row, so it
+        // cannot be issued through `pragma_update` (which expects no rows and
+        // errors with `ExecuteReturnedResults`). An in-memory database cannot
+        // use WAL and reports "memory" instead; a file-backed database reports
+        // "wal". Both are success — anything else is a genuine failure and
+        // propagates.
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if mode != "wal" && mode != "memory" {
+            // Not fatal: the database still works in any journal mode, just
+            // with readers and the writer blocking each other. But this must
+            // be visible, because every claim about concurrent access rests
+            // on WAL actually being in effect -- and a check that only runs
+            // in debug builds would vanish from the release build that
+            // actually runs.
+            eprintln!(
+                "warning: requested WAL journal mode for {} but SQLite reports '{}'; \
+                 readers and the writer will block each other",
+                self.source_id, mode
+            );
+        }
+
         // Source metadata table
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS source_metadata(
@@ -374,10 +476,83 @@ impl SourceDatabase {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     fn test_db() -> SourceDatabase {
         SourceDatabase::open_in_memory("test-source").unwrap()
+    }
+
+    /// Restores the process cwd on drop, including on unwind from a panic.
+    /// Without this, a failed assertion partway through a cwd-mutating test
+    /// would leave the process in the tempdir for every test that runs next.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(dir: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn wal_mode_engages_on_file_backed_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = {
+            let _cwd = CwdGuard::change_to(dir.path());
+            SourceDatabase::open("t").unwrap()
+        };
+
+        let mode: String = db
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    #[serial]
+    fn query_only_connection_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ro = {
+            let _cwd = CwdGuard::change_to(dir.path());
+            std::fs::create_dir_all("db").unwrap();
+
+            // Create and populate through a normal handle.
+            {
+                let db = SourceDatabase::open("t").unwrap();
+                let vol = db.add_volume("Volume 1").unwrap();
+                db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+            }
+
+            SourceDatabase::open_query_only("t").unwrap()
+        };
+
+        // Reads work.
+        let vols = ro
+            .connection()
+            .prepare("SELECT COUNT(*) FROM volumes")
+            .unwrap()
+            .query_row([], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(vols, 1);
+
+        // Writes do not.
+        let err = ro
+            .connection()
+            .execute("INSERT INTO volumes(name) VALUES ('Volume 2')", []);
+        assert!(err.is_err(), "query_only handle must reject writes");
     }
 
     #[test]

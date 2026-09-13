@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MailConfig {
     pub name: String,
@@ -12,6 +12,36 @@ pub struct MailConfig {
     pub smtp_port: u16,
     pub destinations: Vec<UserConfig>,
 }
+
+impl std::fmt::Debug for MailConfig {
+    /// Deliberately hand-written. `Mail.Password` is a live Gmail app password;
+    /// a derived `Debug` puts it in any log line that formats a Config.
+    ///
+    /// Destructured, not field-accessed, on purpose: a field added to
+    /// `MailConfig` later must not be able to reach `Debug` output without
+    /// someone here choosing where it goes. Field access would let it vanish
+    /// silently; destructuring makes the compiler refuse to build until this
+    /// impl says what happens to it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MailConfig {
+            name,
+            address,
+            password: _,
+            smtp_hostname,
+            smtp_port,
+            destinations,
+        } = self;
+        f.debug_struct("MailConfig")
+            .field("name", name)
+            .field("address", address)
+            .field("password", &"<redacted>")
+            .field("smtp_hostname", smtp_hostname)
+            .field("smtp_port", smtp_port)
+            .field("destinations", destinations)
+            .finish()
+    }
+}
+
 impl Default for MailConfig {
     fn default() -> Self {
         MailConfig {
@@ -341,67 +371,83 @@ impl Config {
 }
 
 pub fn load_config() -> Config {
-    if !std::path::Path::new("config.json").exists() {
-        println!("No config.json found, using default values");
+    load_config_from(std::path::Path::new("config.json"))
+}
+
+/// Load config from an explicit path. `load_config()` is this with
+/// `config.json`, preserved so the CLI is unchanged.
+pub fn load_config_from(path: &std::path::Path) -> Config {
+    if !path.exists() {
+        println!("No {} found, using default values", path.display());
         println!("Request delay is 1000ms");
         return Config::default();
     }
 
-    match std::fs::read_to_string("config.json") {
-        Ok(str) => match serde_json::from_str::<Config>(&str) {
-            Ok(mut config) => {
-                println!("Loaded config");
-                println!("Delay is {}ms", config.request_delay);
-                println!(
-                    "Sending from <{}> at <{}>",
-                    config.mail.name, config.mail.address
-                );
-                for dest in &config.mail.destinations {
-                    println!("Sending to <{}> at <{}>", dest.name, dest.email);
-                }
+    match std::fs::read_to_string(path) {
+        Ok(str) => parse_and_migrate(&str),
+        Err(e) => panic!("{}", e),
+    }
+}
 
-                for dest in &config.mail.destinations {
-                    if dest.sources.is_empty() {
-                        // User receives all sources — use top-level defaults
-                        if dest.strip_colour {
+fn parse_and_migrate(raw: &str) -> Config {
+    match serde_json::from_str::<Config>(raw) {
+        Ok(mut config) => {
+            println!("Loaded config");
+            println!("Delay is {}ms", config.request_delay);
+            // Names and counts, not addresses. This runs at startup for the
+            // long-running web service as well as for a one-shot scrape, so
+            // its output lands in a log file that outlives the process and is
+            // read by whoever can read logs. An address list there is a
+            // standing copy of everyone's mail address for no operational
+            // gain — the names identify the destinations well enough, and the
+            // config editor shows the addresses to an authenticated operator.
+            println!("Sending from <{}>", config.mail.name);
+            let names: Vec<&str> = config
+                .mail
+                .destinations
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            println!("Sending to {} destinations: {}", names.len(), names.join(", "));
+
+            for dest in &config.mail.destinations {
+                if dest.sources.is_empty() {
+                    // User receives all sources — use top-level defaults
+                    if dest.strip_colour {
+                        config.epub_gen.strip_colour = true;
+                    }
+                    if dest.send_full_volumes {
+                        config.epub_gen.volumes = true;
+                    }
+                    if dest.send_individual_chapters {
+                        config.epub_gen.chapters = true;
+                    }
+                } else {
+                    for source_id in dest.sources.keys() {
+                        let resolved = dest.source_config(source_id);
+                        if resolved.strip_colour {
                             config.epub_gen.strip_colour = true;
                         }
-                        if dest.send_full_volumes {
+                        if resolved.send_full_volumes {
                             config.epub_gen.volumes = true;
                         }
-                        if dest.send_individual_chapters {
+                        if resolved.send_individual_chapters {
                             config.epub_gen.chapters = true;
-                        }
-                    } else {
-                        for source_id in dest.sources.keys() {
-                            let resolved = dest.source_config(source_id);
-                            if resolved.strip_colour {
-                                config.epub_gen.strip_colour = true;
-                            }
-                            if resolved.send_full_volumes {
-                                config.epub_gen.volumes = true;
-                            }
-                            if resolved.send_individual_chapters {
-                                config.epub_gen.chapters = true;
-                            }
                         }
                     }
                 }
-
-                // Backward compatibility: migrate legacy config to multi-source format
-                config = migrate_legacy_config(config);
-
-                // Print enabled sources
-                for source in config.enabled_sources() {
-                    println!("Source enabled: {} ({})", source.name, source.id);
-                }
-
-                config
             }
-            Err(e) => {
-                panic!("{}", e);
+
+            // Backward compatibility: migrate legacy config to multi-source format
+            config = migrate_legacy_config(config);
+
+            // Print enabled sources
+            for source in config.enabled_sources() {
+                println!("Source enabled: {} ({})", source.name, source.id);
             }
-        },
+
+            config
+        }
         Err(e) => {
             panic!("{}", e);
         }
@@ -439,4 +485,20 @@ fn migrate_legacy_config(mut config: Config) -> Config {
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_the_password() {
+        let mail = MailConfig {
+            password: "abcdefghijklmnop".to_string(),
+            ..MailConfig::default()
+        };
+        let rendered = format!("{:?}", mail);
+        assert!(!rendered.contains("abcdefghijklmnop"));
+        assert!(rendered.contains("<redacted>"));
+    }
 }
