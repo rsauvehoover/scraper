@@ -305,16 +305,16 @@ fn reader_css(theme: ReaderTheme) -> String {
 }
 
 const READER_LIGHT: &str = r#"
-:root { --reader-fg:#1c1c1c; --reader-bg:#ffffff; --reader-accent:#3a5a8c; }
+:root { color-scheme: light; --reader-fg:#1c1c1c; --reader-bg:#ffffff; --reader-accent:#3a5a8c; }
 "#;
 
 const READER_DARK: &str = r#"
-:root { --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
+:root { color-scheme: dark; --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
 "#;
 
 const READER_AUTO_DARK: &str = r#"
 @media (prefers-color-scheme: dark) {
-  :root { --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
+  :root { color-scheme: dark; --reader-fg:#e4e4e2; --reader-bg:#1f1f24; --reader-accent:#8ab0e4; }
 }
 "#;
 
@@ -565,6 +565,43 @@ mod tests {
         );
         assert_eq!(response.headers().get("referrer-policy").unwrap(), "no-referrer");
         assert_eq!(response.headers().get("x-frame-options").unwrap(), "SAMEORIGIN");
+    }
+
+    /// Without `color-scheme` the frame's native form widgets and scrollbars
+    /// render in light chrome regardless of the palette, no matter which
+    /// reader theme is selected.
+    #[test]
+    fn every_reader_variant_declares_color_scheme() {
+        let auto = super::reader_css(super::ReaderTheme::Auto);
+        assert!(
+            auto.contains("color-scheme: light"),
+            "auto must start from the light color-scheme: {}",
+            auto
+        );
+        assert!(
+            auto.contains("color-scheme: dark"),
+            "auto must switch to the dark color-scheme under prefers-color-scheme: {}",
+            auto
+        );
+
+        let light = super::reader_css(super::ReaderTheme::Light);
+        assert!(
+            light.contains("color-scheme: light"),
+            "the light theme must declare a light color-scheme: {}",
+            light
+        );
+        assert!(
+            !light.contains("color-scheme: dark"),
+            "the light theme must not also declare a dark color-scheme: {}",
+            light
+        );
+
+        let dark = super::reader_css(super::ReaderTheme::Dark);
+        assert!(
+            dark.contains("color-scheme: dark"),
+            "an explicit dark choice must declare a dark color-scheme: {}",
+            dark
+        );
     }
 
     #[test]

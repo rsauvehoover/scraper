@@ -30,18 +30,21 @@ use crate::web::toc::format_thousands;
 /// test for that.
 const PALETTE: &str = r#"
 :root {
+  color-scheme: light;
   --fg:#1c1c1c; --muted:#666666; --line:#e2e2e2; --accent:#3a5a8c;
   --bg:#fdfdfc; --surface:#ffffff; --on-accent:#ffffff;
   --note-bg:#fff8e6; --note-line:#f0dca0; --error:#a3272c; --ok:#2a7a3f;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --fg:#e4e4e2; --muted:#9b9b97; --line:#33333a; --accent:#8ab0e4;
     --bg:#17171a; --surface:#1f1f24; --on-accent:#10131a;
     --note-bg:#2d2718; --note-line:#5c4f26; --error:#ef8a8f; --ok:#79c98d;
   }
 }
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --fg:#e4e4e2; --muted:#9b9b97; --line:#33333a; --accent:#8ab0e4;
   --bg:#17171a; --surface:#1f1f24; --on-accent:#10131a;
   --note-bg:#2d2718; --note-line:#5c4f26; --error:#ef8a8f; --ok:#79c98d;
@@ -52,6 +55,8 @@ const BASE: &str = r#"
 * { box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
        margin:0; background:var(--bg); color:var(--fg); line-height:1.55; }
+a { color:var(--accent); }
+a:visited { color:var(--accent); }
 header { border-bottom:1px solid var(--line); padding:0.85rem 1.5rem;
          display:flex; gap:1.25rem; align-items:baseline; }
 header a { color:var(--accent); text-decoration:none; font-weight:500; }
@@ -408,6 +413,7 @@ pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{page, BASE, PALETTE, PREPAINT_SCRIPT, THEME_SCRIPT};
+    use std::collections::HashMap;
 
     /// A colour left hardcoded in the rules is simply wrong in one of the two
     /// themes, and the mistake is invisible to whoever is looking at the theme
@@ -531,5 +537,175 @@ mod tests {
             "the toggle must carry the theme into the sandboxed reader: {}",
             THEME_SCRIPT
         );
+    }
+
+    /// A link inside a table cell (or anywhere else with no more specific
+    /// selector) must not fall back to the browser's own blue/purple
+    /// defaults. `a:visited` matters as much as the base rule: without it,
+    /// any link the operator has actually clicked keeps the browser's default
+    /// visited purple regardless of what `a` says.
+    #[test]
+    fn every_link_has_a_declared_colour_including_visited() {
+        assert!(
+            BASE.contains("a { color:var(--accent); }"),
+            "a base `a` colour rule using the palette is required: {}",
+            BASE
+        );
+        assert!(
+            BASE.contains("a:visited { color:var(--accent); }"),
+            "an `a:visited` rule using the palette is required, or the \
+             browser's visited-link purple wins for any clicked link: {}",
+            BASE
+        );
+
+        // The base rule has to come before the more specific selectors so
+        // those still win the cascade.
+        let base_pos = BASE.find("a { color:var(--accent); }").unwrap();
+        let header_pos = BASE.find("header a {").unwrap();
+        let summary_pos = BASE.find(".summary a {").unwrap();
+        assert!(
+            base_pos < header_pos && base_pos < summary_pos,
+            "the base `a` rule must precede the more specific link rules: {}",
+            BASE
+        );
+
+        // The one deliberate exception: chapter titles read as text, not
+        // links, and must keep using --fg rather than the new base rule.
+        assert!(
+            BASE.contains("ol.chapters li a:first-child { flex:1; color:var(--fg);"),
+            "chapter titles must keep their deliberate --fg colour: {}",
+            BASE
+        );
+    }
+
+    /// Without `color-scheme` the browser renders native widgets (form
+    /// controls, scrollbars, `::placeholder` text) in light chrome no matter
+    /// what the palette says, because nothing here told it a dark theme was
+    /// in play.
+    #[test]
+    fn color_scheme_is_declared_in_every_root_block() {
+        let light = PALETTE.split("@media").next().unwrap();
+        let media = PALETTE.split("@media").nth(1).unwrap();
+        let dark_blocks: Vec<&str> = PALETTE
+            .match_indices(":root[data-theme=\"dark\"]")
+            .map(|(i, _)| &PALETTE[i..])
+            .collect();
+
+        assert!(
+            light.contains("color-scheme: light;"),
+            "the bare :root block must declare color-scheme: light: {}",
+            light
+        );
+        assert!(
+            media.contains("color-scheme: dark;"),
+            "the prefers-color-scheme block must declare color-scheme: dark: {}",
+            media
+        );
+        assert!(
+            dark_blocks[0].contains("color-scheme: dark;"),
+            "the [data-theme=\"dark\"] block must declare color-scheme: dark: {}",
+            dark_blocks[0]
+        );
+    }
+
+    /// sRGB relative luminance per the WCAG formula, on a 0..=1 linear scale.
+    fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        fn linearise(channel: u8) -> f64 {
+            let c = channel as f64 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * linearise(r) + 0.7152 * linearise(g) + 0.0722 * linearise(b)
+    }
+
+    /// WCAG contrast ratio between two colours, order-independent.
+    fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    fn parse_hex(value: &str) -> (u8, u8, u8) {
+        let value = value.trim().trim_start_matches('#');
+        assert_eq!(value.len(), 6, "expected a 6-digit hex colour, got {}", value);
+        let byte = |i: usize| u8::from_str_radix(&value[i..i + 2], 16).unwrap();
+        (byte(0), byte(2), byte(4))
+    }
+
+    /// Pulls every `--name:#rrggbb` declaration out of one `:root`-style
+    /// block, so the test checks whatever the palette currently says rather
+    /// than a copy pasted into the test.
+    fn parse_palette_vars(block: &str) -> HashMap<String, (u8, u8, u8)> {
+        let mut vars = HashMap::new();
+        for decl in block.split(';') {
+            let decl = decl.trim();
+            let Some(rest) = decl.strip_prefix("--") else { continue };
+            let Some((name, value)) = rest.split_once(':') else { continue };
+            if !value.trim().starts_with('#') {
+                continue;
+            }
+            vars.insert(name.trim().to_string(), parse_hex(value));
+        }
+        vars
+    }
+
+    /// Extracts the declaration list of one `selector { ... }` block,
+    /// assuming (as is true of every block here) that it contains no nested
+    /// braces of its own.
+    fn extract_block<'a>(css: &'a str, selector: &str) -> &'a str {
+        let start = css.find(selector).unwrap_or_else(|| panic!("{} not found in: {}", selector, css));
+        let open = css[start..].find('{').map(|i| start + i).unwrap();
+        let close = css[open..].find('}').map(|i| open + i).unwrap();
+        &css[open + 1..close]
+    }
+
+    /// Every foreground colour the palette defines must read against every
+    /// background it is meant to sit on, at the 4.5:1 WCAG AA threshold for
+    /// body text, in both themes. This is exactly the class of bug that let
+    /// browser-default link blue through undetected: a colour pairing that
+    /// nothing checked.
+    #[test]
+    fn every_palette_pair_meets_wcag_aa_contrast() {
+        let light = parse_palette_vars(extract_block(PALETTE, "\n:root {"));
+        let dark = parse_palette_vars(extract_block(PALETTE, ":root[data-theme=\"dark\"]"));
+
+        for (theme_name, vars) in [("light", &light), ("dark", &dark)] {
+            let get = |name: &str| {
+                *vars
+                    .get(name)
+                    .unwrap_or_else(|| panic!("--{} missing from the {} palette", name, theme_name))
+            };
+            let fg = get("fg");
+            let muted = get("muted");
+            let accent = get("accent");
+            let bg = get("bg");
+            let surface = get("surface");
+            let on_accent = get("on-accent");
+
+            for (fg_name, fg_colour) in [("fg", fg), ("muted", muted), ("accent", accent)] {
+                for (bg_name, bg_colour) in [("bg", bg), ("surface", surface)] {
+                    let ratio = contrast_ratio(fg_colour, bg_colour);
+                    assert!(
+                        ratio >= 4.5,
+                        "{} theme: --{} on --{} is only {:.2}:1, needs 4.5:1",
+                        theme_name,
+                        fg_name,
+                        bg_name,
+                        ratio
+                    );
+                }
+            }
+
+            let ratio = contrast_ratio(on_accent, accent);
+            assert!(
+                ratio >= 4.5,
+                "{} theme: --on-accent on --accent is only {:.2}:1, needs 4.5:1",
+                theme_name,
+                ratio
+            );
+        }
     }
 }
