@@ -11,6 +11,12 @@ use crate::web::app::AppState;
 use crate::web::sanitize::sanitize_chapter;
 use crate::web::views::page;
 
+/// Shown to the client whenever the cause is a database fault rather than a
+/// missing row. The real cause carries schema names and file paths, so it is
+/// logged at the point it is known instead of returned. Mirrors the constant
+/// of the same name in `web::download`.
+const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
 pub async fn source_toc(
     State(state): State<Arc<AppState>>,
     AxumPath(source_id): AxumPath<String>,
@@ -18,7 +24,16 @@ pub async fn source_toc(
     let Some(entry) = state.registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
-    let stat = state.stats.get(entry);
+    // This page is one source, so there is nothing to degrade to: a scan that
+    // fails is a 500, with the cause logged rather than shown (it can carry
+    // schema names and file paths).
+    let stat = match state.stats.get(entry) {
+        Ok(stat) => stat,
+        Err(e) => {
+            eprintln!("statistics scan failed for {}: {}", source_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
+        }
+    };
 
     page(
         &stat.name,
@@ -97,8 +112,22 @@ pub async fn chapter_page(
         [chapter_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     );
-    let Ok((name, downloaded)) = row else {
-        return (StatusCode::NOT_FOUND, "Unknown chapter").into_response();
+    // `QueryReturnedNoRows` means the chapter genuinely does not exist. Any
+    // other error is a backend fault (locked file, corruption, missing schema)
+    // and reporting it as 404 sends whoever debugs it looking for a missing row
+    // instead of the real failure. Same policy as `web::download`.
+    let (name, downloaded) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return (StatusCode::NOT_FOUND, "Unknown chapter").into_response()
+        }
+        Err(e) => {
+            eprintln!(
+                "chapter lookup failed for {}/{}: {}",
+                source_id, chapter_id, e
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
+        }
     };
 
     page(
@@ -142,8 +171,20 @@ pub async fn chapter_raw(
         [chapter_id],
         |r| r.get(0),
     );
-    let Ok(raw) = raw else {
-        return (StatusCode::NOT_FOUND, "Chapter not downloaded").into_response();
+    // As in `chapter_page`: no row means the chapter has not been downloaded;
+    // anything else is a fault and must not be dressed up as a 404.
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return (StatusCode::NOT_FOUND, "Chapter not downloaded").into_response()
+        }
+        Err(e) => {
+            eprintln!(
+                "chapter body lookup failed for {}/{}: {}",
+                source_id, chapter_id, e
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
+        }
     };
 
     let body = sanitize_chapter(&raw);

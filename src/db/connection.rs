@@ -38,7 +38,7 @@ impl SourceDatabase {
         Ok(db)
     }
 
-    /// Open a source database for reading only.
+    /// Open an existing source database for reading only.
     ///
     /// Deliberately NOT `SQLITE_OPEN_READ_ONLY`: a WAL reader must be able to
     /// write the `-shm` index, so a read-only handle fails against exactly the
@@ -46,18 +46,36 @@ impl SourceDatabase {
     /// at the SQLite level instead. The process still needs filesystem write
     /// permission on `db/` even though it never writes through SQLite.
     ///
-    /// Does not call `initialize_schema`: schema creation is a write, and this
-    /// handle cannot write.
+    /// `SQLITE_OPEN_CREATE` is left out on purpose. `Connection::open` sets it,
+    /// and it creates a zero-byte file for a database that does not exist —
+    /// which would make this process write to `db/` after all, contradicting
+    /// what the README promises, and would turn "this source has never been
+    /// scraped" into a silently empty database instead of an error. Without
+    /// the flag, a missing file is `SqliteFailure(14, "unable to open database
+    /// file")` and the caller decides what to do about it.
     ///
-    /// Deliberately not `pub`: the only caller should be `SourceRegistry`,
-    /// which resolves a user-supplied source ID against the configured list
-    /// before it ever reaches this function. A `pub` constructor here would
-    /// let a handler interpolate an unvalidated string into a path directly,
-    /// silently reopening the traversal hole the registry exists to close.
+    /// Does not call `initialize_schema`: schema creation is a write, and this
+    /// handle cannot write. A database that opens is therefore not necessarily
+    /// one the scraper has ever populated — see `has_scraper_schema`.
+    ///
+    /// Deliberately `pub(crate)`, not `pub`. `source_id` is interpolated into
+    /// a path with no validation here, so this function does nothing to stop a
+    /// traversal on its own — what stops it is that both callers
+    /// (`SourceRegistry::from_config`, and `web::download`'s blocking tasks,
+    /// which run only after `SourceRegistry::get` has matched the id against
+    /// the configured list) pass a string that has already been compared
+    /// against the configured IDs. That is a convention this signature cannot
+    /// enforce; keeping the constructor crate-private keeps the set of places
+    /// that have to honour it small enough to check by reading them.
     pub(crate) fn open_query_only(source_id: &str) -> Result<Self> {
+        use rusqlite::OpenFlags;
+
         let db_dir = Path::new("db");
         let db_path = db_dir.join(format!("{}.db", source_id));
-        let conn = Connection::open(&db_path)?;
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "query_only", true)?;
         Ok(SourceDatabase {
@@ -65,6 +83,22 @@ impl SourceDatabase {
             source_id: source_id.to_string(),
             db_path,
         })
+    }
+
+    /// Whether this database carries the tables `initialize_schema` creates.
+    ///
+    /// A query-only handle cannot create them, so a source that has been added
+    /// to `config.json` but never scraped opens fine and then fails every
+    /// query with "no such table". Callers use this to tell that apart from a
+    /// database that is merely empty.
+    pub(crate) fn has_scraper_schema(&self) -> Result<bool> {
+        let found: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('volumes', 'chapters', 'raw_data')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(found == 3)
     }
 
     /// Open an in-memory database for tests

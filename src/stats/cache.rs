@@ -96,17 +96,23 @@ fn mean_words(total_words: usize, chapters: usize) -> usize {
     }
 }
 
-fn compute(entry: &SourceEntry) -> SourceStat {
+/// Scan one source's database.
+///
+/// Returns `Err` rather than panicking on a database fault. The obvious fault
+/// is a source that is configured but has never been scraped: nothing has
+/// created the tables, so every statement here fails with "no such table".
+/// `SourceRegistry::from_config` skips such a source at startup, but a
+/// database can also lose its schema or develop a fault while the process
+/// runs, and a `.expect()` in this path aborts the whole service — a request
+/// handler and the startup warm-up both call it.
+fn compute(entry: &SourceEntry) -> Result<SourceStat, rusqlite::Error> {
     let db = entry.db();
     let conn = db.connection();
     let mut volumes: Vec<VolumeStat> = Vec::new();
 
-    let mut vol_stmt = conn
-        .prepare("SELECT id, name FROM volumes ORDER BY id")
-        .expect("volumes query");
+    let mut vol_stmt = conn.prepare("SELECT id, name FROM volumes ORDER BY id")?;
     let vol_rows: Vec<(isize, String)> = vol_stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .expect("volumes query")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -114,21 +120,18 @@ fn compute(entry: &SourceEntry) -> SourceStat {
         // LEFT JOIN, not INNER: a chapter the TOC lists but the scraper has
         // not downloaded yet still needs a row here, for the TOC listing.
         // It is kept out of the word/chapter totals below instead.
-        let mut ch_stmt = conn
-            .prepare(
-                "SELECT c.id, c.name, c.uri, rd.data
-                 FROM chapters c
-                 LEFT JOIN raw_data rd ON rd.chapter_id = c.id
-                 WHERE c.volumeid = ?1
-                 ORDER BY c.id",
-            )
-            .expect("chapters query");
+        let mut ch_stmt = conn.prepare(
+            "SELECT c.id, c.name, c.uri, rd.data
+             FROM chapters c
+             LEFT JOIN raw_data rd ON rd.chapter_id = c.id
+             WHERE c.volumeid = ?1
+             ORDER BY c.id",
+        )?;
 
         let rows: Vec<(isize, String, String, Option<String>)> = ch_stmt
             .query_map([vol_id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .expect("chapters query")
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -181,7 +184,7 @@ fn compute(entry: &SourceEntry) -> SourceStat {
         .filter_map(|c| c.published.clone())
         .max();
 
-    SourceStat {
+    Ok(SourceStat {
         source_id: entry.config.id.clone(),
         name: entry.config.name.clone(),
         total_words,
@@ -190,7 +193,7 @@ fn compute(entry: &SourceEntry) -> SourceStat {
         mean_chapter_words: mean_words(total_words, total_chapters),
         latest_published,
         volumes,
-    }
+    })
 }
 
 /// Cheap change-detection token for a source's database.
@@ -229,7 +232,16 @@ impl StatsCache {
         }
     }
 
-    pub fn get(&self, entry: &SourceEntry) -> Arc<SourceStat> {
+    /// Statistics for one source, computed on a cache miss.
+    ///
+    /// `Err` carries a database fault. Callers must decide what to show for
+    /// that source rather than having the decision made for them by a panic:
+    /// this runs inside request handlers, and an aggregate page over several
+    /// sources should not go blank because one database is broken. Failures
+    /// are not cached — they are cheap to reproduce and a database that is
+    /// repaired underneath a running process should start working again
+    /// without a restart.
+    pub fn get(&self, entry: &SourceEntry) -> Result<Arc<SourceStat>, rusqlite::Error> {
         let version = data_version(entry);
 
         // Check under the lock, then release it before the scan: a cache
@@ -242,7 +254,7 @@ impl StatsCache {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = guard.get(&entry.config.id) {
                 if cached.version == version {
-                    return Arc::clone(&cached.stat);
+                    return Ok(Arc::clone(&cached.stat));
                 }
             }
         }
@@ -250,7 +262,7 @@ impl StatsCache {
         // Computed WITHOUT the map lock held. Two callers racing a miss on
         // the same source may each compute once; that is idempotent and far
         // cheaper than serialising every request behind one scan.
-        let stat = Arc::new(compute(entry));
+        let stat = Arc::new(compute(entry)?);
 
         let mut guard = self
             .inner
@@ -263,7 +275,7 @@ impl StatsCache {
                 stat: Arc::clone(&stat),
             },
         );
-        stat
+        Ok(stat)
     }
 }
 
@@ -367,7 +379,7 @@ mod tests {
                 .unwrap();
         }
 
-        let stat = compute(entry);
+        let stat = compute(entry).expect("the fixture database has a schema");
 
         assert_eq!(stat.total_chapters, 1, "pending chapter must not count toward the total");
         assert_eq!(stat.pending_chapters, 1);
@@ -380,6 +392,48 @@ mod tests {
         assert_eq!(
             stat.mean_chapter_words, 3,
             "mean must divide by downloaded chapters, not all listed chapters"
+        );
+    }
+
+    /// A database that opens but has no tables is what `open_query_only`
+    /// produces for a source that has been configured but never scraped: it
+    /// deliberately never calls `initialize_schema`, because a query-only
+    /// handle cannot write. Scanning it must be a recoverable error, not a
+    /// panic — this function runs inside request handlers and inside the
+    /// startup cache warm-up, where a panic aborts the process before it
+    /// binds a listener and leaves no HTTP surface to diagnose it through.
+    #[test]
+    #[serial]
+    fn schema_less_database_is_an_error_not_a_panic() {
+        use crate::config::SourceConfig;
+        use crate::db::{SourceDatabase, SourceEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        // A zero-byte file is a valid, empty SQLite database: it opens, and
+        // then every query against it fails with "no such table".
+        std::fs::write("db/never-scraped.db", b"").unwrap();
+
+        let entry = SourceEntry::for_test(
+            SourceConfig {
+                id: "never-scraped".to_string(),
+                name: "Never Scraped".to_string(),
+                ..SourceConfig::default()
+            },
+            SourceDatabase::open_query_only("never-scraped").unwrap(),
+        );
+
+        let err = compute(&entry).expect_err("a schema-less database must not scan cleanly");
+        assert!(
+            err.to_string().contains("no such table"),
+            "expected a missing-table error, got {}",
+            err
+        );
+
+        assert!(
+            StatsCache::new().get(&entry).is_err(),
+            "the cache must surface the fault to its caller rather than panicking"
         );
     }
 
@@ -435,7 +489,7 @@ mod tests {
         );
 
         let cache = StatsCache::new();
-        let first = cache.get(&entry);
+        let first = cache.get(&entry).expect("the fixture database has a schema");
         assert_eq!(first.total_chapters, 1);
         assert_eq!(first.total_words, 3);
 
@@ -454,7 +508,7 @@ mod tests {
             .id;
         writer.add_chapter_data(ch2, "<p>four five</p>").unwrap();
 
-        let second = cache.get(&entry);
+        let second = cache.get(&entry).expect("the fixture database has a schema");
         assert_eq!(
             second.total_chapters, 2,
             "cache must observe the writer's commit, not serve stale data"

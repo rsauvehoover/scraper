@@ -7,9 +7,14 @@
 //! file behind, so what is there can be wrong as well as missing. Generating
 //! from the database is the only correct source.
 //!
-//! No filesystem path is constructed in this module. The source ID resolves
-//! through `SourceRegistry`, and volume and chapter IDs are integers parsed by
-//! the extractor, so a traversal attempt fails before any handler runs.
+//! No filesystem path is constructed in this module, but the source ID it
+//! passes to `SourceDatabase::open_query_only` is interpolated into one there.
+//! What keeps a traversal out is a filter, not the structure: every handler
+//! looks the ID up with `SourceRegistry::get` first, which returns `None` for
+//! anything not in the configured list, and returns 404 before the blocking
+//! task starts. Volume and chapter IDs are `i64`, so those genuinely cannot
+//! carry a path. A new handler here that opened a database without going
+//! through `registry.get` would reopen the hole.
 
 use std::sync::Arc;
 

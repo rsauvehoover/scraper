@@ -96,6 +96,13 @@ a mistake: SQLite's WAL mode requires even a read-only connection to be able
 to create and update the `-shm` shared-memory index file, so a reader that
 cannot write to the directory cannot open the database at all.
 
+It never creates a database, though, so a source that is configured but has
+never been scraped has no `db/{source-id}.db` for it to read. Such a source is
+skipped at startup with a warning on stderr and does not appear in the UI;
+run the scraper for it once and restart. The same applies to a database that
+exists but has no tables. One unreadable source never stops the server from
+starting.
+
 The admin password is read once at process startup and held in memory for
 the life of the process. Rotating it with `--set-password` writes the new
 credential to `--auth-file` immediately, but the running server keeps using

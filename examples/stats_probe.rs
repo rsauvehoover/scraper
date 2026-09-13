@@ -11,7 +11,13 @@ fn main() {
     let mut total_chapters = 0usize;
     let mut total_pending = 0usize;
     for entry in registry.entries() {
-        let stat = cache.get(entry);
+        let stat = match cache.get(entry) {
+            Ok(stat) => stat,
+            Err(e) => {
+                eprintln!("{:<28} unavailable: {}", entry.config.name, e);
+                continue;
+            }
+        };
         println!(
             "{:<28} {:>6} chapters {:>14} words {:>6} pending",
             stat.name, stat.total_chapters, stat.total_words, stat.pending_chapters

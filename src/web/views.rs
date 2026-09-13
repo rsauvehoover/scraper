@@ -10,6 +10,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
+use crate::stats::cache::SourceStat;
 use crate::web::app::AppState;
 use crate::web::toc::format_thousands;
 
@@ -90,12 +91,47 @@ pub fn page(title: &str, body: Markup) -> Markup {
     }
 }
 
+/// Statistics for every registered source, with the ones whose database could
+/// not be read reported separately instead of dropped.
+///
+/// An aggregate page must not go blank because one source's database is
+/// broken, and it must not quietly present a total that is missing a source
+/// either. The cause goes to the log; the page names the sources it could not
+/// read so the omission is visible from the browser.
+fn collect_stats(state: &AppState, page_name: &str) -> (Vec<Arc<SourceStat>>, Vec<String>) {
+    let mut stats = Vec::new();
+    let mut unreadable = Vec::new();
+
+    for entry in state.registry.entries() {
+        match state.stats.get(entry) {
+            Ok(stat) => stats.push(stat),
+            Err(e) => {
+                eprintln!(
+                    "statistics scan failed for {} while rendering {}: {}",
+                    entry.config.id, page_name, e
+                );
+                unreadable.push(entry.config.id.clone());
+            }
+        }
+    }
+
+    (stats, unreadable)
+}
+
+/// The names of sources whose statistics could not be computed, or nothing.
+fn unreadable_note(unreadable: &[String]) -> Markup {
+    html! {
+        @if !unreadable.is_empty() {
+            p class="error" {
+                "Could not read statistics for: " (unreadable.join(", "))
+                ". The totals below exclude them; see the server log for the cause."
+            }
+        }
+    }
+}
+
 pub async fn index(State(state): State<Arc<AppState>>) -> Response {
-    let stats: Vec<_> = state
-        .registry
-        .entries()
-        .map(|e| state.stats.get(e))
-        .collect();
+    let (stats, unreadable) = collect_stats(&state, "the source overview");
 
     let total_words: usize = stats.iter().map(|s| s.total_words).sum();
     let total_chapters: usize = stats.iter().map(|s| s.total_chapters).sum();
@@ -104,6 +140,7 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
     page(
         "Sources",
         html! {
+            (unreadable_note(&unreadable))
             p class="summary" {
                 (stats.len()) " sources · " (format_thousands(total_chapters)) " chapters · "
                 (format_thousands(total_words)) " words"
@@ -155,15 +192,12 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
-    let stats: Vec<_> = state
-        .registry
-        .entries()
-        .map(|e| state.stats.get(e))
-        .collect();
+    let (stats, unreadable) = collect_stats(&state, "the statistics page");
 
     page(
         "Statistics",
         html! {
+            (unreadable_note(&unreadable))
             p class="summary" {
                 "Word counts exclude the contents of style and script elements. "
                 "Dates come from the chapter URL where the source provides one; "

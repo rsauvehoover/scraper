@@ -285,12 +285,22 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Warm the statistics cache before accepting traffic, so the first
     // request does not pay the full scan.
+    //
+    // A source that fails to scan is reported and skipped, never fatal. This
+    // runs before `TcpListener::bind`, so a panic here leaves no HTTP surface
+    // at all — the operator would see a process that exits on start, with the
+    // only clue in the log, for a fault that affects exactly one source.
     for entry in state.registry.entries() {
-        let stat = state.stats.get(entry);
-        println!(
-            "{}: {} chapters, {} words",
-            stat.source_id, stat.total_chapters, stat.total_words
-        );
+        match state.stats.get(entry) {
+            Ok(stat) => println!(
+                "{}: {} chapters, {} words",
+                stat.source_id, stat.total_chapters, stat.total_words
+            ),
+            Err(e) => eprintln!(
+                "warning: statistics unavailable for {}: {}",
+                entry.config.id, e
+            ),
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
