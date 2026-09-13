@@ -140,6 +140,20 @@ scraper's data directory. A service started anywhere else starts cleanly and
 reports every configured source as configured but not yet scraped — that is
 the signature of a wrong working directory, not of missing databases.
 
+### Operational notes
+
+Sessions and login rate-limit state are held in memory, so a restart drops
+both. Every upgrade therefore signs all users out, and so does every password
+rotation, because `--set-password` only takes effect on restart. Dropping the
+rate-limit state also means a restart clears an active lockout.
+
+While the service runs it holds each database open, so SQLite never
+checkpoints and `db/*.db-wal` and `db/*.db-shm` persist at rest. They do not
+appear when only the scraper runs, which checkpoints and closes. Anything
+copying `db/` must take the `-wal` sibling along with its `.db`, or go through
+`sqlite3 <file> ".backup <dest>"`; copying the `.db` alone can capture an
+inconsistent database.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories

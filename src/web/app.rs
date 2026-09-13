@@ -234,6 +234,13 @@ async fn login_submit(
             .unwrap_or_else(|| peer.ip().to_string()),
     };
 
+    // This check runs BEFORE verify_password, and the order is load-bearing:
+    // argon2 verification is deliberately expensive, so answering a
+    // rate-limited request without it keeps the login endpoint from being
+    // usable as a CPU-exhaustion lever. Measured on a deployed instance, a
+    // rejected attempt costs ~285ms and a rate-limited one ~16ms. Moving the
+    // verification above this check would surrender that with no visible
+    // change in behaviour.
     if !state.limiter.check(&client) {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Try again later.")
             .into_response();
