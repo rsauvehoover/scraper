@@ -47,6 +47,16 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 "current one."
                 @if !password_set { " No password is currently set." }
             }
+            // The registry and the statistics cache are built once, at
+            // startup. A save that adds, removes or renames a source is
+            // written to disk immediately and picked up by the next scraper
+            // run, but this UI keeps showing the old set until the service is
+            // restarted. Saying so here and in the save confirmation, because
+            // "Saved" on its own reads as "in effect".
+            p class="note" {
+                "Changes are written immediately, but this server reads the source list once "
+                "at startup. Restart the web service for source changes to appear here."
+            }
             form id="config-form" {
                 label for="mail-password" { "New mail password (optional)" }
                 input type="password" id="mail-password" autocomplete="new-password"
@@ -107,7 +117,7 @@ document.getElementById('save').addEventListener('click', async () => {{
     body: JSON.stringify(body)
   }});
   const text = await res.text();
-  status.textContent = res.ok ? 'Saved.' : 'Failed: ' + text;
+  status.textContent = res.ok ? text : 'Failed: ' + text;
   status.className = res.ok ? 'ok' : 'error';
   if (res.ok) document.getElementById('mail-password').value = '';
 }});
@@ -178,7 +188,15 @@ pub async fn put_config(
         changed_keys(&current, &prepared).join(", ")
     );
 
-    (StatusCode::OK, "Saved").into_response()
+    (
+        StatusCode::OK,
+        // The save script shows this text verbatim. The restart caveat
+        // belongs in the confirmation, not only on the page above it: an
+        // operator who adds a source and sees a bare "Saved" reasonably
+        // concludes the service is already using it.
+        "Saved. Restart the web service for source changes to take effect here.",
+    )
+        .into_response()
 }
 
 #[cfg(test)]

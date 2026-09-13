@@ -394,13 +394,21 @@ fn parse_and_migrate(raw: &str) -> Config {
         Ok(mut config) => {
             println!("Loaded config");
             println!("Delay is {}ms", config.request_delay);
-            println!(
-                "Sending from <{}> at <{}>",
-                config.mail.name, config.mail.address
-            );
-            for dest in &config.mail.destinations {
-                println!("Sending to <{}> at <{}>", dest.name, dest.email);
-            }
+            // Names and counts, not addresses. This runs at startup for the
+            // long-running web service as well as for a one-shot scrape, so
+            // its output lands in a log file that outlives the process and is
+            // read by whoever can read logs. An address list there is a
+            // standing copy of everyone's mail address for no operational
+            // gain — the names identify the destinations well enough, and the
+            // config editor shows the addresses to an authenticated operator.
+            println!("Sending from <{}>", config.mail.name);
+            let names: Vec<&str> = config
+                .mail
+                .destinations
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            println!("Sending to {} destinations: {}", names.len(), names.join(", "));
 
             for dest in &config.mail.destinations {
                 if dest.sources.is_empty() {

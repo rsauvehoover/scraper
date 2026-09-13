@@ -70,13 +70,18 @@ pub fn load_credential(path: &Path) -> Result<String, String> {
 /// error — that would lock the operator out of their own admin UI with no
 /// way back in except editing the file by hand.
 ///
-/// The mode is forced unconditionally after writing rather than relied on
-/// from `OpenOptions::mode`, because POSIX `open()` only applies the mode
-/// argument when it actually creates the inode (`O_CREAT` on a path that did
-/// not exist). The temp path here is always new, so that part is fine; the
-/// unconditional `set_permissions` matters when this whole file is a rename
-/// target that itself might have started life some other way (a backup
-/// restore, a hand copy) before ever going through this function once.
+/// The mode is forced on the TEMP file after writing rather than relied on
+/// from `OpenOptions::mode`, because POSIX `open()` applies the mode argument
+/// only when it actually creates the inode. The temp path is normally new, so
+/// `.mode(0o600)` normally does the job — but a leftover temp file from a
+/// crashed earlier run with the same pid is opened, not created, and keeps
+/// whatever mode it already had. The unconditional `set_permissions` closes
+/// that case.
+///
+/// It says nothing about the target's previous mode, and does not need to:
+/// `rename` replaces the target's directory entry with the temp file's inode,
+/// so the mode that survives is the temp file's. A loose mode on a
+/// pre-existing credential file is discarded by the rename, not inherited.
 pub fn store_credential(path: &Path, phc: &str) -> io::Result<()> {
     let body = serde_json::to_string_pretty(&CredentialFile {
         argon2: phc.to_string(),
@@ -246,14 +251,23 @@ impl RateLimiter {
     }
 
     /// `true` if the attempt is allowed. Records it either way.
+    ///
+    /// Expired windows are dropped before the insert, as `SessionStore::create`
+    /// does. Without that the map only ever grows, and with
+    /// `--trust-forwarded-for` the key comes from a client-supplied header: an
+    /// attacker rotating `X-Forwarded-For` would add an entry per request and
+    /// never free one. The retain bounds the map by the number of distinct
+    /// clients seen within one window instead.
     pub fn check(&self, key: &str) -> bool {
         let mut guard = self.attempts.lock().expect("rate limiter poisoned");
         let now = Instant::now();
-        let entry = guard.entry(key.to_string()).or_insert((0, now));
 
-        if now.duration_since(entry.1) > self.window {
-            *entry = (0, now);
-        }
+        guard.retain(|_, (_, started)| now.duration_since(*started) <= self.window);
+
+        // Every surviving entry is inside its window, so a new entry here is
+        // either genuinely new or one whose window has just been dropped —
+        // both start a fresh count.
+        let entry = guard.entry(key.to_string()).or_insert((0, now));
 
         if entry.0 >= self.max {
             return false;

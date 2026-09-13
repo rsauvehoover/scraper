@@ -109,6 +109,13 @@ credential to `--auth-file` immediately, but the running server keeps using
 the old one until it is restarted. If the old password still works after a
 rotation, that means "restart pending", not "rotation failed".
 
+The configuration editor writes `config.json` immediately, and the next
+scraper run reads the new file, but this server reads the source list once at
+startup. Adding, removing or renaming a source therefore does not change what
+the UI shows until the web service is restarted — the save confirmation says
+so. Mail and EPUB settings have no such caveat: only the scraper reads those,
+and it reads them per run.
+
 The server and the scraper are one binary, so a binary upgrade replaces the
 file on disk without restarting whatever process is already running it.
 After upgrading, restart the web service explicitly and check the version in
