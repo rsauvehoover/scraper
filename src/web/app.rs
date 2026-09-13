@@ -383,9 +383,9 @@ mod tests {
             .to_str()
             .unwrap();
 
-        assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
-        assert!(cookie.contains("SameSite=Strict"), "cookie: {cookie}");
-        assert!(cookie.contains("Path=/"), "cookie: {cookie}");
+        assert!(cookie.contains("HttpOnly"), "cookie: {}", cookie);
+        assert!(cookie.contains("SameSite=Strict"), "cookie: {}", cookie);
+        assert!(cookie.contains("Path=/"), "cookie: {}", cookie);
     }
 
     #[tokio::test]
@@ -425,6 +425,6 @@ mod tests {
             .unwrap();
 
         let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.contains("Secure"), "cookie: {cookie}");
+        assert!(cookie.contains("Secure"), "cookie: {}", cookie);
     }
 }
