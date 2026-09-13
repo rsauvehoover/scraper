@@ -41,4 +41,5 @@ async-trait = "0.1"
 clap = { version = "4.4", features = ["derive"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serial_test = "4.0.1"
