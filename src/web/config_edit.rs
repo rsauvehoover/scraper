@@ -57,6 +57,122 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 "Changes are written immediately, but this server reads the source list once "
                 "at startup. Restart the web service for source changes to appear here."
             }
+            // The forms below splice into the textarea, client-side, and
+            // change nothing about how a save is performed: no new endpoint,
+            // no change to PUT /config, so the CSRF check, `prepare_for_write`
+            // and the atomic mode-preserving write stay exactly as reviewed.
+            // The operator also sees the literal document that will be
+            // written before committing to it.
+            //
+            // The deeper reason is that they only ever INSERT into the parsed
+            // object. `config.json` carries keys the typed structs do not
+            // model — `Sources[].Selectors.IgnoredVolumes` among them — and
+            // serde drops every one of them on the way through. A form that
+            // rebuilt the document from typed fields would delete those keys
+            // silently, on a page whose whole job is not to lose settings.
+            details class="adder" {
+                summary { "Add a source" }
+                p class="summary" {
+                    "Fills in a source and appends it to the JSON below. Nothing is written "
+                    "until you click Save."
+                }
+                div class="fields" {
+                    div class="field" {
+                        label for="src-toc" { "Table of contents URL" }
+                        input type="url" id="src-toc" placeholder="https://example.com/contents/";
+                    }
+                    div class="field" {
+                        label for="src-id" { "Source id" }
+                        input type="text" id="src-id" placeholder="example-serial";
+                    }
+                    div class="field" {
+                        label for="src-name" { "Name" }
+                        input type="text" id="src-name" placeholder="Example Serial";
+                    }
+                    div class="field" {
+                        label for="src-author" { "Author" }
+                        input type="text" id="src-author";
+                    }
+                    div class="field" {
+                        label for="src-desc" { "Description" }
+                        input type="text" id="src-desc";
+                    }
+                }
+                p class="summary" {
+                    "A Royal Road fiction URL fills in the selectors and post-processors that "
+                    "the built-in Royal Road scraper expects, and suggests an id beginning "
+                    "royal-road-, which is what selects that scraper. Everything stays editable."
+                }
+                div class="fields" {
+                    div class="field" {
+                        label for="src-volume-wrapper" { "Volume wrapper" }
+                        input type="text" id="src-volume-wrapper" value="volume-wrapper";
+                    }
+                    div class="field" {
+                        label for="src-volume-title" { "Volume title" }
+                        input type="text" id="src-volume-title" value="h2";
+                    }
+                    div class="field" {
+                        label for="src-chapter-entry" { "Chapter entry" }
+                        input type="text" id="src-chapter-entry" value="chapter-entry";
+                    }
+                    div class="field" {
+                        label for="src-chapter-link" { "Chapter link" }
+                        input type="text" id="src-chapter-link" value="a";
+                    }
+                    div class="field" {
+                        label for="src-main-content" { "Main content" }
+                        input type="text" id="src-main-content" value="main-content";
+                    }
+                    div class="field" {
+                        label for="src-selector-type" { "Selector type" }
+                        select id="src-selector-type" {
+                            option value="class" selected { "class" }
+                            option value="id" { "id" }
+                            option value="tag" { "tag" }
+                        }
+                    }
+                    div class="field" {
+                        label for="src-post-processors" { "Post-processors (comma separated)" }
+                        input type="text" id="src-post-processors" placeholder="strip-links";
+                    }
+                }
+                button type="button" id="add-source" { "Add source below" }
+                span id="source-status" class="form-status" {}
+            }
+            details class="adder" {
+                summary { "Add a mail destination" }
+                p class="summary" {
+                    "Appends a destination to Mail.Destinations in the JSON below. Nothing is "
+                    "written until you click Save."
+                }
+                div class="fields" {
+                    div class="field" {
+                        label for="dst-name" { "Name" }
+                        input type="text" id="dst-name" placeholder="Kindle Upload";
+                    }
+                    div class="field" {
+                        label for="dst-email" { "Email" }
+                        input type="email" id="dst-email" placeholder="reader@example.com";
+                    }
+                }
+                div class="checks" {
+                    label { input type="checkbox" id="dst-strip-colour"; "StripColour" }
+                    label { input type="checkbox" id="dst-full-volumes" checked; "SendFullVolumes" }
+                    label {
+                        input type="checkbox" id="dst-individual-chapters";
+                        "SendIndividualChapters"
+                    }
+                }
+                div class="field" { label { "Sources this destination receives" } }
+                div id="dst-sources" class="picks" {}
+                p class="summary" {
+                    "Selecting none means every source: that is what an empty Sources map means "
+                    "to the mailer."
+                }
+                button type="button" id="add-destination" { "Add destination below" }
+                span id="destination-status" class="form-status" {}
+            }
             form id="config-form" {
                 label for="mail-password" { "New mail password (optional)" }
                 input type="password" id="mail-password" autocomplete="new-password"
@@ -68,11 +184,253 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 button type="button" id="save" { "Save" }
                 span id="status" {}
             }
+            script { (maud::PreEscaped(FORMS_SCRIPT)) }
             script { (maud::PreEscaped(save_script(&csrf))) }
         },
     )
     .into_response()
 }
+
+/// The two adder forms.
+///
+/// Everything here is an insert into the object the operator is looking at:
+/// parse the textarea, add one entry, pretty-print it back. It never rebuilds
+/// the document, never touches a key it did not just add, and never saves —
+/// the existing Save button remains the only write.
+///
+/// Three ways this refuses rather than guessing: unparseable JSON in the
+/// textarea, a container that exists but is the wrong type (a `Sources` that
+/// is not an array, a `Mail` that is not an object), and a duplicate source id
+/// or destination address. Quietly doing nothing on any of those is how an
+/// operator ends up saving a config they believe contains a source it does
+/// not.
+///
+/// Source ids reach the destination picker through `createElement` and
+/// `createTextNode`, never `innerHTML`: the ids come from whatever is in the
+/// textarea, and building markup out of them would make the editor its own
+/// injection vector.
+const FORMS_SCRIPT: &str = r#"
+(function () {
+  var area = document.getElementById('config-json');
+  var byId = function (id) { return document.getElementById(id); };
+  var val = function (id) { return byId(id).value.trim(); };
+  var checked = function (id) { return byId(id).checked; };
+
+  function say(id, message, ok) {
+    var el = byId(id);
+    el.textContent = message;
+    el.className = 'form-status ' + (ok ? 'ok' : 'error');
+  }
+
+  // Every splice starts from what is on screen, so the forms can only add to
+  // the document the operator is about to save.
+  function parsedConfig(statusId) {
+    var cfg;
+    try {
+      cfg = JSON.parse(area.value);
+    } catch (e) {
+      say(statusId, 'Nothing added: the JSON below does not parse (' + e.message + ').', false);
+      return null;
+    }
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+      say(statusId, 'Nothing added: the JSON below is not an object.', false);
+      return null;
+    }
+    return cfg;
+  }
+
+  function render(cfg) { area.value = JSON.stringify(cfg, null, 2); }
+
+  function sourceIds() {
+    var ids = [];
+    var cfg;
+    try {
+      cfg = JSON.parse(area.value);
+    } catch (e) {
+      // An unparsed config offers no ids rather than a stale list.
+      return ids;
+    }
+    var list = cfg && cfg.Sources;
+    if (!Array.isArray(list)) return ids;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && typeof list[i].Id === 'string' && list[i].Id) ids.push(list[i].Id);
+    }
+    return ids;
+  }
+
+  function refreshPicker() {
+    var box = byId('dst-sources');
+    var keep = {};
+    var existing = box.querySelectorAll('input');
+    for (var i = 0; i < existing.length; i++) {
+      if (existing[i].checked) keep[existing[i].value] = true;
+    }
+    box.textContent = '';
+    var ids = sourceIds();
+    if (!ids.length) {
+      box.textContent = 'No source ids in the JSON below.';
+      return;
+    }
+    for (var j = 0; j < ids.length; j++) {
+      var label = document.createElement('label');
+      var input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = ids[j];
+      if (keep[ids[j]]) input.checked = true;
+      label.appendChild(input);
+      label.appendChild(document.createTextNode(ids[j]));
+      box.appendChild(label);
+    }
+  }
+
+  // Mirrors SourceConfig::royal_road and Selectors::default in src/config.rs.
+  // Order matches SELECTOR_FIELDS.
+  var SELECTOR_FIELDS =
+    ['src-volume-wrapper', 'src-volume-title', 'src-chapter-entry',
+     'src-chapter-link', 'src-main-content'];
+  var GENERIC = ['volume-wrapper', 'h2', 'chapter-entry', 'a', 'main-content'];
+  var ROYAL_ROAD = ['volume-selector', 'h6', 'chapter-row', 'a', 'chapter-content'];
+  var ROYAL_ROAD_URL = /^https?:\/\/(?:www\.)?royalroad\.com\/fiction\/(\d+)/i;
+
+  var idEdited = false;
+  var selectorsEdited = false;
+
+  function applyPreset() {
+    var match = ROYAL_ROAD_URL.exec(val('src-toc'));
+    if (!selectorsEdited) {
+      var preset = match ? ROYAL_ROAD : GENERIC;
+      for (var i = 0; i < SELECTOR_FIELDS.length; i++) {
+        byId(SELECTOR_FIELDS[i]).value = preset[i];
+      }
+      byId('src-selector-type').value = 'class';
+      byId('src-post-processors').value = match ? 'strip-links' : '';
+    }
+    // The royal-road- prefix is not cosmetic: ScraperRegistry selects the
+    // built-in Royal Road scraper by it. Suggested, never forced.
+    if (match && !idEdited) byId('src-id').value = 'royal-road-' + match[1];
+  }
+
+  byId('src-toc').addEventListener('input', applyPreset);
+  byId('src-id').addEventListener('input', function () { idEdited = true; });
+  var touched = SELECTOR_FIELDS.concat(['src-selector-type', 'src-post-processors']);
+  for (var t = 0; t < touched.length; t++) {
+    byId(touched[t]).addEventListener('input', function () { selectorsEdited = true; });
+    byId(touched[t]).addEventListener('change', function () { selectorsEdited = true; });
+  }
+
+  byId('add-source').addEventListener('click', function () {
+    var cfg = parsedConfig('source-status');
+    if (!cfg) return;
+
+    var id = val('src-id');
+    var name = val('src-name');
+    var toc = val('src-toc');
+    if (!id || !name || !toc) {
+      say('source-status', 'Nothing added: id, name and TOC URL are all required.', false);
+      return;
+    }
+
+    if (cfg.Sources === undefined || cfg.Sources === null) cfg.Sources = [];
+    if (!Array.isArray(cfg.Sources)) {
+      say('source-status', 'Nothing added: Sources is present but is not an array.', false);
+      return;
+    }
+    for (var i = 0; i < cfg.Sources.length; i++) {
+      if (cfg.Sources[i] && cfg.Sources[i].Id === id) {
+        say('source-status', 'Nothing added: a source with the id ' + id + ' already exists.',
+            false);
+        return;
+      }
+    }
+
+    var processors = val('src-post-processors').split(',').map(function (s) {
+      return s.trim();
+    }).filter(function (s) { return s.length > 0; });
+
+    cfg.Sources.push({
+      Id: id,
+      Name: name,
+      Enabled: true,
+      TocUrl: toc,
+      Selectors: {
+        VolumeWrapper: val('src-volume-wrapper'),
+        VolumeTitle: val('src-volume-title'),
+        ChapterEntry: val('src-chapter-entry'),
+        ChapterLink: val('src-chapter-link'),
+        MainContent: val('src-main-content'),
+        SelectorType: byId('src-selector-type').value
+      },
+      Auth: { Type: 'None' },
+      Metadata: { Author: val('src-author'), Description: val('src-desc') },
+      PostProcessors: processors
+    });
+
+    render(cfg);
+    refreshPicker();
+    say('source-status', 'Added ' + id + ' to the JSON below. Review it, then click Save.', true);
+  });
+
+  byId('add-destination').addEventListener('click', function () {
+    var cfg = parsedConfig('destination-status');
+    if (!cfg) return;
+
+    var name = val('dst-name');
+    var email = val('dst-email');
+    if (!name || !email) {
+      say('destination-status', 'Nothing added: name and email are both required.', false);
+      return;
+    }
+
+    if (cfg.Mail === undefined || cfg.Mail === null) cfg.Mail = {};
+    if (typeof cfg.Mail !== 'object' || Array.isArray(cfg.Mail)) {
+      say('destination-status', 'Nothing added: Mail is present but is not an object.', false);
+      return;
+    }
+    if (cfg.Mail.Destinations === undefined || cfg.Mail.Destinations === null) {
+      cfg.Mail.Destinations = [];
+    }
+    if (!Array.isArray(cfg.Mail.Destinations)) {
+      say('destination-status',
+          'Nothing added: Mail.Destinations is present but is not an array.', false);
+      return;
+    }
+    for (var i = 0; i < cfg.Mail.Destinations.length; i++) {
+      var existing = cfg.Mail.Destinations[i];
+      if (existing && typeof existing.Email === 'string' &&
+          existing.Email.trim().toLowerCase() === email.toLowerCase()) {
+        say('destination-status', 'Nothing added: ' + email + ' is already a destination.', false);
+        return;
+      }
+    }
+
+    // An empty map means every source, which is what UserConfig::receives_source
+    // treats it as. Selecting nothing is therefore a real answer, not a
+    // missing one.
+    var sources = {};
+    var picks = byId('dst-sources').querySelectorAll('input');
+    for (var j = 0; j < picks.length; j++) {
+      if (picks[j].checked) sources[picks[j].value] = {};
+    }
+
+    cfg.Mail.Destinations.push({
+      Name: name,
+      Email: email,
+      StripColour: checked('dst-strip-colour'),
+      SendFullVolumes: checked('dst-full-volumes'),
+      SendIndividualChapters: checked('dst-individual-chapters'),
+      Sources: sources
+    });
+
+    render(cfg);
+    say('destination-status',
+        'Added ' + email + ' to the JSON below. Review it, then click Save.', true);
+  });
+
+  area.addEventListener('input', refreshPicker);
+  applyPreset();
+  refreshPicker();
+})();
+"#;
 
 /// Render the client-side save script, with `csrf` embedded as a JS string
 /// literal.
@@ -260,6 +618,181 @@ mod tests {
         let raw = std::fs::read_to_string(path).unwrap();
         let value: Value = serde_json::from_str(&raw).unwrap();
         value["Mail"]["Password"].clone()
+    }
+
+    async fn body_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Render the config page against a throwaway `config.json`.
+    ///
+    /// Never against the process's own working directory: `AppState::for_test`
+    /// defaults `config_path` to a relative "config.json", and a test that
+    /// renders it would be reading whatever real config the run happens to sit
+    /// next to.
+    async fn rendered_config_page(dir: &std::path::Path) -> String {
+        let path = write_config(dir, &serde_json::to_string_pretty(&sample_config()).unwrap());
+        let (state, headers) = state_with_session(path);
+        body_of(get_config(State(state), headers).await).await
+    }
+
+    #[tokio::test]
+    async fn the_page_offers_an_add_source_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = rendered_config_page(dir.path()).await;
+
+        for control in &[
+            "id=\"src-id\"",
+            "id=\"src-name\"",
+            "id=\"src-toc\"",
+            "id=\"src-author\"",
+            "id=\"src-desc\"",
+            "id=\"src-selector-type\"",
+            "id=\"add-source\"",
+        ] {
+            assert!(page.contains(control), "add-source form is missing {}", control);
+        }
+
+        // Prefilled and editable in both cases, not hidden: the generic
+        // defaults are rendered into the fields, and the Royal Road set is in
+        // the script that swaps them in.
+        for default in &["volume-wrapper", "chapter-entry", "main-content"] {
+            assert!(
+                page.contains(&format!("value=\"{}\"", default)),
+                "the generic selector default {} must be prefilled and visible",
+                default
+            );
+        }
+    }
+
+    /// The Royal Road preset is not decoration: those five selectors are what
+    /// `SourceConfig::royal_road` builds, and the `royal-road-` id prefix is
+    /// what makes `ScraperRegistry` pick the built-in scraper at all. A preset
+    /// that drifts from `src/config.rs` produces a source that parses nothing.
+    #[tokio::test]
+    async fn the_royal_road_preset_matches_the_built_in_scraper() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = rendered_config_page(dir.path()).await;
+
+        let reference = crate::config::SourceConfig::royal_road("1", "Example", "A", "B");
+        for selector in &[
+            reference.selectors.volume_wrapper.as_str(),
+            reference.selectors.volume_title.as_str(),
+            reference.selectors.chapter_entry.as_str(),
+            reference.selectors.main_content.as_str(),
+        ] {
+            assert!(
+                page.contains(&format!("'{}'", selector)),
+                "the Royal Road preset must carry {} exactly as SourceConfig::royal_road does",
+                selector
+            );
+        }
+        assert!(
+            reference.post_processors == vec!["strip-links".to_string()],
+            "fixture precondition: royal_road uses strip-links"
+        );
+        assert!(page.contains("'strip-links'"), "the preset must set the post-processors");
+        assert!(
+            page.contains("'royal-road-'"),
+            "the suggested id must carry the prefix that selects the built-in scraper"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_offers_an_add_destination_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = rendered_config_page(dir.path()).await;
+
+        for control in &[
+            "id=\"dst-name\"",
+            "id=\"dst-email\"",
+            "id=\"dst-strip-colour\"",
+            "id=\"dst-full-volumes\"",
+            "id=\"dst-individual-chapters\"",
+            "id=\"dst-sources\"",
+            "id=\"add-destination\"",
+        ] {
+            assert!(page.contains(control), "add-destination form is missing {}", control);
+        }
+        for key in &["StripColour", "SendFullVolumes", "SendIndividualChapters"] {
+            assert!(page.contains(key), "the destination form must emit {}", key);
+        }
+    }
+
+    /// The forms deliberately have no server side. If one ever grows an
+    /// endpoint, the hardened write path stops being the only way config
+    /// reaches disk and the operator stops seeing what will be written.
+    #[tokio::test]
+    async fn the_forms_add_no_second_write_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = rendered_config_page(dir.path()).await;
+
+        assert_eq!(
+            page.matches("fetch(").count(),
+            1,
+            "the Save button must remain the only request the page makes"
+        );
+        assert!(page.contains("fetch('/config'"), "and it must still go to PUT /config");
+        assert!(
+            !super::FORMS_SCRIPT.contains("fetch"),
+            "the forms must not save; the operator reviews and clicks Save"
+        );
+    }
+
+    /// The reason the forms splice client-side instead of posting typed
+    /// fields. `Selectors` does not model `IgnoredVolumes`, but the live
+    /// config has one, and serde drops every key it does not model. The write
+    /// path carries the operator's own document through, so an insert-only
+    /// editor preserves it; anything that rebuilt the document from the typed
+    /// structs would delete it with no warning and a "Saved" in reply.
+    #[tokio::test]
+    async fn a_key_the_structs_do_not_model_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = sample_config();
+        config["Sources"][0]["Selectors"] = json!({
+            "VolumeWrapper": "volume-wrapper",
+            "IgnoredVolumes": ["Volume 1", "Volume 2"]
+        });
+        let path = write_config(dir.path(), &serde_json::to_string_pretty(&config).unwrap());
+        let (state, headers) = state_with_session(path.clone());
+
+        // What the browser sends back: the rendered document plus one spliced
+        // source, exactly the shape the add-source form produces.
+        let mut candidate = read_redacted(&path).unwrap();
+        candidate["Sources"].as_array_mut().unwrap().push(json!({
+            "Id": "royal-road-1",
+            "Name": "Example",
+            "Enabled": true,
+            "TocUrl": "https://www.royalroad.com/fiction/1/example",
+            "Selectors": {
+                "VolumeWrapper": "volume-selector",
+                "VolumeTitle": "h6",
+                "ChapterEntry": "chapter-row",
+                "ChapterLink": "a",
+                "MainContent": "chapter-content",
+                "SelectorType": "class"
+            },
+            "Auth": {"Type": "None"},
+            "Metadata": {"Author": "A. Writer", "Description": "Example"},
+            "PostProcessors": ["strip-links"]
+        }));
+
+        let response = put_config(State(state), headers, Json(candidate)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["Sources"][0]["Selectors"]["IgnoredVolumes"],
+            json!(["Volume 1", "Volume 2"]),
+            "an unmodelled key must survive a save that adds a source"
+        );
+        assert_eq!(
+            written["Sources"][1]["Id"],
+            json!("royal-road-1"),
+            "and the spliced source must actually be written"
+        );
     }
 
     /// The documented normal path — operator leaves the write-only password

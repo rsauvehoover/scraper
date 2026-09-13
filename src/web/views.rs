@@ -90,6 +90,23 @@ button { font:inherit; margin-top:0.85rem; padding:0.45rem 1.1rem; border:0; bor
 footer.version { color:var(--muted); font-size:0.75rem; text-align:right;
                  padding:1rem 1.5rem; font-variant-numeric:tabular-nums; }
 #status { margin-left:0.75rem; font-size:0.88rem; }
+details.adder { border:1px solid var(--line); border-radius:3px; background:var(--surface);
+                padding:0.6rem 0.9rem; margin:1rem 0; }
+details.adder summary { cursor:pointer; font-weight:500; font-size:0.92rem; }
+/* One grid cell per label-and-input pair. Putting the label and the input in
+   cells of their own lets a row wrap between them, which pairs every label
+   with the next field's box. */
+.fields { display:grid; grid-template-columns:repeat(auto-fit, minmax(15rem, 1fr));
+          gap:0 1.25rem; align-items:start; }
+.fields .field label { display:block; margin-top:0.6rem; }
+.checks { margin-top:0.6rem; }
+.checks label, .picks label { display:inline-flex; align-items:center; margin-right:1.25rem;
+                              color:var(--fg); font-size:0.85rem; }
+.picks { display:flex; flex-wrap:wrap; margin-top:0.35rem; font-size:0.85rem;
+         color:var(--muted); }
+input[type="checkbox"] { width:auto; margin-right:0.35rem; }
+.adder button { margin-top:1rem; }
+.adder .form-status { margin-left:0.75rem; font-size:0.88rem; }
 "#;
 
 /// Runs in `<head>`, before the body is parsed, so the stored choice is on the
