@@ -70,8 +70,7 @@ impl SourceDatabase {
     pub(crate) fn open_query_only(source_id: &str) -> Result<Self> {
         use rusqlite::OpenFlags;
 
-        let db_dir = Path::new("db");
-        let db_path = db_dir.join(format!("{}.db", source_id));
+        let db_path = Self::path_for(source_id);
         let conn = Connection::open_with_flags(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -83,6 +82,18 @@ impl SourceDatabase {
             source_id: source_id.to_string(),
             db_path,
         })
+    }
+
+    /// Where `open_query_only` would look for `source_id`'s database, without
+    /// opening it.
+    ///
+    /// Exists so a caller that just got an open failure can tell "the file
+    /// isn't there yet" (a source added to config but never scraped) apart
+    /// from any other reason the open could fail, by checking this path
+    /// itself — without duplicating the `db/{id}.db` convention at the call
+    /// site.
+    pub(crate) fn path_for(source_id: &str) -> PathBuf {
+        Path::new("db").join(format!("{}.db", source_id))
     }
 
     /// Whether this database carries the tables `initialize_schema` creates.

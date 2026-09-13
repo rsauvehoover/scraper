@@ -303,6 +303,17 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // `entries()` above never includes these — each one was already logged
+    // in detail by `SourceRegistry::from_config` — so this is a one-line
+    // summary an operator scanning startup output can see at a glance,
+    // rather than having to notice their absence from the loop above.
+    if !state.registry.skipped().is_empty() {
+        println!(
+            "{} configured source(s) not registered at startup; see warnings above",
+            state.registry.skipped().len()
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     println!("listening on {}", args.bind);
     axum::serve(

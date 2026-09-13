@@ -60,10 +60,42 @@ impl SourceEntry {
     }
 }
 
+/// Why a configured, enabled source did not make it into the registry.
+///
+/// The two cases call for different operator responses, so the registry
+/// keeps them apart instead of handing back one bucket a caller would have
+/// to re-derive by re-parsing the logged error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No database file, or a database file with no scraper schema yet.
+    /// Expected right after a source is added through the config editor and
+    /// before the scraper has run for it — the operator should wait for the
+    /// next scrape, not investigate.
+    NotYetScraped,
+    /// The database could not be opened or read for some other reason
+    /// (permissions, corruption, I/O). This one wants looking at.
+    Broken,
+}
+
+/// A configured, enabled source that `from_config` could not admit.
+///
+/// Deliberately carries no error text: the cause goes to the server log at
+/// the point of the skip (see `from_config`), and nothing derived from it —
+/// only the id, the operator-facing name, and which of the two cases this
+/// is — is meant to reach a response body.
+pub struct SkippedSource {
+    pub id: String,
+    pub name: String,
+    pub reason: SkipReason,
+}
+
 pub struct SourceRegistry {
     entries: HashMap<String, SourceEntry>,
     /// Config order, for stable display.
     order: Vec<String>,
+    /// Configured, enabled sources that did not make it into `entries`, in
+    /// config order.
+    skipped: Vec<SkippedSource>,
 }
 
 impl SourceRegistry {
@@ -81,15 +113,35 @@ impl SourceRegistry {
     /// would push that failure into request handlers and the startup cache
     /// warm-up, which is how one newly configured source used to abort the
     /// process before it reached `TcpListener::bind`.
+    ///
+    /// Every source skipped this way is also recorded in `skipped()`, so a
+    /// caller that would otherwise report the source as if it never existed
+    /// in config at all — the web frontend's `/` and `/stats`, chiefly — can
+    /// name it instead.
     pub fn from_config(config: &Config) -> Self {
         let mut entries = HashMap::new();
         let mut order = Vec::new();
+        let mut skipped = Vec::new();
 
         for source in config.enabled_sources() {
             let db = match SourceDatabase::open_query_only(&source.id) {
                 Ok(db) => db,
                 Err(e) => {
                     eprintln!("warning: skipping source {}: {}", source.id, e);
+                    // No database file at all is the config-editor case: the
+                    // source was just added and the scraper has not run for
+                    // it. Any other open failure (the path exists but is
+                    // unreadable, corrupt, a directory, etc.) is a fault.
+                    let reason = if SourceDatabase::path_for(&source.id).exists() {
+                        SkipReason::Broken
+                    } else {
+                        SkipReason::NotYetScraped
+                    };
+                    skipped.push(SkippedSource {
+                        id: source.id.clone(),
+                        name: source.name.clone(),
+                        reason,
+                    });
                     continue;
                 }
             };
@@ -102,6 +154,11 @@ impl SourceRegistry {
                          run the scraper for this source first",
                         source.id
                     );
+                    skipped.push(SkippedSource {
+                        id: source.id.clone(),
+                        name: source.name.clone(),
+                        reason: SkipReason::NotYetScraped,
+                    });
                     continue;
                 }
                 Err(e) => {
@@ -109,6 +166,11 @@ impl SourceRegistry {
                         "warning: skipping source {}: schema check failed: {}",
                         source.id, e
                     );
+                    skipped.push(SkippedSource {
+                        id: source.id.clone(),
+                        name: source.name.clone(),
+                        reason: SkipReason::Broken,
+                    });
                     continue;
                 }
             }
@@ -123,7 +185,11 @@ impl SourceRegistry {
             );
         }
 
-        SourceRegistry { entries, order }
+        SourceRegistry {
+            entries,
+            order,
+            skipped,
+        }
     }
 
     /// Test seam: build a registry without opening real database files.
@@ -142,7 +208,11 @@ impl SourceRegistry {
                 },
             );
         }
-        SourceRegistry { entries, order }
+        SourceRegistry {
+            entries,
+            order,
+            skipped: Vec::new(),
+        }
     }
 
     /// Resolve a user-supplied source ID. `None` for anything not configured.
@@ -153,6 +223,12 @@ impl SourceRegistry {
     /// Entries in config order.
     pub fn entries(&self) -> impl Iterator<Item = &SourceEntry> {
         self.order.iter().filter_map(move |id| self.entries.get(id))
+    }
+
+    /// Configured, enabled sources that `from_config` could not admit, in
+    /// config order.
+    pub fn skipped(&self) -> &[SkippedSource] {
+        &self.skipped
     }
 }
 
@@ -253,6 +329,11 @@ mod tests {
             !std::path::Path::new("db/never-scraped.db").exists(),
             "opening for read must not create the database file"
         );
+
+        let skipped = registry.skipped();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, "never-scraped");
+        assert_eq!(skipped[0].reason, SkipReason::NotYetScraped);
     }
 
     /// The same source one step later: the file exists (someone touched it, or
@@ -272,6 +353,42 @@ mod tests {
         assert!(
             registry.get("empty-source").is_none(),
             "a schema-less database must not resolve"
+        );
+
+        let skipped = registry.skipped();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, "empty-source");
+        assert_eq!(skipped[0].reason, SkipReason::NotYetScraped);
+    }
+
+    /// A database file that exists but cannot be opened as a database at all
+    /// (here: the path is a directory, standing in for permissions,
+    /// corruption, or any other I/O fault) is a different case from "not
+    /// scraped yet" and must be recorded as such.
+    #[test]
+    #[serial_test::serial]
+    fn skips_a_source_whose_database_is_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        // A directory where a database file is expected: it exists, so it is
+        // not the "never scraped" case, but SQLite cannot open it.
+        std::fs::create_dir_all("db/broken-source.db").unwrap();
+
+        let registry = SourceRegistry::from_config(&config_with(&["broken-source"]));
+
+        assert!(
+            registry.get("broken-source").is_none(),
+            "an unopenable database must not resolve"
+        );
+
+        let skipped = registry.skipped();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, "broken-source");
+        assert_eq!(
+            skipped[0].reason,
+            SkipReason::Broken,
+            "a database that exists but cannot be opened is broken, not merely unscraped"
         );
     }
 

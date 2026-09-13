@@ -10,6 +10,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
+use crate::db::{SkipReason, SkippedSource};
 use crate::stats::cache::SourceStat;
 use crate::web::app::AppState;
 use crate::web::toc::format_thousands;
@@ -269,6 +270,44 @@ fn unreadable_note(unreadable: &[String]) -> Markup {
     }
 }
 
+/// Sources present in config that never made it into the registry at all —
+/// one step earlier than `unreadable_note`, which only covers a source that
+/// registered and then faulted.
+///
+/// Same reasoning as `unreadable_note`, same markup shape, placed with it:
+/// a source silently missing from this page must not be indistinguishable
+/// from a source that was never configured. The two `SkipReason`s call for
+/// different operator action, so they render as two distinct notes rather
+/// than one list — and, per the rule already established on this page,
+/// only the source names reach the response; the cause stays in the log.
+fn skipped_note(skipped: &[SkippedSource]) -> Markup {
+    let not_yet_scraped: Vec<&str> = skipped
+        .iter()
+        .filter(|s| s.reason == SkipReason::NotYetScraped)
+        .map(|s| s.name.as_str())
+        .collect();
+    let broken: Vec<&str> = skipped
+        .iter()
+        .filter(|s| s.reason == SkipReason::Broken)
+        .map(|s| s.name.as_str())
+        .collect();
+
+    html! {
+        @if !not_yet_scraped.is_empty() {
+            p class="note" {
+                "Configured but not yet scraped: " (not_yet_scraped.join(", "))
+                ". It will appear here after the next scrape."
+            }
+        }
+        @if !broken.is_empty() {
+            p class="error" {
+                "Configured but unreadable: " (broken.join(", "))
+                ". See the server log for the cause."
+            }
+        }
+    }
+}
+
 pub async fn index(State(state): State<Arc<AppState>>) -> Response {
     let (stats, unreadable) = collect_stats(&state, "the source overview");
 
@@ -279,6 +318,7 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
     page(
         "Sources",
         html! {
+            (skipped_note(state.registry.skipped()))
             (unreadable_note(&unreadable))
             p class="summary" {
                 (stats.len()) " sources · " (format_thousands(total_chapters)) " chapters · "
@@ -336,6 +376,7 @@ pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
     page(
         "Statistics",
         html! {
+            (skipped_note(state.registry.skipped()))
             (unreadable_note(&unreadable))
             p class="summary" {
                 "Word counts exclude the contents of style and script elements. "
@@ -412,7 +453,7 @@ pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{page, BASE, PALETTE, PREPAINT_SCRIPT, THEME_SCRIPT};
+    use super::{index, page, stats_page, BASE, PALETTE, PREPAINT_SCRIPT, THEME_SCRIPT};
     use std::collections::HashMap;
 
     /// A colour left hardcoded in the rules is simply wrong in one of the two
@@ -707,5 +748,171 @@ mod tests {
                 ratio
             );
         }
+    }
+
+    /// Restores the process cwd on drop, including on unwind from a panic.
+    /// Mirrors the same-named helper duplicated in `db::registry`,
+    /// `db::connection` and `stats::cache` — `SourceDatabase::open` and
+    /// `open_query_only` both resolve `db/` relative to the cwd.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn change_to(dir: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    fn fixture_source(id: &str, name: &str) -> crate::config::SourceConfig {
+        crate::config::SourceConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            enabled: true,
+            ..crate::config::SourceConfig::default()
+        }
+    }
+
+    /// Lays out four sources on disk under the current (already-redirected)
+    /// cwd, one per state this branch now distinguishes, and returns the
+    /// `AppState` over them:
+    ///
+    /// - `healthy-source`: a real, complete schema — scans cleanly.
+    /// - `faulted-source`: has the three tables `has_scraper_schema` checks
+    ///   for, so the registry admits it, but they are missing the columns
+    ///   `compute` actually selects — so it registers and then faults on
+    ///   every scan, same as `collect_stats`'s pre-existing `unreadable`.
+    /// - `never-scraped-source`: no database file at all.
+    /// - `broken-source`: the path exists but is a directory, not a
+    ///   database — stands in for permissions, corruption, or any other
+    ///   open failure that is not "never scraped".
+    fn build_test_state() -> std::sync::Arc<crate::web::app::AppState> {
+        use crate::db::{SourceDatabase, SourceRegistry};
+        use crate::stats::cache::StatsCache;
+        use crate::web::app::AppState;
+        use crate::web::auth::{hash_password, RateLimiter, SessionStore};
+
+        std::fs::create_dir_all("db").unwrap();
+
+        SourceDatabase::open("healthy-source").unwrap();
+
+        let conn = rusqlite::Connection::open("db/faulted-source.db").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE volumes (id INTEGER PRIMARY KEY);
+             CREATE TABLE chapters (id INTEGER PRIMARY KEY);
+             CREATE TABLE raw_data (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all("db/broken-source.db").unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.sources = vec![
+            fixture_source("healthy-source", "Healthy Source"),
+            fixture_source("faulted-source", "Faulted Source"),
+            fixture_source("never-scraped-source", "Never Scraped Source"),
+            fixture_source("broken-source", "Broken Source"),
+        ];
+
+        std::sync::Arc::new(AppState {
+            registry: SourceRegistry::from_config(&config),
+            stats: StatsCache::new(),
+            sessions: SessionStore::new(std::time::Duration::from_secs(3600)),
+            limiter: RateLimiter::new(10, std::time::Duration::from_secs(900)),
+            credential: hash_password("hunter2-hunter2").unwrap(),
+            config_path: std::path::PathBuf::from("config.json"),
+            secure_cookies: false,
+            trust_forwarded_for: false,
+            epub_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        })
+    }
+
+    async fn body_of(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// One error text a missing-file open failure produces, and one an
+    /// empty/schema-less database's failed query produces. Neither may ever
+    /// reach a response body — only the source names and the fixed wording
+    /// may.
+    fn asserts_no_error_text_leaked(body: &str) {
+        assert!(
+            !body.contains("no such table"),
+            "a schema fault's error text leaked into the page: {}",
+            body
+        );
+        assert!(
+            !body.contains("unable to open database"),
+            "an open failure's error text leaked into the page: {}",
+            body
+        );
+        assert!(
+            !body.contains("Is a directory") && !body.contains("CANTOPEN"),
+            "the broken-database error text leaked into the page: {}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn index_names_skipped_sources_alongside_unreadable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        let state = build_test_state();
+
+        let body = body_of(index(axum::extract::State(state)).await).await;
+
+        assert!(body.contains("Healthy Source"), "a healthy source must still render: {}", body);
+        assert!(
+            body.contains("Never Scraped Source"),
+            "a source with no database yet must be named on the page: {}",
+            body
+        );
+        assert!(
+            body.contains("It will appear here after the next scrape"),
+            "the not-yet-scraped case must say what happens next: {}",
+            body
+        );
+        assert!(
+            body.contains("Broken Source"),
+            "a source whose database could not be opened must be named: {}",
+            body
+        );
+        assert!(
+            // `unreadable_note` names by id, not by config name — that is
+            // its pre-existing behaviour and is deliberately left untouched.
+            body.contains("Could not read statistics for: faulted-source"),
+            "a registered-then-faulted source must still get its existing note: {}",
+            body
+        );
+        asserts_no_error_text_leaked(&body);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_page_names_skipped_sources_alongside_unreadable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        let state = build_test_state();
+
+        let body = body_of(stats_page(axum::extract::State(state)).await).await;
+
+        assert!(body.contains("Healthy Source"));
+        assert!(body.contains("Never Scraped Source"));
+        assert!(body.contains("It will appear here after the next scrape"));
+        assert!(body.contains("Broken Source"));
+        assert!(body.contains("Could not read statistics for: faulted-source"));
+        asserts_no_error_text_leaked(&body);
     }
 }
