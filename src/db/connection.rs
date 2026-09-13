@@ -48,7 +48,13 @@ impl SourceDatabase {
     ///
     /// Does not call `initialize_schema`: schema creation is a write, and this
     /// handle cannot write.
-    pub fn open_query_only(source_id: &str) -> Result<Self> {
+    ///
+    /// Deliberately not `pub`: the only caller should be `SourceRegistry`,
+    /// which resolves a user-supplied source ID against the configured list
+    /// before it ever reaches this function. A `pub` constructor here would
+    /// let a handler interpolate an unvalidated string into a path directly,
+    /// silently reopening the traversal hole the registry exists to close.
+    pub(crate) fn open_query_only(source_id: &str) -> Result<Self> {
         let db_dir = Path::new("db");
         let db_path = db_dir.join(format!("{}.db", source_id));
         let conn = Connection::open(&db_path)?;
@@ -108,11 +114,19 @@ impl SourceDatabase {
         let mode: String = self
             .conn
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        debug_assert!(
-            mode == "wal" || mode == "memory",
-            "unexpected journal_mode after WAL request: {}",
-            mode
-        );
+        if mode != "wal" && mode != "memory" {
+            // Not fatal: the database still works in any journal mode, just
+            // with readers and the writer blocking each other. But this must
+            // be visible, because every claim about concurrent access rests
+            // on WAL actually being in effect -- and a check that only runs
+            // in debug builds would vanish from the release build that
+            // actually runs.
+            eprintln!(
+                "warning: requested WAL journal mode for {} but SQLite reports '{}'; \
+                 readers and the writer will block each other",
+                self.source_id, mode
+            );
+        }
 
         // Source metadata table
         self.conn.execute(
