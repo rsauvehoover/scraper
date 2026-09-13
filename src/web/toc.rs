@@ -46,8 +46,19 @@ pub async fn source_toc(
                 section class="volume" {
                     h2 { (volume.name) }
                     p class="summary" {
-                        (volume.chapters.len()) " chapters, "
+                        // `volume.chapters` includes pending chapters so the
+                        // listing below stays complete, but `stat.total_chapters`
+                        // in the header counts downloaded chapters only. Using
+                        // the raw length here made one page report two different
+                        // chapter counts for the same data; pending chapters get
+                        // their own figure instead. Same expression as `views.rs`.
+                        @let downloaded_chapters =
+                            volume.chapters.len() - volume.pending_chapters;
+                        (downloaded_chapters) " chapters, "
                         (format_thousands(volume.words)) " words"
+                        @if volume.pending_chapters > 0 {
+                            ", " (volume.pending_chapters) " pending"
+                        }
                         " · "
                         a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
                         " · "
@@ -134,8 +145,15 @@ pub async fn chapter_page(
         &name,
         html! {
             p class="summary" {
-                a href={ "/source/" (source_id) "/chapter/" (chapter_id) "/epub" } { "Download EPUB" }
-                " · "
+                // `chapter_epub` rejects a chapter with no `raw_data` row, so
+                // offering the link for one would be offering a 404. The TOC
+                // listing suppresses it on the same basis.
+                @if downloaded {
+                    a href={ "/source/" (source_id) "/chapter/" (chapter_id) "/epub" } {
+                        "Download EPUB"
+                    }
+                    " · "
+                }
                 a href={ "/source/" (source_id) } { "Back to contents" }
             }
             @if downloaded {
@@ -158,6 +176,17 @@ pub async fn chapter_page(
 }
 
 /// The sanitised chapter body, served for the sandboxed iframe only.
+///
+/// "For the iframe only" is an intention, not an enforced property: the route
+/// is an ordinary authenticated GET, so a signed-in operator who navigates
+/// straight to `/raw` gets the same document as a TOP-LEVEL page, outside the
+/// `sandbox=""` attribute that constrains it when embedded. On that path the
+/// response's own CSP (`default-src 'none'`, no `script-src`) is the only
+/// thing between upstream-authored markup and this origin, so the two
+/// defences stop being independent. Left as is: it takes a CSP bypass plus a
+/// sanitiser miss plus a deliberate navigation to reach, and the alternatives
+/// (a separate origin, or a one-shot token per embed) cost more than that is
+/// worth here. Do not weaken the CSP below without revisiting this.
 pub async fn chapter_raw(
     State(state): State<Arc<AppState>>,
     AxumPath((source_id, chapter_id)): AxumPath<(String, i64)>,
@@ -244,6 +273,103 @@ pub fn format_thousands(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::format_thousands;
+
+    /// Seed the in-memory fixture database with one downloaded and one
+    /// pending chapter, and return the two chapter ids in that order.
+    #[cfg(test)]
+    fn seed_one_downloaded_one_pending(state: &crate::web::app::AppState) -> (i64, i64) {
+        let entry = state.registry.get("test-source").expect("fixture source");
+        let db = entry.db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("Chapter 1", "https://example.com/c1", vol).unwrap();
+        db.add_chapter("Chapter 2", "https://example.com/c2", vol).unwrap();
+        let chapters = db.get_chapters_by_volume(vol).unwrap();
+        let downloaded = chapters.iter().find(|c| c.name == "Chapter 1").unwrap().id;
+        let pending = chapters.iter().find(|c| c.name == "Chapter 2").unwrap().id;
+        db.add_chapter_data(downloaded, "<p>one two three</p>").unwrap();
+        (downloaded as i64, pending as i64)
+    }
+
+    async fn body_of(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The page header counts downloaded chapters (matching every other page
+    /// and `wordcount.py`); the per-volume line used to count the listing,
+    /// which includes pending chapters. One page, two different answers for
+    /// the same data. Both must now say "1 chapters", with the undownloaded
+    /// one reported as pending rather than folded in or dropped.
+    #[tokio::test]
+    async fn volume_and_page_chapter_counts_agree() {
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test());
+        seed_one_downloaded_one_pending(&state);
+
+        let body = body_of(
+            super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
+        )
+        .await;
+
+        assert_eq!(
+            body.matches("1 chapters").count(),
+            2,
+            "the page header and the volume line must report the same count: {}",
+            body
+        );
+        assert!(
+            !body.contains("2 chapters"),
+            "the pending chapter must not be counted as downloaded: {}",
+            body
+        );
+        assert!(body.contains("1 pending"), "pending chapters must be stated: {}", body);
+    }
+
+    /// `chapter_epub` 404s a chapter with no `raw_data` row, and the table of
+    /// contents already suppresses its EPUB link on that basis. The chapter
+    /// page offered one unconditionally.
+    #[tokio::test]
+    async fn pending_chapter_page_offers_no_epub_link() {
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test());
+        let (downloaded, pending) = seed_one_downloaded_one_pending(&state);
+
+        let body = body_of(
+            super::chapter_page(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), pending)),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            !body.contains("Download EPUB"),
+            "a pending chapter must not offer a link that 404s: {}",
+            body
+        );
+
+        let body = body_of(
+            super::chapter_page(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), downloaded)),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains("Download EPUB"),
+            "a downloaded chapter must still offer its EPUB: {}",
+            body
+        );
+    }
 
     #[test]
     fn formats_thousands_separators() {
