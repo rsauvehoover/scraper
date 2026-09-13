@@ -693,4 +693,96 @@ mod tests {
             text
         );
     }
+
+    #[tokio::test]
+    async fn config_get_never_returns_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"Mail":{"Name":"S","Address":"s@example.com","Password":"abcdefghijklmnop",
+               "Destinations":[]},"EpubGen":{},"Sources":[]}"#,
+        )
+        .unwrap();
+
+        let mut state = AppState::for_test();
+        state.config_path = config_path;
+        let state = Arc::new(state);
+        let token = state.sessions.create();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/config")
+                    .header("cookie", format!("scraper_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(
+            !text.contains("abcdefghijklmnop"),
+            "the password must never reach the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_put_requires_the_csrf_token() {
+        let state = test_state();
+        let token = state.sessions.create();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config")
+                    .header("cookie", format!("scraper_session={}", token))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a write without the CSRF header must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_put_requires_json_content_type() {
+        let state = test_state();
+        let token = state.sessions.create();
+        let csrf = state.sessions.csrf_for(&token).unwrap();
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config")
+                    .header("cookie", format!("scraper_session={}", token))
+                    .header("x-csrf-token", csrf)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("Sources=[]"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_client_error(),
+            "form-encoded writes must be refused; got {}",
+            response.status()
+        );
+    }
 }
