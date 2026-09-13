@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -58,6 +58,14 @@ pub struct WebArgs {
     /// console.
     #[arg(long)]
     pub set_password: bool,
+
+    /// Trust `X-Forwarded-For` for the client address used by login rate
+    /// limiting. Off by default: the header is client-controlled, so honouring
+    /// it on a directly-reachable service lets an attacker rotate it for
+    /// unlimited attempts. Turn it on only when a reverse proxy in front of
+    /// this service overwrites the header.
+    #[arg(long)]
+    pub trust_forwarded_for: bool,
 }
 
 pub struct AppState {
@@ -68,6 +76,9 @@ pub struct AppState {
     pub credential: String,
     pub config_path: PathBuf,
     pub secure_cookies: bool,
+    /// Whether `X-Forwarded-For` is trusted for login rate limiting. See
+    /// `WebArgs::trust_forwarded_for`.
+    pub trust_forwarded_for: bool,
     /// EPUB generation is CPU-bound and each build holds several megabytes,
     /// so concurrent builds are capped rather than unbounded.
     pub epub_permits: Arc<Semaphore>,
@@ -92,6 +103,7 @@ impl AppState {
             credential: hash_password("hunter2").unwrap(),
             config_path: PathBuf::from("config.json"),
             secure_cookies: false,
+            trust_forwarded_for: false,
             epub_permits: Arc::new(Semaphore::new(2)),
         }
     }
@@ -151,18 +163,25 @@ struct LoginForm {
 
 async fn login_submit(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     axum::Form(form): axum::Form<LoginForm>,
 ) -> Response {
-    // Behind a reverse proxy the peer address is the proxy, so prefer the
-    // forwarded client address for rate limiting.
-    let client = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+    // The peer address cannot be forged by the client. X-Forwarded-For can, so
+    // it is consulted only when the operator has asserted a proxy overwrites
+    // it. Keyed on the IP, not the full socket address — the source port
+    // changes per connection, so including it would give every attempt its
+    // own bucket and defeat the limiter entirely.
+    let client = if state.trust_forwarded_for {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| peer.ip().to_string())
+    } else {
+        peer.ip().to_string()
+    };
 
     if !state.limiter.check(&client) {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Try again later.")
@@ -260,6 +279,7 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
         credential,
         config_path: args.config_file.clone(),
         secure_cookies: args.secure_cookies,
+        trust_forwarded_for: args.trust_forwarded_for,
         epub_permits: Arc::new(Semaphore::new(2)),
     });
 
@@ -275,7 +295,11 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     println!("listening on {}", args.bind);
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -301,11 +325,29 @@ fn set_password(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
+    use std::net::SocketAddr;
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
         Arc::new(AppState::for_test())
+    }
+
+    /// Build a login POST from `peer`, carrying `forwarded_for` as its
+    /// `X-Forwarded-For` header. `peer` is TEST-NET-1 (192.0.2.0/24,
+    /// RFC 5737) throughout these tests, so the fixture is obviously
+    /// synthetic.
+    fn login_request(peer: SocketAddr, forwarded_for: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", forwarded_for)
+            .body(Body::from("password=wrong"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req
     }
 
     /// Every route in the application. Keep this list exhaustive: the
@@ -363,17 +405,16 @@ mod tests {
         let state = test_state();
         let app = router(Arc::clone(&state));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("password=hunter2"))
-                    .unwrap(),
-            )
-            .await
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("password=hunter2"))
             .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 1], 1234))));
+
+        let response = app.oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let cookie = response
@@ -391,17 +432,16 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_sets_no_cookie() {
         let app = router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("password=wrong"))
-                    .unwrap(),
-            )
-            .await
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("password=wrong"))
             .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 1], 1234))));
+
+        let response = app.oneshot(req).await.unwrap();
 
         assert!(response.headers().get("set-cookie").is_none());
     }
@@ -412,19 +452,99 @@ mod tests {
         state.secure_cookies = true;
         let app = router(Arc::new(state));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("password=hunter2"))
-                    .unwrap(),
-            )
-            .await
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("password=hunter2"))
             .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 1], 1234))));
+
+        let response = app.oneshot(req).await.unwrap();
 
         let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(cookie.contains("Secure"), "cookie: {}", cookie);
+    }
+
+    #[tokio::test]
+    async fn forwarded_for_cannot_bypass_the_rate_limit_when_untrusted() {
+        // `trust_forwarded_for` defaults to `false`.
+        let state = test_state();
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
+
+        // Exhaust this peer's bucket, rotating the (untrusted) forwarded
+        // header on every request. If the header were consulted, each
+        // request would land in its own bucket and none of this would ever
+        // block.
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request(peer, &format!("203.0.113.{i}")))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(login_request(peer, "203.0.113.99"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the same peer must be blocked despite a freshly rotated X-Forwarded-For"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_for_gives_separate_buckets_when_trusted() {
+        let mut state = AppState::for_test();
+        state.trust_forwarded_for = true;
+        let state = Arc::new(state);
+        let app = router(Arc::clone(&state));
+        let peer = SocketAddr::from(([192, 0, 2, 1], 1234));
+
+        // Exhaust the bucket for one forwarded client.
+        for i in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(login_request(peer, "203.0.113.1"))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should still be within the limit"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(login_request(peer, "203.0.113.1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the exhausted forwarded client must now be blocked"
+        );
+
+        // A different forwarded client, same peer, must be unaffected.
+        let response = app
+            .clone()
+            .oneshot(login_request(peer, "203.0.113.2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a distinct forwarded client must get its own bucket"
+        );
     }
 }
