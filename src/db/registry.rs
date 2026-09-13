@@ -19,7 +19,23 @@ pub struct SourceEntry {
     // task puts this registry behind `Arc<AppState>` as axum state, which
     // requires `Send + Sync`. `Mutex<T>` is `Sync` whenever `T: Send`, so the
     // Mutex is load-bearing here, not incidental — do not remove it.
-    pub db: Mutex<SourceDatabase>,
+    //
+    // Private: `db()` is the only route in, so the mutex-poisoning policy is
+    // decided once, here, rather than re-decided at every call site.
+    db: Mutex<SourceDatabase>,
+}
+
+impl SourceEntry {
+    /// Lock this source's database.
+    ///
+    /// Poisoning is recovered rather than propagated. A query-only SQLite read
+    /// is not left structurally broken by a Rust-side panic, so one panicking
+    /// request must not permanently fail every later request for this source.
+    pub fn db(&self) -> std::sync::MutexGuard<'_, SourceDatabase> {
+        self.db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 pub struct SourceRegistry {
