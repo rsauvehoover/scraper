@@ -32,13 +32,19 @@ fn cleaner() -> &'static Builder<'static> {
 
         // Inline `style` is allowed because colour carries meaning in these
         // serials, and the strip-colour processor is an explicit opt-in
-        // elsewhere. Ammonia does NOT filter style values unless asked, so the
-        // allowlist below is what makes that safe: it admits only properties
-        // that cannot carry a `url()`, `expression()` or `behavior`, which are
-        // the vectors that would otherwise fetch or execute from inside a
-        // chapter. Without this call, `style` would be passed through verbatim
-        // and the CSP would be the only thing standing between a stored
-        // payload and the reader.
+        // elsewhere.
+        //
+        // `filter_style_properties` filters by property NAME only. Ammonia
+        // never parses the declaration's value, so this removes `background`,
+        // `behavior` and every other property that is not named below, but it
+        // does NOT inspect what an allowlisted property carries: a stored
+        // `background-color: url(https://…)` survives this filter verbatim.
+        // What stops that from fetching anything is the reader's CSP in
+        // `toc.rs` (`default-src 'none'; style-src 'unsafe-inline'; img-src
+        // data:`) — the name allowlist and the CSP are not independent
+        // defences for this one vector, and the test below pins the actual
+        // behaviour so the distinction stays visible. Do not restate this
+        // filter as a guarantee about values.
         let mut attrs = HashSet::new();
         attrs.insert("style");
         builder.generic_attributes(attrs);
@@ -142,13 +148,39 @@ mod tests {
     }
 
     #[test]
-    fn strips_style_properties_that_can_fetch_or_execute() {
+    fn strips_style_properties_outside_the_allowlist() {
         let out = sanitize_chapter(
             r#"<span style="background: url(https://evil.example/p.png); color: red; behavior:url(x.htc)">text</span>"#,
         );
-        assert!(!out.contains("url("), "style url() survived: {}", out);
+        assert!(!out.contains("background"), "background survived: {}", out);
         assert!(!out.contains("behavior"), "behavior survived: {}", out);
+        assert!(!out.contains("url("), "no url() should remain here: {}", out);
         assert!(out.contains("color"), "colour must still survive: {}", out);
         assert!(out.contains("text"));
+    }
+
+    /// The boundary the test above does NOT reach, pinned so the limit of the
+    /// style filter cannot be mistaken for a guarantee it does not give.
+    ///
+    /// `background` is not allowlisted, so the fixture above proves only that
+    /// an unlisted property is dropped — swap it for the allowlisted
+    /// `background-color` and the `url()` comes straight through, because
+    /// ammonia filters property names and never looks at values. The reader's
+    /// CSP is what prevents the fetch; see the note in `cleaner()`.
+    ///
+    /// If a future ammonia version starts filtering values, this test fails
+    /// and the comment in `cleaner()` should be revisited — that is a
+    /// deliberate tripwire, not a regression.
+    #[test]
+    fn does_not_inspect_the_values_of_allowlisted_properties() {
+        let out = sanitize_chapter(
+            r#"<span style="background-color: url(https://evil.example/p.png)">x</span>"#,
+        );
+        assert!(
+            out.contains("url("),
+            "the filter is documented as name-only; if this now strips values, \
+             update the comment in cleaner(): {}",
+            out
+        );
     }
 }
