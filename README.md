@@ -57,6 +57,56 @@ entry is matched by URL and updated in place, so the chapter is never duplicated
 in the same form the TOC will use (same scheme/host/path; a trailing-slash difference is tolerated).
 Re-running with an already-seeded URL is a no-op.
 
+## Web frontend
+
+`wandering_inn_scraper web` serves a read-only view of the scraped data plus a
+configuration editor. It runs alongside the scraper and never writes to the
+databases through SQLite.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bind` | `127.0.0.1:8080` | Address to listen on |
+| `--auth-file` | `web-auth.json` | Admin credential (argon2id), mode 600 |
+| `--config-file` | `config.json` | The configuration this service edits |
+| `--secure-cookies` | off | Set the Secure flag on the session cookie; turn on when TLS reaches this service directly |
+| `--trust-forwarded-for` | off | Trust `X-Forwarded-For` for login rate limiting; only enable behind a reverse proxy that overwrites the header |
+| `--set-password` | | Prompt for a new admin password, write it, and exit |
+
+The server is a subcommand of the scraper binary, not a separate one:
+`wandering_inn_scraper web`. The packaging step produces one binary per
+invocation, so a second binary would mean a second package to build, ship,
+and version — the subcommand keeps it to one.
+
+Set a password before the first run; the server refuses to start without one:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+The admin credential is deliberately kept out of `config.json`, because this
+service can rewrite `config.json`.
+
+Run it from the same working directory as the scraper: `config.json`, `db/`
+and `build/` are all resolved relative to the process's current directory,
+not the binary's location.
+
+It opens the databases with `PRAGMA query_only`, so it never writes through
+SQLite. It still needs filesystem **write** permission on `db/` — that is not
+a mistake: SQLite's WAL mode requires even a read-only connection to be able
+to create and update the `-shm` shared-memory index file, so a reader that
+cannot write to the directory cannot open the database at all.
+
+The admin password is read once at process startup and held in memory for
+the life of the process. Rotating it with `--set-password` writes the new
+credential to `--auth-file` immediately, but the running server keeps using
+the old one until it is restarted. If the old password still works after a
+rotation, that means "restart pending", not "rotation failed".
+
+The server and the scraper are one binary, so a binary upgrade replaces the
+file on disk without restarting whatever process is already running it.
+After upgrading, restart the web service explicitly and check the version in
+the page footer rather than trusting the installed package version.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories
