@@ -12,14 +12,6 @@ license = "MIT"
 name = "wandering_inn_scraper"
 path = "src/lib.rs"
 
-[[bin]]
-name = "wandering_inn_scraper"
-path = "src/main.rs"
-
-[[bin]]
-name = "wandering-inn-web"
-path = "src/bin/web.rs"
-
 [package.metadata.bundle]
 identifier = "rsauvehoover/wandering-inn-scraper"
 resources = ["src/assets", "src/font"]

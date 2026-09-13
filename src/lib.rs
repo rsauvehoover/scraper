@@ -1,7 +1,7 @@
 //! Multi-source web serial scraper.
 //!
 //! The `wandering_inn_scraper` binary is a CLI over these modules; the
-//! `wandering-inn-web` binary serves them over HTTP.
+//! `wandering_inn_scraper web` serves them over HTTP.
 
 pub mod config;
 pub mod db;
