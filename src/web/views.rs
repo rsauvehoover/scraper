@@ -250,7 +250,11 @@ fn collect_stats(state: &AppState, page_name: &str) -> (Vec<Arc<SourceStat>>, Ve
                     "statistics scan failed for {} while rendering {}: {}",
                     entry.config.id, page_name, e
                 );
-                unreadable.push(entry.config.id.clone());
+                // The log line above carries the id, which is what an operator
+                // greps config.json for. The page carries the display name,
+                // matching both the table below it and `skipped_note` — one
+                // page must not name the same source two different ways.
+                unreadable.push(entry.config.name.clone());
             }
         }
     }
@@ -890,9 +894,9 @@ mod tests {
             body
         );
         assert!(
-            // `unreadable_note` names by id, not by config name — that is
-            // its pre-existing behaviour and is deliberately left untouched.
-            body.contains("Could not read statistics for: faulted-source"),
+            // Named the way `skipped_note` names its sources and the way the
+            // table below names them: by display name, not by config id.
+            body.contains("Could not read statistics for: Faulted Source"),
             "a registered-then-faulted source must still get its existing note: {}",
             body
         );
@@ -912,7 +916,7 @@ mod tests {
         assert!(body.contains("Never Scraped Source"));
         assert!(body.contains("It will appear here after the next scrape"));
         assert!(body.contains("Broken Source"));
-        assert!(body.contains("Could not read statistics for: faulted-source"));
+        assert!(body.contains("Could not read statistics for: Faulted Source"));
         asserts_no_error_text_leaked(&body);
     }
 }
