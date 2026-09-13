@@ -121,14 +121,46 @@ file on disk without restarting whatever process is already running it.
 After upgrading, restart the web service explicitly and check the version in
 the page footer rather than trusting the installed package version.
 
+### Running as a service
+
+The server reads the admin credential at startup and refuses to serve without
+one. Set it before enabling a service unit:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+Enabling the unit first is not harmful, but the service exits immediately with
+an error naming the missing file, and a unit with `Restart=on-failure` repeats
+that every few seconds until the credential exists.
+
+`config.json`, `db/` and the credential file are all resolved relative to the
+process working directory, so a unit must set its working directory to the
+scraper's data directory. A service started anywhere else starts cleanly and
+reports every configured source as configured but not yet scraped — that is
+the signature of a wrong working directory, not of missing databases.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories
 
 ### Linux/MacOS
 ```bash
-cargo bundle --release
+cargo bundle --release --format deb
 ```
+
+On Linux, a bare `cargo bundle --release` also attempts an AppImage, which
+needs `mksquashfs` from `squashfs-tools`. Without it the command exits 1
+*after* it has already written a complete `.deb`, so a script or CI job that
+trusts the exit code throws away a good package. `--format deb` avoids that;
+installing `squashfs-tools` also works.
+
+The `.deb` filename is built from the crate name while the package inside is
+named by `[package.metadata.bundle] name`, so the two disagree:
+`wandering_inn_scraper_<version>_<arch>.deb` contains the package `scraper`.
+Confirm with `dpkg-deb -f <file> Package`. Renaming the package also means a
+new install does not upgrade an older one in place — both ship the same
+binary path, so remove the old package before installing the new one.
 
 ### Windows
 NOTE: `cargo wix` doesn't show any output by default, run with `-v` and `--nocapture` flags to see verbose output.
