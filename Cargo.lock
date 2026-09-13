@@ -3444,6 +3444,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "soup",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

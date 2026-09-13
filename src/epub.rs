@@ -150,17 +150,16 @@ fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -
     processed
 }
 
-fn generate_chapter(
+/// Build a single-chapter EPUB in memory. Touches no filesystem path.
+pub fn build_chapter_epub(
     db: &SourceDatabase,
     chapter: &Chapter,
-    output_dir: &Path,
     ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
     let mut output = Vec::<u8>::new();
-    std::fs::create_dir_all(output_dir.join("individual"))?;
-
     let safe_name = sanitize_filename(&chapter.name);
+
     let mut epub = EpubBuilder::new(ZipLibrary::new()?)?;
     epub.metadata("author", &ctx.source.metadata.author)?;
     epub.metadata("lang", "en")?;
@@ -189,15 +188,25 @@ fn generate_chapter(
 
     epub.generate(&mut output)?;
 
-    let filename = format!("{}({}).epub", &chapter.id, &safe_name);
-
-    let mut file = std::fs::File::create(output_dir.join("individual").join(&filename))?;
-    file.write_all(&output)?;
     Ok(Attachment {
-        filename,
+        filename: format!("{}({}).epub", &chapter.id, &safe_name),
         mime: String::from("application/epub+zip"),
         bytes: output,
     })
+}
+
+fn generate_chapter(
+    db: &SourceDatabase,
+    chapter: &Chapter,
+    output_dir: &Path,
+    ctx: &EpubContext,
+    strip_colour: bool,
+) -> Result<Attachment, Box<dyn std::error::Error>> {
+    let attachment = build_chapter_epub(db, chapter, ctx, strip_colour)?;
+    std::fs::create_dir_all(output_dir.join("individual"))?;
+    let mut file = std::fs::File::create(output_dir.join("individual").join(&attachment.filename))?;
+    file.write_all(&attachment.bytes)?;
+    Ok(attachment)
 }
 
 fn generate_chapters(
@@ -278,11 +287,11 @@ fn generate_chapters(
     Ok(attachments)
 }
 
-fn generate_volume(
+/// Build a volume EPUB in memory. Touches no filesystem path.
+pub fn build_volume_epub(
     db: &SourceDatabase,
     volume: &Volume,
     chapters: &[Chapter],
-    output_dir: &Path,
     ctx: &EpubContext,
     strip_colour: bool,
 ) -> Result<Attachment, Box<dyn std::error::Error>> {
@@ -310,9 +319,12 @@ fn generate_volume(
     for chapter in chapters {
         let raw_data = match db.get_chapter_data(chapter.id) {
             Err(rusqlite::Error::QueryReturnedNoRows) if chapter.id == last_chapter_id => {
-                println!("  Failed to fetch data for last chapter ({}), assuming unreleased content.", chapter.name);
-                continue
-            },
+                println!(
+                    "  Failed to fetch data for last chapter ({}), assuming unreleased content.",
+                    chapter.name
+                );
+                continue;
+            }
             Err(e) => return Err(e.into()),
             Ok(data) => data,
         };
@@ -330,18 +342,27 @@ fn generate_volume(
 
     epub.generate(&mut output)?;
 
-    std::fs::create_dir_all(output_dir)?;
-
-    let filename = format!("{}.epub", safe_volume_name);
-
-    let mut file = std::fs::File::create(output_dir.join(&filename))?;
-    file.write_all(&output)?;
-
     Ok(Attachment {
-        filename,
+        filename: format!("{}.epub", safe_volume_name),
         mime: String::from("application/epub+zip"),
         bytes: output,
     })
+}
+
+/// Build a volume EPUB and persist it under `output_dir`. CLI path only.
+fn generate_volume(
+    db: &SourceDatabase,
+    volume: &Volume,
+    chapters: &[Chapter],
+    output_dir: &Path,
+    ctx: &EpubContext,
+    strip_colour: bool,
+) -> Result<Attachment, Box<dyn std::error::Error>> {
+    let attachment = build_volume_epub(db, volume, chapters, ctx, strip_colour)?;
+    std::fs::create_dir_all(output_dir)?;
+    let mut file = std::fs::File::create(output_dir.join(&attachment.filename))?;
+    file.write_all(&attachment.bytes)?;
+    Ok(attachment)
 }
 
 /// Generate EPUBs for a specific source
@@ -438,7 +459,66 @@ pub async fn generate_epubs_for_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SourceDatabase;
     use serial_test::serial;
+
+    fn fixture_db() -> (SourceDatabase, Volume, Vec<Chapter>) {
+        let db = SourceDatabase::open_in_memory("test-source").unwrap();
+        let vol_id = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("Chapter One", "https://example.com/c1", vol_id)
+            .unwrap();
+        let chapters = db.get_chapters_by_volume(vol_id).unwrap();
+        db.add_chapter_data(chapters[0].id, "<h1>Chapter One</h1><p>body text</p>")
+            .unwrap();
+        let chapters = db.get_chapters_by_volume(vol_id).unwrap();
+        (
+            db,
+            Volume {
+                id: vol_id,
+                name: "Volume 1".to_string(),
+            },
+            chapters,
+        )
+    }
+
+    #[test]
+    fn build_volume_epub_writes_nothing_to_disk() {
+        let (db, volume, chapters) = fixture_db();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let before: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+
+        let attachment = build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+
+        let after: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(before.len(), after.len(), "build must not create files");
+        assert_eq!(attachment.filename, "Volume 1.epub");
+        assert!(!attachment.bytes.is_empty());
+        // EPUBs are ZIP archives.
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+    }
+
+    #[test]
+    fn build_chapter_epub_returns_bytes() {
+        let (db, _volume, chapters) = fixture_db();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        let attachment = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        assert!(attachment.filename.ends_with(".epub"));
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+        assert_eq!(attachment.mime, "application/epub+zip");
+    }
 
     #[test]
     fn sanitize_filename_replaces_path_separators() {
