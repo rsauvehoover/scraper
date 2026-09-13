@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn assets_load_without_filesystem_access() {
         // Changing to a directory with no src/ must not panic. This is the
-        // regression guard for the cwd-relative .unwrap() that made
-        // /opt/scraper/src a required symlink.
+        // regression guard for the cwd-relative .unwrap() that forced deployments
+        // to symlink a src/ directory next to the working directory.
         let tmp = std::env::temp_dir();
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
