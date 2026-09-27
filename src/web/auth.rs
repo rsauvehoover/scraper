@@ -148,7 +148,7 @@ fn force_private_mode(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     // rand 0.10 dropped `OsRng`/`RngCore` in favour of `Rng`/`TryRng` and a
     // `SysRng` that only implements the fallible `TryRng`. `rand::rng()` is
     // the thread-local CSPRNG, seeded from the OS, and implements the
