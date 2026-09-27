@@ -292,30 +292,9 @@ impl Default for StatsCache {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::CwdGuard;
     use super::*;
     use serial_test::serial;
-
-    /// Restores the process cwd on drop, including on unwind from a panic.
-    /// Mirrors `db::connection`'s test helper of the same name; duplicated
-    /// here rather than shared across modules since it is a handful of
-    /// lines and not worth exposing from a non-test build.
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(dir: &std::path::Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
 
     #[test]
     fn parses_wandering_inn_date_from_uri() {

@@ -476,33 +476,13 @@ impl SourceDatabase {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::CwdGuard;
     use serial_test::serial;
 
     use super::*;
 
     fn test_db() -> SourceDatabase {
         SourceDatabase::open_in_memory("test-source").unwrap()
-    }
-
-    /// Restores the process cwd on drop, including on unwind from a panic.
-    /// Without this, a failed assertion partway through a cwd-mutating test
-    /// would leave the process in the tempdir for every test that runs next.
-    struct CwdGuard {
-        original: PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(dir: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
     }
 
     #[test]

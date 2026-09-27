@@ -292,6 +292,7 @@ pub async fn chapter_epub(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::CwdGuard;
     use super::content_disposition;
 
     #[test]
@@ -390,31 +391,6 @@ mod tests {
                 hostile,
                 response.status()
             );
-        }
-    }
-
-    /// Restores the process cwd on drop, including on unwind from a panic.
-    /// `open_query_only` resolves its path relative to the cwd, so a test
-    /// that needs a real file-backed database (the registry's in-memory
-    /// fixture and the handler's own `open_query_only` call are two
-    /// different connections and cannot share state otherwise) must point
-    /// the cwd at a scratch directory for its duration. Mirrors the same
-    /// guard in `src/db/connection.rs`.
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(dir: &std::path::Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
         }
     }
 

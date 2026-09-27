@@ -13,3 +13,6 @@ pub mod sources;
 pub mod stats;
 pub mod web;
 pub mod webconfig;
+
+#[cfg(test)]
+pub(crate) mod test_support;

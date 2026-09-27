@@ -248,6 +248,7 @@ impl SourceRegistry {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::CwdGuard;
     use super::*;
     use crate::config::{Config, SourceConfig};
 
@@ -297,28 +298,6 @@ mod tests {
         let registry = SourceRegistry::from_config_for_test(&config_with(&["wandering-inn"]));
         let entry = registry.get("wandering-inn").expect("configured id resolves");
         assert_eq!(entry.config.id, "wandering-inn");
-    }
-
-    /// Restores the process cwd on drop, including on unwind from a panic.
-    /// `open_query_only` resolves `db/` relative to the cwd, so a test that
-    /// exercises the real constructor must point the cwd at a scratch
-    /// directory or it would touch the repository's own `db/`.
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(dir: &std::path::Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
     }
 
     /// The config-editor path: a source is added to `config.json` and the

@@ -457,6 +457,7 @@ pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::CwdGuard;
     use super::{index, page, stats_page, BASE, PALETTE, PREPAINT_SCRIPT, THEME_SCRIPT};
     use std::collections::HashMap;
 
@@ -751,28 +752,6 @@ mod tests {
                 theme_name,
                 ratio
             );
-        }
-    }
-
-    /// Restores the process cwd on drop, including on unwind from a panic.
-    /// Mirrors the same-named helper duplicated in `db::registry`,
-    /// `db::connection` and `stats::cache` — `SourceDatabase::open` and
-    /// `open_query_only` both resolve `db/` relative to the cwd.
-    struct CwdGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(dir: &std::path::Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            CwdGuard { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
         }
     }
 
