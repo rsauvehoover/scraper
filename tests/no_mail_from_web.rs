@@ -2,7 +2,7 @@
 //! chapter to every configured destination, and only named files may reach
 //! the manual send that replaces it.
 //!
-//! `send_epubs`/`send_epub` are called from exactly one place,
+//! `send_epubs` (which calls `send_epub`) is called from exactly one place,
 //! `generate_epubs_for_source` in src/epub.rs, which mails volumes and
 //! chapters to every configured destination. A download handler that reached
 //! that function would mail hundreds of chapters to every configured
@@ -109,6 +109,24 @@ fn mailer_references_outside(root: &Path, files: &[PathBuf], allowed: &[&str]) -
     offenders
 }
 
+/// Lines in `files` naming the `mail_send` crate as a whole word, outside
+/// comments. The web process's only mail goes through `crate::mail::Mailer`;
+/// nothing under `src/web` — including the three files allowed to name the
+/// mailer — may reach `mail_send` directly.
+fn mail_send_references(files: &[PathBuf]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for path in files {
+        let source = fs::read_to_string(path).unwrap();
+        for (n, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if contains_word(code, "mail_send") {
+                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+    offenders
+}
+
 #[test]
 fn web_module_never_reaches_the_send_everything_path() {
     let files = rs_files(Path::new("src/web"));
@@ -137,6 +155,41 @@ fn only_the_send_files_name_the_mailer() {
         offenders.is_empty(),
         "only send.rs, send_jobs.rs and app.rs may name the mailer:\n{}",
         offenders.join("\n")
+    );
+}
+
+#[test]
+fn web_module_never_names_the_mail_send_crate() {
+    let files = rs_files(Path::new("src/web"));
+
+    let offenders = mail_send_references(&files);
+
+    assert!(
+        offenders.is_empty(),
+        "the web module must go through crate::mail::Mailer, not mail_send directly:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Proves the `mail_send` check reaches subdirectories and matches whole
+/// words, the same way `the_scan_would_catch_a_nested_offender` does for the
+/// send-everything check.
+#[test]
+fn the_mail_send_check_would_catch_a_nested_offender() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(dir.path().join("ok.rs"), "use crate::mail::Mailer;\n").unwrap();
+    fs::write(nested.join("offender.rs"), "use mail_send::SmtpClientBuilder;\n").unwrap();
+
+    let files = rs_files(dir.path());
+    let offenders = mail_send_references(&files);
+
+    assert_eq!(offenders.len(), 1, "expected one offender, got {:?}", offenders);
+    assert!(
+        offenders[0].contains("offender.rs"),
+        "the nested file must be the one reported: {}",
+        offenders[0]
     );
 }
 
@@ -220,6 +273,90 @@ fn the_allowlist_is_exact() {
         let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
         assert!(offenders.is_empty(), "a comment-only mention must not count: {:?}", offenders);
     }
+}
+
+/// Files, relative to `src`, allowed to name `generate_epubs_for_source(`:
+/// its one call site (`main.rs`) and its definition (`epub.rs`).
+const GENERATE_EPUBS_ALLOWED: [&str; 2] = ["main.rs", "epub.rs"];
+
+/// Lines in `files` (rooted at `root`) containing `generate_epubs_for_source(`
+/// outside comments, in a file whose path relative to `root` is not exactly
+/// one of `allowed`.
+fn generate_epubs_references_outside(
+    root: &Path,
+    files: &[PathBuf],
+    allowed: &[&str],
+) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        if allowed.iter().any(|name| relative == Path::new(name)) {
+            continue;
+        }
+        let source = fs::read_to_string(path).unwrap();
+        for (n, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("generate_epubs_for_source(") {
+                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+    offenders
+}
+
+/// `web_module_never_reaches_the_send_everything_path` only scans
+/// `src/web`. A library wrapper around `generate_epubs_for_source` placed
+/// anywhere else — say `src/epub_wrappers.rs` — would let web code reach
+/// the mail-everything path through that wrapper's name instead, which the
+/// web-only scan never looks for. Pinning every call of
+/// `generate_epubs_for_source` across all of `src` to its one real call
+/// site and its definition closes that gap: a new wrapper anywhere would
+/// show up here before it could be reached from `src/web`.
+#[test]
+fn generate_epubs_for_source_has_only_its_call_and_definition() {
+    let root = Path::new("src");
+    let files = rs_files(root);
+
+    let offenders = generate_epubs_references_outside(root, &files, &GENERATE_EPUBS_ALLOWED);
+
+    assert!(
+        offenders.is_empty(),
+        "generate_epubs_for_source must appear only in main.rs (the call) and epub.rs (the definition):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Proves the allowlist above is exact and the walk reaches every file, the
+/// same way `the_scan_would_catch_a_nested_offender` does for the
+/// send-everything check.
+#[test]
+fn the_generate_epubs_allowlist_catches_an_offender_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() { generate_epubs_for_source(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("epub.rs"),
+        "pub async fn generate_epubs_for_source() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("wrapper.rs"),
+        "async fn also_send() { generate_epubs_for_source(); }\n",
+    )
+    .unwrap();
+
+    let files = rs_files(dir.path());
+    let offenders = generate_epubs_references_outside(dir.path(), &files, &GENERATE_EPUBS_ALLOWED);
+
+    assert_eq!(offenders.len(), 1, "expected only wrapper.rs flagged: {:?}", offenders);
+    assert!(
+        offenders[0].contains("wrapper.rs"),
+        "the wrapper file must be the one reported: {:?}",
+        offenders
+    );
 }
 
 #[test]
