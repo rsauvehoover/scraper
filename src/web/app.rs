@@ -76,6 +76,13 @@ pub struct WebArgs {
     /// A proxied deployment should name the header its proxy sets.
     #[arg(long, value_enum, default_value = "peer")]
     pub client_ip_from: ClientIpSource,
+
+    /// A system crontab file (`/etc/crontab` format, e.g. a file under
+    /// `/etc/cron.d`) whose entries run the scraper. When given, the Sources
+    /// page shows the schedule and the next run; the file is only read,
+    /// and only its timing fields are shown, never the commands.
+    #[arg(long, value_name = "PATH")]
+    pub schedule_file: Option<PathBuf>,
 }
 
 /// Where `login_submit` reads the client address it rate-limits on.
@@ -119,6 +126,8 @@ pub struct AppState {
     /// Where the login rate limiter reads the client address. See
     /// `WebArgs::client_ip_from`.
     pub client_ip_from: ClientIpSource,
+    /// See `WebArgs::schedule_file`.
+    pub schedule_file: Option<PathBuf>,
     /// EPUB generation is CPU-bound and each build holds several megabytes,
     /// so concurrent builds are capped rather than unbounded.
     pub epub_permits: Arc<Semaphore>,
@@ -144,6 +153,7 @@ impl AppState {
             config_path: PathBuf::from("config.json"),
             secure_cookies: false,
             client_ip_from: ClientIpSource::Peer,
+            schedule_file: None,
             epub_permits: Arc::new(Semaphore::new(2)),
         }
     }
@@ -338,6 +348,7 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
         config_path: args.config_file.clone(),
         secure_cookies: args.secure_cookies,
         client_ip_from: args.client_ip_from,
+        schedule_file: args.schedule_file.clone(),
         epub_permits: Arc::new(Semaphore::new(2)),
     });
 

@@ -301,6 +301,63 @@ pub(crate) fn config_load_note(state: &AppState) -> Markup {
     }
 }
 
+/// The scrape schedule, when `--schedule-file` names one. The file is read
+/// on every render, so an edit to it shows on the next page load.
+fn schedule_note<Tz>(state: &AppState, now: &chrono::DateTime<Tz>) -> Markup
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let Some(path) = &state.schedule_file else {
+        return html! {};
+    };
+    match crate::web::schedule::read_schedule(path, now) {
+        Err(e) => html! {
+            p class="error" {
+                "Could not read the schedule file " (path.display().to_string())
+                " (" (format!("{:?}", e.kind())) ")."
+            }
+        },
+        Ok(runs) if runs.is_empty() => html! {
+            p class="note" { "The schedule file has no entries that run the scraper." }
+        },
+        Ok(runs) => html! {
+            p class="summary" {
+                "Scrapes run "
+                @for (i, run) in runs.iter().enumerate() {
+                    @if i > 0 { "; " }
+                    (run.summary)
+                    @if let Some(next) = &run.next {
+                        " · next " (format_next(next, now))
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// "18:17 server time, in 12 min". The weekday is added when the run is not
+/// today. Cron runs in the server's time zone, so that is the zone shown.
+fn format_next<Tz>(next: &chrono::DateTime<Tz>, now: &chrono::DateTime<Tz>) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let minutes = next.clone().signed_duration_since(now.clone()).num_minutes().max(0);
+    let clock = if next.date_naive() == now.date_naive() {
+        next.format("%H:%M").to_string()
+    } else {
+        next.format("%a %H:%M").to_string()
+    };
+    let relative = match minutes {
+        0 => "in under a minute".to_string(),
+        m if m < 60 => format!("in {} min", m),
+        m if m < 48 * 60 => format!("in {} h {} min", m / 60, m % 60),
+        m => format!("in {} days", m / (24 * 60)),
+    };
+    format!("{} server time, {}", clock, relative)
+}
+
 /// Sources present in config that never made it into the registry at all —
 /// one step earlier than `unreadable_note`, which only covers a source that
 /// registered and then faulted.
@@ -355,6 +412,7 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
             (config_load_note(&state))
             (skipped_note(registry.skipped()))
             (unreadable_note(&unreadable))
+            (schedule_note(&state, &chrono::Local::now()))
             p class="summary" {
                 (stats.len()) " sources · " (format_thousands(total_chapters)) " chapters · "
                 (format_thousands(total_words)) " words"
@@ -846,6 +904,7 @@ mod tests {
             config_path: std::path::PathBuf::from("config.json"),
             secure_cookies: false,
             client_ip_from: crate::web::app::ClientIpSource::Peer,
+            schedule_file: None,
             epub_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
@@ -929,5 +988,58 @@ mod tests {
         assert!(body.contains("Broken Source"));
         assert!(body.contains("Could not read statistics for: Faulted Source"));
         asserts_no_error_text_leaked(&body);
+    }
+
+    fn state_with_schedule(path: Option<std::path::PathBuf>) -> std::sync::Arc<crate::web::app::AppState> {
+        let mut state = crate::web::app::AppState::for_test();
+        state.schedule_file = path;
+        std::sync::Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn the_sources_page_shows_the_schedule_and_never_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scraper");
+        std::fs::write(
+            &path,
+            "MAILTO=ops@example.com\n\
+             17 * * * * scraper cd /var/lib/scraper && /usr/bin/wandering_inn_scraper; \
+             curl -fsS https://hc.example.com/ping/0f5e8c1a-secret-token\n",
+        )
+        .unwrap();
+
+        let body = body_of(index(axum::extract::State(state_with_schedule(Some(path)))).await).await;
+
+        assert!(body.contains("Scrapes run hourly at :17"), "{}", body);
+        assert!(body.contains("server time"), "{}", body);
+        for secret in ["secret-token", "hc.example.com", "ops@example.com", "/var/lib/scraper"] {
+            assert!(!body.contains(secret), "{} reached the page: {}", secret, body);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_schedule_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_schedule(Some(dir.path().join("absent")));
+        let body = body_of(index(axum::extract::State(state)).await).await;
+        assert!(body.contains("Could not read the schedule file"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn without_the_flag_there_is_no_schedule_line() {
+        let body = body_of(index(axum::extract::State(state_with_schedule(None))).await).await;
+        assert!(!body.contains("Scrapes run"), "{}", body);
+        assert!(!body.contains("schedule file"), "{}", body);
+    }
+
+    #[test]
+    fn format_next_reads_naturally() {
+        use chrono::{DateTime, Utc};
+        let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let now = t("2026-09-26T18:05:00Z");
+        assert_eq!(super::format_next(&t("2026-09-26T18:17:00Z"), &now), "18:17 server time, in 12 min");
+        assert_eq!(super::format_next(&t("2026-09-26T18:05:30Z"), &now), "18:05 server time, in under a minute");
+        assert_eq!(super::format_next(&t("2026-09-27T02:30:00Z"), &now), "Sun 02:30 server time, in 8 h 25 min");
+        assert_eq!(super::format_next(&t("2026-10-01T12:00:00Z"), &now), "Thu 12:00 server time, in 4 days");
     }
 }

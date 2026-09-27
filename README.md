@@ -169,7 +169,8 @@ Wants=network-online.target
 User=scraper
 Group=scraper
 WorkingDirectory=/var/lib/scraper
-ExecStart=/usr/bin/wandering_inn_scraper web --bind 127.0.0.1:8080
+ExecStart=/usr/bin/wandering_inn_scraper web --bind 127.0.0.1:8080 \
+    --schedule-file /etc/cron.d/scraper
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -187,6 +188,15 @@ And the scheduled scrape as the same user, in `/etc/cron.d/scraper`:
 ```
 17 * * * * scraper cd /var/lib/scraper && /usr/bin/wandering_inn_scraper
 ```
+
+`--schedule-file` makes the Sources page show the schedule and the next run,
+e.g. "Scrapes run hourly at :17 · next 18:17 server time, in 12 min". It
+expects system crontab format (a file under `/etc/cron.d`, or `/etc/crontab`)
+and picks out the entries that run a scrape. Only the timing fields are shown:
+the commands never reach the page, since they often carry secrets such as a
+healthcheck ping URL. A user's own crontab is readable only by that user and
+by root, so the schedule has to live in a system crontab for an unprivileged
+service to show it.
 
 Behind an HTTPS reverse proxy, also pass `--secure-cookies`, and pass
 `--client-ip-from` with the header the proxy sets; see `web --help`.
