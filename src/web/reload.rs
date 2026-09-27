@@ -121,6 +121,21 @@ impl LiveRegistry {
             .clone()
     }
 
+    /// Names of destinations in the configuration in use that list no
+    /// sources, and so are sent nothing. See `UserConfig::receives_source`.
+    pub fn destinations_sent_nothing(&self) -> Vec<String> {
+        self.control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .applied
+            .mail
+            .destinations
+            .iter()
+            .filter(|d| d.sources.is_empty())
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
     fn current(&self) -> Arc<SourceRegistry> {
         Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
     }

@@ -80,7 +80,9 @@ pub struct UserConfig {
     pub strip_colour: bool,
     pub send_full_volumes: bool,
     pub send_individual_chapters: bool,
-    /// Map of source ID to per-source overrides. Empty map means all sources with defaults.
+    /// Map of source ID to per-source overrides. A destination is sent exactly
+    /// the sources listed here; an empty or omitted map means it is sent
+    /// nothing. See `receives_source`.
     pub sources: HashMap<String, UserSourceConfig>,
 }
 impl Default for UserConfig {
@@ -97,9 +99,15 @@ impl Default for UserConfig {
 }
 
 impl UserConfig {
-    /// Check if this user should receive emails for the given source
+    /// Whether this destination is sent `source_id`: only if it lists it.
+    ///
+    /// An empty map used to mean every source. That made a newly added
+    /// source's first scrape, which flags every chapter for regeneration,
+    /// mail its entire back catalogue to every destination with an empty
+    /// map. Opting in per source means a new source reaches nobody until a
+    /// destination lists it.
     pub fn receives_source(&self, source_id: &str) -> bool {
-        self.sources.is_empty() || self.sources.contains_key(source_id)
+        self.sources.contains_key(source_id)
     }
 
     /// Get the resolved config for a specific source, merging per-source overrides with defaults.
@@ -490,16 +498,14 @@ fn try_parse_and_migrate(raw: &[u8]) -> Result<Config, serde_json::Error> {
 
             for dest in &config.mail.destinations {
                 if dest.sources.is_empty() {
-                    // User receives all sources — use top-level defaults
-                    if dest.strip_colour {
-                        config.epub_gen.strip_colour = true;
-                    }
-                    if dest.send_full_volumes {
-                        config.epub_gen.volumes = true;
-                    }
-                    if dest.send_individual_chapters {
-                        config.epub_gen.chapters = true;
-                    }
+                    // Not an error: a destination can be parked. But it is
+                    // sent nothing, and that should be visible in the log
+                    // rather than discovered by someone wondering why their
+                    // chapters stopped. Name only, as above.
+                    eprintln!(
+                        "warning: destination {} lists no sources and will be sent nothing",
+                        dest.name
+                    );
                 } else {
                     for source_id in dest.sources.keys() {
                         let resolved = dest.source_config(source_id);
@@ -616,6 +622,66 @@ mod tests {
             "the panic quoted the file: {}",
             message
         );
+    }
+
+    fn destination(sources: &[&str]) -> UserConfig {
+        UserConfig {
+            name: "Test Reader".to_string(),
+            email: "reader@example.com".to_string(),
+            sources: sources
+                .iter()
+                .map(|id| (id.to_string(), UserSourceConfig::default()))
+                .collect(),
+            ..UserConfig::default()
+        }
+    }
+
+    /// A destination receives exactly the sources it lists. An empty map used
+    /// to mean every source, which made adding a source mail its whole back
+    /// catalogue to every such destination on the source's first scrape:
+    /// every newly downloaded chapter is flagged for regeneration.
+    #[test]
+    fn a_destination_with_no_sources_receives_nothing() {
+        assert!(!destination(&[]).receives_source("example-source"));
+    }
+
+    #[test]
+    fn a_destination_receives_only_what_it_lists() {
+        let dest = destination(&["example-source"]);
+        assert!(dest.receives_source("example-source"));
+        assert!(
+            !dest.receives_source("new-source"),
+            "a source added later must reach nobody until a destination lists it"
+        );
+    }
+
+    #[test]
+    fn an_omitted_sources_map_receives_nothing() {
+        let config = parse_config(
+            br#"{"Mail": {"Destinations": [{"Name": "Test Reader", "Email": "reader@example.com"}]}}"#,
+        )
+        .unwrap();
+        assert!(!config.mail.destinations[0].receives_source("example-source"));
+    }
+
+    /// EPUB generation is switched on by whatever the destinations will be
+    /// sent. A destination that is sent nothing must switch nothing on.
+    #[test]
+    fn a_destination_with_no_sources_turns_no_epub_generation_on() {
+        let config = parse_config(
+            br#"{
+                "EpubGen": {"Volumes": false, "Chapters": false, "StripColour": false},
+                "Mail": {"Destinations": [{
+                    "Name": "Test Reader", "Email": "reader@example.com",
+                    "SendFullVolumes": true, "SendIndividualChapters": true,
+                    "StripColour": true, "Sources": {}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.epub_gen.volumes);
+        assert!(!config.epub_gen.chapters);
+        assert!(!config.epub_gen.strip_colour);
     }
 
     #[test]

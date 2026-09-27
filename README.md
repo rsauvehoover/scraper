@@ -286,7 +286,8 @@ Create a `config.json` file with the following structure:
         "SendFullVolumes": true,          // Default: send complete volume EPUBs
         "SendIndividualChapters": false,  // Default: send each chapter as separate EPUB
 
-        // Map of source ID to per-source overrides (empty map or omitted = all sources with defaults)
+        // The sources this destination is sent, each with optional overrides.
+        // Only listed sources are sent; an empty or omitted map means nothing is.
         "Sources": {
           "my-serial": {},                           // Inherits all defaults above
           "another-serial": {                        // Override specific settings for this source

@@ -301,6 +301,19 @@ pub(crate) fn config_load_note(state: &AppState) -> Markup {
     }
 }
 
+/// Destinations that list no sources. They are sent nothing, which is
+/// allowed, but should never be a surprise. Names only, as in the log.
+pub(crate) fn idle_destinations_note(state: &AppState) -> Markup {
+    let names = state.registry.destinations_sent_nothing();
+    html! {
+        @if !names.is_empty() {
+            p class="note" {
+                "Sent nothing, because they list no sources: " (names.join(", ")) "."
+            }
+        }
+    }
+}
+
 /// The scrape schedule, when `--schedule-file` names one. The file is read
 /// on every render, so an edit to it shows on the next page load.
 fn schedule_note<Tz>(state: &AppState, now: &chrono::DateTime<Tz>) -> Markup
@@ -410,6 +423,7 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
         "Sources",
         html! {
             (config_load_note(&state))
+            (idle_destinations_note(&state))
             (skipped_note(registry.skipped()))
             (unreadable_note(&unreadable))
             (schedule_note(&state, &chrono::Local::now()))
@@ -1041,5 +1055,38 @@ mod tests {
         assert_eq!(super::format_next(&t("2026-09-26T18:05:30Z"), &now), "18:05 server time, in under a minute");
         assert_eq!(super::format_next(&t("2026-09-27T02:30:00Z"), &now), "Sun 02:30 server time, in 8 h 25 min");
         assert_eq!(super::format_next(&t("2026-10-01T12:00:00Z"), &now), "Thu 12:00 server time, in 4 days");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_destination_that_lists_no_sources_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        std::fs::write(
+            "config.json",
+            r#"{"Mail": {"Destinations": [
+                {"Name": "Parked Reader", "Email": "parked@example.com", "Sources": {}},
+                {"Name": "Active Reader", "Email": "active@example.com",
+                 "Sources": {"example-source": {}}}
+            ]}}"#,
+        )
+        .unwrap();
+        let mut state = crate::web::app::AppState::for_test();
+        state.registry = crate::web::reload::LiveRegistry::load(
+            std::path::PathBuf::from("config.json"),
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        let body = body_of(index(axum::extract::State(std::sync::Arc::new(state))).await).await;
+
+        assert!(
+            body.contains("Sent nothing, because they list no sources: Parked Reader."),
+            "{}",
+            body
+        );
+        assert!(!body.contains("Active Reader"), "a destination with sources must not be named: {}", body);
+        assert!(!body.contains("parked@example.com"), "names only, never addresses: {}", body);
     }
 }

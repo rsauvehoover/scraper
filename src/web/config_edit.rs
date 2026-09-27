@@ -48,6 +48,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 @if !password_set { " No password is currently set." }
             }
             (crate::web::views::config_load_note(&state))
+            (crate::web::views::idle_destinations_note(&state))
             // The forms below splice into the textarea, client-side, and
             // change nothing about how a save is performed: no new endpoint,
             // no change to PUT /config, so the CSRF check, `prepare_for_write`
@@ -158,8 +159,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 div class="field" { label { "Sources this destination receives" } }
                 div id="dst-sources" class="picks" {}
                 p class="summary" {
-                    "Selecting none means every source: that is what an empty Sources map means "
-                    "to the mailer."
+                    "A destination is sent only the sources ticked here, so pick at least one. "
+                    "A source added later reaches nobody until it is ticked for a destination."
                 }
                 button type="button" id="add-destination" { "Add destination below" }
                 span id="destination-status" class="form-status" {}
@@ -394,13 +395,20 @@ const FORMS_SCRIPT: &str = r#"
       }
     }
 
-    // An empty map means every source, which is what UserConfig::receives_source
-    // treats it as. Selecting nothing is therefore a real answer, not a
-    // missing one.
+    // A destination is sent exactly the sources it lists
+    // (UserConfig::receives_source), so ticking nothing would add a
+    // destination that is sent nothing. That is refused here as almost
+    // certainly a mistake; the JSON below can still say it deliberately.
     var sources = {};
     var picks = byId('dst-sources').querySelectorAll('input');
     for (var j = 0; j < picks.length; j++) {
       if (picks[j].checked) sources[picks[j].value] = {};
+    }
+    if (Object.keys(sources).length === 0) {
+      say('destination-status',
+          'Nothing added: pick at least one source. A destination that lists none is sent nothing.',
+          false);
+      return;
     }
 
     cfg.Mail.Destinations.push({

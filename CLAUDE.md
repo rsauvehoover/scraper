@@ -83,7 +83,7 @@ Each user destination's `Sources` is a map of source ID to per-source overrides:
 
 - Top-level `StripColour`, `SendFullVolumes`, `SendIndividualChapters` are defaults for all sources
 - Per-source entries can override any of these with explicit values; omitted fields inherit the defaults
-- An empty `Sources` map (or omitted) means the user receives all sources with their defaults
+- A destination is sent only the sources listed in its `Sources` map. An empty or omitted map means it is sent nothing, and the scraper logs a warning for it; a newly added source reaches nobody until a destination lists it
 
 ## Adding New Sources
 
