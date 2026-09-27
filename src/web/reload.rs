@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::config::{parse_config, Config, ConfigLoadError};
+use crate::config::{parse_config, Config, ConfigLoadError, MailConfig};
 use crate::db::SourceRegistry;
 
 pub struct LiveRegistry {
@@ -86,6 +86,27 @@ impl LiveRegistry {
             config_path: None,
             min_interval: Duration::MAX,
         }
+    }
+
+    /// A registry that never reloads, built from `config`, destinations
+    /// included.
+    #[cfg(test)]
+    pub fn fixed_with_config(config: Config) -> Self {
+        let live = LiveRegistry::fixed(SourceRegistry::from_config_for_test(&config));
+        live.control.lock().unwrap().applied = config;
+        live
+    }
+
+    /// The registry and the mail settings of the configuration in use, from
+    /// the same reload. A send reads both, and must not pair sources from one
+    /// config with destinations from another.
+    ///
+    /// Unlike `snapshot`, this waits for a reload in progress: the pair can
+    /// only be read consistently under the lock that swaps them.
+    pub fn snapshot_and_mail(&self) -> (Arc<SourceRegistry>, MailConfig) {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        self.check_if_due(&mut control);
+        (self.current(), control.applied.mail.clone())
     }
 
     /// The registry to use for this request, reloading first if a check is
@@ -394,5 +415,41 @@ mod tests {
         let registry = live(Duration::ZERO);
         assert_eq!(registry.snapshot().entries().count(), 0);
         assert_eq!(registry.load_error(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn mail_settings_follow_an_edit_with_the_sources() {
+        let (_dir, _cwd) = scratch();
+        write_config(&["first-source"]);
+        let live = live(Duration::ZERO);
+        let (_, mail) = live.snapshot_and_mail();
+        assert!(mail.destinations.is_empty());
+
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(CONFIG).unwrap()).unwrap();
+        doc["Mail"] = serde_json::json!({
+            "Name": "Example Sender", "Address": "sender@example.com", "Password": "",
+            "SmtpHostname": "smtp.example.com", "SmtpPort": 587,
+            "Destinations": [{ "Name": "Test Reader", "Email": "reader@example.com",
+                               "Sources": { "first-source": {} } }]
+        });
+        std::fs::write(CONFIG, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let (_, mail) = live.snapshot_and_mail();
+        assert_eq!(mail.destinations.len(), 1);
+        assert_eq!(mail.destinations[0].email, "reader@example.com");
+    }
+
+    #[test]
+    fn a_fixed_registry_can_carry_destinations() {
+        let mut config = Config::default();
+        config.mail.destinations.push(crate::config::UserConfig {
+            name: "Test Reader".into(),
+            email: "reader@example.com".into(),
+            ..Default::default()
+        });
+        let live = LiveRegistry::fixed_with_config(config);
+        assert_eq!(live.snapshot_and_mail().1.destinations[0].name, "Test Reader");
     }
 }
