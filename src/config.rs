@@ -390,9 +390,16 @@ pub fn load_config_from(path: &std::path::Path) -> Config {
 }
 
 /// The scraper's path: a config that fails to parse aborts the run, as it
-/// always has.
+/// always has. The message says where and what kind of fault, never the
+/// offending text, because it lands in the scheduled job's log file and the
+/// file it describes holds the mail password.
 fn parse_and_migrate(raw: &str) -> Config {
-    try_parse_and_migrate(raw.as_bytes()).unwrap_or_else(|e| panic!("{}", e))
+    try_parse_and_migrate(raw.as_bytes()).unwrap_or_else(|e| {
+        panic!(
+            "could not load config: {}",
+            ConfigLoadError::from_serde(&e)
+        )
+    })
 }
 
 /// Why a config could not be loaded, carrying nothing from the file itself.
@@ -589,6 +596,25 @@ mod tests {
             matches!(err, ConfigLoadError::Invalid { line: 1, .. }),
             "{:?}",
             err
+        );
+    }
+
+    /// The scraper still stops on a config it cannot parse, as it always
+    /// has, but its panic message is written to the scheduled job's log, so
+    /// it gets the same treatment as the web service's error.
+    #[test]
+    fn a_scrape_that_cannot_parse_its_config_does_not_log_the_value() {
+        let raw = r#"{"RequestDelay": "s3cret-value-from-the-file"}"#;
+        let payload = std::panic::catch_unwind(|| parse_and_migrate(raw)).unwrap_err();
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("line 1"), "{}", message);
+        assert!(
+            !message.contains("s3cret-value-from-the-file"),
+            "the panic quoted the file: {}",
+            message
         );
     }
 
