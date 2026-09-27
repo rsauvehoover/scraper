@@ -81,6 +81,34 @@ ol.chapters li a:first-child:hover { text-decoration:underline; }
 ol.chapters .words, ol.chapters .date { color:var(--muted); font-size:0.82rem;
                                         font-variant-numeric:tabular-nums; }
 ol.chapters .dl { color:var(--accent); font-size:0.82rem; text-decoration:none; }
+/* Folding volumes on a table of contents. The summary is the volume's heading
+   plus its counts and downloads, so a folded volume still offers both. */
+.page-bar { display:flex; flex-wrap:wrap; align-items:baseline; gap:0.5rem 1rem;
+            margin:0 0 1rem; }
+.page-bar .summary { flex:1 1 auto; margin:0; }
+button.toggle-all { margin:0; padding:0.25rem 0.8rem; background:transparent;
+                    color:var(--accent); border:1px solid var(--line); font-size:0.85rem; }
+button.toggle-all:hover { border-color:var(--accent); }
+details.volume { border-bottom:1px solid var(--line); }
+details.volume:first-of-type { border-top:1px solid var(--line); }
+details.volume > summary { list-style:none; cursor:pointer; padding:0.7rem 0 0.6rem;
+                           display:grid; grid-template-columns:1.1rem 1fr; column-gap:0.35rem; }
+details.volume > summary::-webkit-details-marker { display:none; }
+details.volume > summary::before { content:"\25B8"; color:var(--muted); font-size:0.85rem;
+                                   line-height:1.9; transition:transform 120ms ease; }
+details.volume[open] > summary::before { transform:rotate(90deg); }
+details.volume > summary h2 { font-size:1.15rem; margin:0; grid-column:2; }
+details.volume > summary .summary { grid-column:2; margin:0; }
+details.volume > summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px;
+                                         border-radius:3px; }
+details.volume > ol.chapters { margin:0 0 1rem 1.45rem; }
+details.volume > ol.chapters li:last-child { border-bottom:0; }
+@media (prefers-reduced-motion: reduce) {
+  details.volume > summary::before { transition:none; }
+}
+@media (max-width: 640px) {
+  details.volume > ol.chapters { margin-left:0; }
+}
 iframe.reader { width:100%; height:78vh; border:1px solid var(--line);
                 background:var(--surface); border-radius:3px; }
 form.login { max-width:20rem; margin:5rem auto; display:flex; flex-direction:column; gap:0.5rem; }

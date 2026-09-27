@@ -1,4 +1,4 @@
-// Logic tests for src/web/config_panel.js, run by tests/config_panel_js.rs.
+// Logic tests for src/web/config_panel.js, run by tests/js_logic.rs.
 // Fixtures are synthetic.
 'use strict';
 

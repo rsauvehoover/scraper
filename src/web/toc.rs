@@ -41,12 +41,28 @@ pub async fn source_toc(
     page(
         &stat.name,
         html! {
-            p class="summary" {
-                (stat.total_chapters) " chapters, "
-                (format_thousands(stat.total_words)) " words"
+            div class="page-bar" {
+                p class="summary" {
+                    (stat.total_chapters) " chapters, "
+                    (format_thousands(stat.total_words)) " words"
+                }
+                // Hidden until toc_folds.js runs, so a reader without
+                // JavaScript is not offered a button that does nothing.
+                button type="button" id="toggle-volumes" class="toggle-all"
+                       aria-controls="volumes" hidden { "Collapse all" }
             }
-            @for volume in &stat.volumes {
-                section class="volume" {
+            // Each volume folds natively. Its heading and its counts and
+            // download links are the summary, so they stay visible and usable
+            // with the volume folded. The newest volume starts open; the script
+            // then applies whatever this reader left open last time, stored
+            // under this series' id.
+            div id="volumes" data-storage-key={ "toc-open:" (source_id) } {
+            @for (i, volume) in stat.volumes.iter().enumerate() {
+                // Volumes are listed by id, so the last is the newest, the same
+                // volume `--pull-chapter` defaults to.
+                @let newest = i + 1 == stat.volumes.len();
+                details class="volume" data-volume=(volume.id) open[newest] {
+                    summary {
                     h2 { (volume.name) }
                     p class="summary" {
                         // `volume.chapters` includes pending chapters so the
@@ -68,6 +84,7 @@ pub async fn source_toc(
                         a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
                             "EPUB (no colour)"
                         }
+                    }
                     }
                     ol class="chapters" {
                         @for chapter in &volume.chapters {
@@ -101,10 +118,15 @@ pub async fn source_toc(
                     }
                 }
             }
+            }
+            script { (PreEscaped(TOC_SCRIPT)) }
         },
     )
     .into_response()
 }
+
+/// Collapse/expand-all and remembered folds. See the file's header.
+const TOC_SCRIPT: &str = include_str!("toc_folds.js");
 
 pub async fn chapter_page(
     State(state): State<Arc<AppState>>,
@@ -364,6 +386,57 @@ mod tests {
         let pending = chapters.iter().find(|c| c.name == "Chapter 2").unwrap().id;
         db.add_chapter_data(downloaded, "<p>one two three</p>").unwrap();
         (downloaded as i64, pending as i64)
+    }
+
+    /// Volumes fold, the newest starts open, and a folded volume still
+    /// carries its counts and downloads in its summary.
+    #[tokio::test]
+    async fn volumes_fold_with_the_newest_open() {
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+        let state = Arc::new(crate::web::app::AppState::for_test());
+        {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            for name in ["Volume 1", "Volume 2"] {
+                let vol = db.add_volume(name).unwrap();
+                let uri = format!("https://example.com/{}", name.replace(' ', "-"));
+                db.add_chapter("Chapter", &uri, vol).unwrap();
+                let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
+                db.add_chapter_data(id, "<p>one two</p>").unwrap();
+            }
+        }
+
+        let body = body_of(
+            super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
+        )
+        .await;
+
+        let volumes: Vec<&str> = body.split("<details class=\"volume\"").skip(1).collect();
+        assert_eq!(volumes.len(), 2, "{}", body);
+        let open_tag = |v: &str| v[..v.find('>').unwrap()].contains(" open");
+        assert!(!open_tag(volumes[0]), "an older volume must start folded: {}", volumes[0]);
+        assert!(open_tag(volumes[1]), "the newest volume must start open: {}", volumes[1]);
+        for v in &volumes {
+            let summary = &v[v.find("<summary>").unwrap()..v.find("</summary>").unwrap()];
+            assert!(summary.contains("/epub\""), "the volume EPUB link must be in the summary: {}", summary);
+            assert!(summary.contains("/epub?stripped=1\""), "and the no-colour one: {}", summary);
+        }
+        assert!(
+            body.contains("id=\"toggle-volumes\" class=\"toggle-all\" aria-controls=\"volumes\" hidden"),
+            "the button starts hidden, for readers without JavaScript: {}",
+            body
+        );
+        assert!(body.contains("data-storage-key=\"toc-open:test-source\""), "{}", body);
+        assert!(body.contains("Folding volumes on the table-of-contents page."), "script missing");
+    }
+
+    #[test]
+    fn the_folding_script_only_touches_the_page() {
+        for forbidden in ["fetch", "XMLHttpRequest", "innerHTML", "outerHTML", "insertAdjacentHTML", "eval("] {
+            assert!(!super::TOC_SCRIPT.contains(forbidden), "the folding script must not use {}", forbidden);
+        }
+        assert!(!super::TOC_SCRIPT.contains("</script"), "that would end the inline script early");
     }
 
     async fn body_of(response: axum::response::Response) -> String {
