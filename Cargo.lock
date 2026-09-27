@@ -3947,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "wandering_inn_scraper"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "ammonia",
  "argon2",

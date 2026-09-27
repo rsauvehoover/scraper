@@ -1,6 +1,6 @@
 [package]
 name = "wandering_inn_scraper"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2018"
 # The newest minimum among the build dependencies (`time`, `cookie_store`).
 # Declared so an older toolchain stops with that, not with a resolution
