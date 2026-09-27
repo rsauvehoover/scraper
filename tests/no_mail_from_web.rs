@@ -12,9 +12,28 @@
 //!
 //! The web process's only mail is a manual send through `crate::mail::Mailer`,
 //! to destinations chosen one by one rather than every configured
-//! destination at once. Only `src/web/send.rs`, `src/web/send_jobs.rs` and
-//! `src/web/app.rs` may name `Mailer`, `SmtpMailer` or `SendError`; every
-//! other file under `src/web` is checked against both rules.
+//! destination at once. Each rule below is a line scan of code text (what
+//! comes before `//` on a line), against an allowlist of exact paths:
+//!
+//! - Nothing under `src/web` names `send_epub` (so `send_epubs` too),
+//!   `generate_epubs_for_source`, or the `mail_send` crate.
+//! - Across `src`, `generate_epubs_for_source(` appears only in `main.rs`
+//!   (its call) and `epub.rs` (its definition).
+//! - Under `src/web`, only `send.rs`, `send_jobs.rs` and `app.rs` name
+//!   `Mailer`, `SmtpMailer` or `SendError` as whole words.
+//! - Under `src/web`, only `send.rs` reads the `mailer` field (`.mailer`, as
+//!   in `(state.mailer)(mail)`): the one place a mailer is made. `app.rs`
+//!   declares and fills the field as `mailer:`, which this does not match.
+//! - Under `src/web`, only `send.rs` (the one spawn) and `send_jobs.rs` (the
+//!   definition and its tests) name `run_job`.
+//! - Under `src/web`, only `send_plan.rs` (which builds recipients from the
+//!   configuration) names `Recipient`, plus the tests module of
+//!   `send_jobs.rs`. A whole-word match rather than `Recipient {`, so an
+//!   alias or a constructor, which must name the type too, is caught.
+//!
+//! The last three exist because Rust calls a method on a `dyn Mailer` without
+//! the trait in scope: a handler could send through the factory, the runner
+//! or a hand-built recipient without naming any word in the third rule.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,21 +61,48 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Lines in `files` that reach the send-everything path: `send_epub` (which
-/// also matches `send_epubs`) or `generate_epubs_for_source`, outside
-/// comments.
-fn send_everything_references(files: &[PathBuf]) -> Vec<String> {
-    let mut offenders = Vec::new();
+/// How much of an allowed file may match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Whole,
+    /// Only from the file's `mod tests` line to its end. Every file here
+    /// keeps its tests module last.
+    Tests,
+}
+
+/// Lines in `files` (rooted at `root`) whose code text, before `//`,
+/// satisfies `matches`, except in the parts of files that `allowed` names by
+/// their exact path relative to `root`.
+fn offenders(
+    root: &Path,
+    files: &[PathBuf],
+    allowed: &[(&str, Part)],
+    matches: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut found = Vec::new();
     for path in files {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let part = allowed
+            .iter()
+            .find(|(name, _)| relative == Path::new(name))
+            .map(|(_, part)| *part);
+        if part == Some(Part::Whole) {
+            continue;
+        }
         let source = fs::read_to_string(path).unwrap();
+        let mut in_tests = false;
         for (n, line) in source.lines().enumerate() {
+            in_tests |= line.trim_start().starts_with("mod tests");
+            if in_tests && part == Some(Part::Tests) {
+                continue;
+            }
             let code = line.split("//").next().unwrap_or("");
-            if code.contains("send_epub") || code.contains("generate_epubs_for_source") {
-                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            if matches(code) {
+                found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
             }
         }
     }
-    offenders
+    found
 }
 
 fn is_word_char(c: char) -> bool {
@@ -82,60 +128,83 @@ fn contains_word(code: &str, identifier: &str) -> bool {
     false
 }
 
-/// Files, relative to `src/web`, allowed to name the manual mailer.
-const MAILER_ALLOWED: [&str; 3] = ["send.rs", "send_jobs.rs", "app.rs"];
-
-/// Lines in `files` (rooted at `root`) that name `Mailer`, `SmtpMailer` or
-/// `SendError` as whole words, outside comments, in a file whose path
-/// relative to `root` is not exactly one of `allowed`.
-fn mailer_references_outside(root: &Path, files: &[PathBuf], allowed: &[&str]) -> Vec<String> {
-    let mut offenders = Vec::new();
-    for path in files {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        if allowed.iter().any(|name| relative == Path::new(name)) {
-            continue;
-        }
-        let source = fs::read_to_string(path).unwrap();
-        for (n, line) in source.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if ["Mailer", "SmtpMailer", "SendError"]
-                .iter()
-                .any(|id| contains_word(code, id))
-            {
-                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-            }
-        }
-    }
-    offenders
+/// `send_epub` (which also matches `send_epubs`) or
+/// `generate_epubs_for_source`.
+fn reaches_send_everything(code: &str) -> bool {
+    code.contains("send_epub") || code.contains("generate_epubs_for_source")
 }
 
-/// Lines in `files` naming the `mail_send` crate as a whole word, outside
-/// comments. The web process's only mail goes through `crate::mail::Mailer`;
-/// nothing under `src/web` — including the three files allowed to name the
-/// mailer — may reach `mail_send` directly.
-fn mail_send_references(files: &[PathBuf]) -> Vec<String> {
-    let mut offenders = Vec::new();
-    for path in files {
-        let source = fs::read_to_string(path).unwrap();
-        for (n, line) in source.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if contains_word(code, "mail_send") {
-                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-            }
-        }
+fn names_mail_send(code: &str) -> bool {
+    contains_word(code, "mail_send")
+}
+
+fn calls_generate_epubs(code: &str) -> bool {
+    code.contains("generate_epubs_for_source(")
+}
+
+fn names_mailer(code: &str) -> bool {
+    ["Mailer", "SmtpMailer", "SendError"]
+        .iter()
+        .any(|id| contains_word(code, id))
+}
+
+/// A read of a field named `mailer`: `.mailer` not followed by a word
+/// character, so `.mailer_count` would not match.
+fn reads_mailer_field(code: &str) -> bool {
+    code.match_indices(".mailer").any(|(i, m)| {
+        !code[i + m.len()..].chars().next().is_some_and(is_word_char)
+    })
+}
+
+fn names_run_job(code: &str) -> bool {
+    contains_word(code, "run_job")
+}
+
+fn names_recipient(code: &str) -> bool {
+    contains_word(code, "Recipient")
+}
+
+/// Files, relative to `src/web`, allowed to name the manual mailer.
+const MAILER_ALLOWED: [(&str, Part); 3] =
+    [("send.rs", Part::Whole), ("send_jobs.rs", Part::Whole), ("app.rs", Part::Whole)];
+
+/// Files, relative to `src/web`, allowed to read the mailer factory.
+const MAILER_FIELD_ALLOWED: [(&str, Part); 1] = [("send.rs", Part::Whole)];
+
+/// Files, relative to `src/web`, allowed to name the job runner.
+const RUN_JOB_ALLOWED: [(&str, Part); 2] = [("send.rs", Part::Whole), ("send_jobs.rs", Part::Whole)];
+
+/// Files, relative to `src/web`, allowed to name `Recipient`.
+const RECIPIENT_ALLOWED: [(&str, Part); 2] =
+    [("send_plan.rs", Part::Whole), ("send_jobs.rs", Part::Tests)];
+
+/// Files, relative to `src`, allowed to name `generate_epubs_for_source(`:
+/// its one call site (`main.rs`) and its definition (`epub.rs`).
+const GENERATE_EPUBS_ALLOWED: [(&str, Part); 2] = [("main.rs", Part::Whole), ("epub.rs", Part::Whole)];
+
+/// A scratch directory holding `files` (relative path, content), and every
+/// `.rs` file under it.
+fn scratch(files: &[(&str, &str)]) -> (tempfile::TempDir, Vec<PathBuf>) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, content) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
     }
-    offenders
+    let found = rs_files(dir.path());
+    (dir, found)
 }
 
 #[test]
 fn web_module_never_reaches_the_send_everything_path() {
-    let files = rs_files(Path::new("src/web"));
+    let root = Path::new("src/web");
+    let files = rs_files(root);
     assert!(
         !files.is_empty(),
         "found no source files under src/web; the scan is broken, not the code"
     );
 
-    let offenders = send_everything_references(&files);
+    let offenders = offenders(root, &files, &[], reaches_send_everything);
 
     assert!(
         offenders.is_empty(),
@@ -149,7 +218,7 @@ fn only_the_send_files_name_the_mailer() {
     let root = Path::new("src/web");
     let files = rs_files(root);
 
-    let offenders = mailer_references_outside(root, &files, &MAILER_ALLOWED);
+    let offenders = offenders(root, &files, &MAILER_ALLOWED, names_mailer);
 
     assert!(
         offenders.is_empty(),
@@ -160,13 +229,56 @@ fn only_the_send_files_name_the_mailer() {
 
 #[test]
 fn web_module_never_names_the_mail_send_crate() {
-    let files = rs_files(Path::new("src/web"));
+    let root = Path::new("src/web");
+    let files = rs_files(root);
 
-    let offenders = mail_send_references(&files);
+    let offenders = offenders(root, &files, &[], names_mail_send);
 
     assert!(
         offenders.is_empty(),
         "the web module must go through crate::mail::Mailer, not mail_send directly:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn only_send_rs_makes_a_mailer() {
+    let root = Path::new("src/web");
+    let files = rs_files(root);
+
+    let offenders = offenders(root, &files, &MAILER_FIELD_ALLOWED, reads_mailer_field);
+
+    assert!(
+        offenders.is_empty(),
+        "only send.rs may call the mailer factory:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn only_send_rs_starts_a_job() {
+    let root = Path::new("src/web");
+    let files = rs_files(root);
+
+    let offenders = offenders(root, &files, &RUN_JOB_ALLOWED, names_run_job);
+
+    assert!(
+        offenders.is_empty(),
+        "only send.rs and send_jobs.rs may name run_job:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn only_send_plan_rs_builds_a_recipient() {
+    let root = Path::new("src/web");
+    let files = rs_files(root);
+
+    let offenders = offenders(root, &files, &RECIPIENT_ALLOWED, names_recipient);
+
+    assert!(
+        offenders.is_empty(),
+        "only send_plan.rs and send_jobs.rs's tests may name Recipient:\n{}",
         offenders.join("\n")
     );
 }
@@ -176,14 +288,12 @@ fn web_module_never_names_the_mail_send_crate() {
 /// send-everything check.
 #[test]
 fn the_mail_send_check_would_catch_a_nested_offender() {
-    let dir = tempfile::tempdir().unwrap();
-    let nested = dir.path().join("nested");
-    fs::create_dir_all(&nested).unwrap();
-    fs::write(dir.path().join("ok.rs"), "use crate::mail::Mailer;\n").unwrap();
-    fs::write(nested.join("offender.rs"), "use mail_send::SmtpClientBuilder;\n").unwrap();
+    let (dir, files) = scratch(&[
+        ("ok.rs", "use crate::mail::Mailer;\n"),
+        ("nested/offender.rs", "use mail_send::SmtpClientBuilder;\n"),
+    ]);
 
-    let files = rs_files(dir.path());
-    let offenders = mail_send_references(&files);
+    let offenders = offenders(dir.path(), &files, &[], names_mail_send);
 
     assert_eq!(offenders.len(), 1, "expected one offender, got {:?}", offenders);
     assert!(
@@ -199,20 +309,13 @@ fn the_mail_send_check_would_catch_a_nested_offender() {
 /// top level — and nothing about the passing result would look different.
 #[test]
 fn the_scan_would_catch_a_nested_offender() {
-    let dir = tempfile::tempdir().unwrap();
-    let nested = dir.path().join("handlers").join("deep");
-    fs::create_dir_all(&nested).unwrap();
-    fs::write(dir.path().join("ok.rs"), "fn handler() {}\n").unwrap();
-    fs::write(
-        nested.join("offender.rs"),
-        "fn handler() {\n    crate::mail::send_epubs();\n}\n",
-    )
-    .unwrap();
-
-    let files = rs_files(dir.path());
+    let (dir, files) = scratch(&[
+        ("ok.rs", "fn handler() {}\n"),
+        ("handlers/deep/offender.rs", "fn handler() {\n    crate::mail::send_epubs();\n}\n"),
+    ]);
     assert_eq!(files.len(), 2, "the walk must reach nested files: {:?}", files);
 
-    let offenders = send_everything_references(&files);
+    let offenders = offenders(dir.path(), &files, &[], reaches_send_everything);
     assert_eq!(offenders.len(), 1, "expected one offender, got {:?}", offenders);
     assert!(
         offenders[0].contains("offender.rs"),
@@ -227,81 +330,87 @@ fn the_scan_would_catch_a_nested_offender() {
 /// three as a substring, nor by one that appears only in a comment.
 #[test]
 fn the_allowlist_is_exact() {
+    let check = |files: &[(&str, &str)]| {
+        let (dir, found) = scratch(files);
+        offenders(dir.path(), &found, &MAILER_ALLOWED, names_mailer)
+    };
+
     // send.rs directly under the scanned root is allowed to name the mailer.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("send.rs"), "fn f() -> Mailer { todo!() }\n").unwrap();
-        let files = rs_files(dir.path());
-        let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
-        assert!(offenders.is_empty(), "send.rs should be allowed: {:?}", offenders);
-    }
+    let found = check(&[("send.rs", "fn f() -> Mailer { todo!() }\n")]);
+    assert!(found.is_empty(), "send.rs should be allowed: {:?}", found);
 
     // nested/send.rs is a different path from send.rs: the allowlist is exact.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(nested.join("send.rs"), "fn f() -> Mailer { todo!() }\n").unwrap();
-        let files = rs_files(dir.path());
-        let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
-        assert_eq!(offenders.len(), 1, "nested/send.rs must not be allowed: {:?}", offenders);
-    }
+    let found = check(&[("nested/send.rs", "fn f() -> Mailer { todo!() }\n")]);
+    assert_eq!(found.len(), 1, "nested/send.rs must not be allowed: {:?}", found);
 
     // A disallowed file naming SmtpMailer is caught.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("other.rs"), "fn f() -> SmtpMailer { todo!() }\n").unwrap();
-        let files = rs_files(dir.path());
-        let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
-        assert_eq!(offenders.len(), 1, "SmtpMailer must be caught: {:?}", offenders);
-    }
+    let found = check(&[("other.rs", "fn f() -> SmtpMailer { todo!() }\n")]);
+    assert_eq!(found.len(), 1, "SmtpMailer must be caught: {:?}", found);
 
     // RecordingMailer is not a whole-word match for Mailer.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("other.rs"), "fn f() -> RecordingMailer { todo!() }\n").unwrap();
-        let files = rs_files(dir.path());
-        let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
-        assert!(offenders.is_empty(), "RecordingMailer must not match Mailer: {:?}", offenders);
-    }
+    let found = check(&[("other.rs", "fn f() -> RecordingMailer { todo!() }\n")]);
+    assert!(found.is_empty(), "RecordingMailer must not match Mailer: {:?}", found);
 
     // Mailer named only in a comment does not count.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("other.rs"), "fn f() {} // Mailer\n").unwrap();
-        let files = rs_files(dir.path());
-        let offenders = mailer_references_outside(dir.path(), &files, &MAILER_ALLOWED);
-        assert!(offenders.is_empty(), "a comment-only mention must not count: {:?}", offenders);
-    }
+    let found = check(&[("other.rs", "fn f() {} // Mailer\n")]);
+    assert!(found.is_empty(), "a comment-only mention must not count: {:?}", found);
 }
 
-/// Files, relative to `src`, allowed to name `generate_epubs_for_source(`:
-/// its one call site (`main.rs`) and its definition (`epub.rs`).
-const GENERATE_EPUBS_ALLOWED: [&str; 2] = ["main.rs", "epub.rs"];
+/// The factory call is caught outside send.rs however it is spelled, a
+/// field declaration is not, and a longer field name is not a match.
+#[test]
+fn the_mailer_factory_check_catches_a_call_elsewhere() {
+    let (dir, files) = scratch(&[
+        ("send.rs", "let m = (state.mailer)(mail);\n"),
+        ("app.rs", "pub mailer: Factory,\nmailer: Arc::new(make),\n"),
+        ("handler.rs", "(state.mailer)(mail).send(&to, &att).await;\n"),
+        ("nested/send.rs", "let f = Arc::clone(&s.mailer);\n"),
+        ("other.rs", "let n = state.mailer_count;\n"),
+    ]);
 
-/// Lines in `files` (rooted at `root`) containing `generate_epubs_for_source(`
-/// outside comments, in a file whose path relative to `root` is not exactly
-/// one of `allowed`.
-fn generate_epubs_references_outside(
-    root: &Path,
-    files: &[PathBuf],
-    allowed: &[&str],
-) -> Vec<String> {
-    let mut offenders = Vec::new();
-    for path in files {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        if allowed.iter().any(|name| relative == Path::new(name)) {
-            continue;
-        }
-        let source = fs::read_to_string(path).unwrap();
-        for (n, line) in source.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if code.contains("generate_epubs_for_source(") {
-                offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-            }
-        }
-    }
-    offenders
+    let mut found = offenders(dir.path(), &files, &MAILER_FIELD_ALLOWED, reads_mailer_field);
+    found.sort();
+
+    assert_eq!(found.len(), 2, "expected handler.rs and nested/send.rs: {:?}", found);
+    assert!(found[0].contains("handler.rs"), "{:?}", found);
+    assert!(found[1].contains("send.rs"), "{:?}", found);
+}
+
+#[test]
+fn the_run_job_check_catches_a_call_elsewhere() {
+    let (dir, files) = scratch(&[
+        ("send.rs", "tokio::spawn(run_job(jobs));\n"),
+        ("send_jobs.rs", "pub(crate) async fn run_job() {}\n"),
+        ("handler.rs", "tokio::spawn(send_jobs::run_job(jobs));\n"),
+        ("other.rs", "fn f() {} // run_job\nfn rerun_jobs() {}\n"),
+    ]);
+
+    let found = offenders(dir.path(), &files, &RUN_JOB_ALLOWED, names_run_job);
+
+    assert_eq!(found.len(), 1, "expected only handler.rs: {:?}", found);
+    assert!(found[0].contains("handler.rs"), "{:?}", found);
+}
+
+/// send_jobs.rs may name `Recipient` in its tests module only, and
+/// send_plan.rs anywhere.
+#[test]
+fn the_recipient_check_catches_one_built_elsewhere() {
+    let (dir, files) = scratch(&[
+        ("send_plan.rs", "to: Recipient { name, email },\n"),
+        (
+            "send_jobs.rs",
+            "fn f() { let r = Recipient { name, email }; }\n\
+             #[cfg(test)]\nmod tests {\n    use crate::mail::Recipient;\n}\n",
+        ),
+        ("handler.rs", "use crate::mail::Recipient as R;\n"),
+    ]);
+
+    let mut found = offenders(dir.path(), &files, &RECIPIENT_ALLOWED, names_recipient);
+    found.sort();
+
+    assert_eq!(found.len(), 2, "expected handler.rs and send_jobs.rs line 1: {:?}", found);
+    assert!(found[0].contains("handler.rs"), "{:?}", found);
+    assert!(found[1].contains("send_jobs.rs:1:"), "{:?}", found);
 }
 
 /// `web_module_never_reaches_the_send_everything_path` only scans
@@ -317,7 +426,7 @@ fn generate_epubs_for_source_has_only_its_call_and_definition() {
     let root = Path::new("src");
     let files = rs_files(root);
 
-    let offenders = generate_epubs_references_outside(root, &files, &GENERATE_EPUBS_ALLOWED);
+    let offenders = offenders(root, &files, &GENERATE_EPUBS_ALLOWED, calls_generate_epubs);
 
     assert!(
         offenders.is_empty(),
@@ -331,25 +440,13 @@ fn generate_epubs_for_source_has_only_its_call_and_definition() {
 /// send-everything check.
 #[test]
 fn the_generate_epubs_allowlist_catches_an_offender_elsewhere() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(
-        dir.path().join("main.rs"),
-        "fn main() { generate_epubs_for_source(); }\n",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("epub.rs"),
-        "pub async fn generate_epubs_for_source() {}\n",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("wrapper.rs"),
-        "async fn also_send() { generate_epubs_for_source(); }\n",
-    )
-    .unwrap();
+    let (dir, files) = scratch(&[
+        ("main.rs", "fn main() { generate_epubs_for_source(); }\n"),
+        ("epub.rs", "pub async fn generate_epubs_for_source() {}\n"),
+        ("wrapper.rs", "async fn also_send() { generate_epubs_for_source(); }\n"),
+    ]);
 
-    let files = rs_files(dir.path());
-    let offenders = generate_epubs_references_outside(dir.path(), &files, &GENERATE_EPUBS_ALLOWED);
+    let offenders = offenders(dir.path(), &files, &GENERATE_EPUBS_ALLOWED, calls_generate_epubs);
 
     assert_eq!(offenders.len(), 1, "expected only wrapper.rs flagged: {:?}", offenders);
     assert!(
