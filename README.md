@@ -209,6 +209,13 @@ healthcheck ping URL. A user's own crontab is readable only by that user and
 by root, so the schedule has to live in a system crontab for an unprivileged
 service to show it.
 
+Next-run times are shown in the web service's time zone and must match the
+zone cron fires in, which is the system's. A host left on UTC shows UTC times;
+change the system zone (for example `timedatectl set-timezone Region/City`)
+rather than only setting `TZ` in the unit. With `TZ` set in the unit alone, an
+hourly entry still reads correctly, since only the minute matters, but a daily
+one is shown at the unit's local time while cron fires at the system's.
+
 Behind an HTTPS reverse proxy, also pass `--secure-cookies`, and pass
 `--client-ip-from` with the header the proxy sets; see `web --help`.
 
