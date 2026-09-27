@@ -118,6 +118,17 @@ seconds. A file that fails to load is not applied: the site keeps the last
 configuration that loaded and says so on the Sources and Configuration pages,
 because the next scrape reads the file as it is and will fail on it.
 
+The Configuration page shows the config two ways: the raw JSON, and a panel
+listing each source, destination and global section as editable fields. The
+JSON is the document and the panel is a view over it. Editing a field changes
+that one value in the JSON, and an edit to the JSON that parses redraws the
+panel; while the JSON does not parse, the panel shows the last version that
+did and Save is disabled. Keys the panel does not model are listed read-only
+under "Other settings" and are kept as they are, because the panel never
+rebuilds an entry from its fields. A source's id is shown but changed only in
+the JSON, since it names the source's database. The panel has no way to save
+of its own; Save sends the JSON, as before.
+
 The server and the scraper are one binary, so a binary upgrade replaces the
 file on disk without restarting whatever process is already running it.
 After upgrading, restart the web service explicitly and check the version in

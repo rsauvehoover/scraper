@@ -113,6 +113,57 @@ details.adder summary { cursor:pointer; font-weight:500; font-size:0.92rem; }
 input[type="checkbox"] { width:auto; margin-right:0.35rem; }
 .adder button { margin-top:1rem; }
 .adder .form-status { margin-left:0.75rem; font-size:0.88rem; }
+/* Configuration panel. Class selectors only, and colours only in the pairs
+   the contrast test checks: fg, muted and accent on bg or surface. The
+   760px breakpoint must match the one in config_panel.js, which renders
+   into whichever layout is showing. */
+.config-panel { border:1px solid var(--line); border-radius:3px; background:var(--surface);
+                margin:1rem 0; }
+.panel-bar { display:flex; flex-wrap:wrap; gap:0.25rem 0.75rem; align-items:baseline;
+             padding:0.5rem 0.9rem; border-bottom:1px solid var(--line); font-size:0.85rem; }
+.panel-badge { font-weight:500; }
+.panel-hint { color:var(--muted); }
+.panel-fields { border:0; margin:0; padding:0; min-width:0; }
+.panel-wide { display:none; }
+.panel-index { flex:0 0 15rem; border-right:1px solid var(--line); padding:0.5rem; }
+.panel-detail { flex:1 1 auto; min-width:0; padding:0.6rem 1rem 1rem; }
+@media (min-width: 760px) {
+  .panel-wide { display:flex; }
+  .panel-accordion { display:none; }
+}
+.panel-group { color:var(--muted); font-size:0.75rem; text-transform:uppercase;
+               letter-spacing:0.04em; margin:0.75rem 0 0.25rem; padding:0 0.5rem; }
+.panel-group:first-child { margin-top:0.25rem; }
+button.panel-item { display:flex; align-items:center; gap:0.5rem; width:100%; margin:0;
+                    padding:0.35rem 0.5rem; background:transparent; color:var(--fg);
+                    text-align:left; border-left:2px solid transparent; border-radius:0; }
+button.panel-item[aria-current="true"] { color:var(--accent); border-left-color:var(--accent);
+                                         font-weight:500; }
+.panel-name { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+              white-space:nowrap; }
+.panel-pill { color:var(--muted); border:1px solid var(--line); border-radius:3px;
+              font-size:0.72rem; padding:0 0.35rem; }
+.panel-title { margin:0.2rem 0 0.4rem; font-size:1.05rem; }
+.panel-sub { margin:1rem 0 0; font-size:0.9rem; color:var(--muted); font-weight:500; }
+.panel-field label { display:block; }
+.panel-field input[readonly] { color:var(--muted); background:var(--bg); }
+/* Fields pair up when there is room; everything else spans the row. */
+.panel-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(14rem, 1fr));
+              gap:0 1rem; align-items:start; }
+.panel-grid > :not(.panel-field) { grid-column:1 / -1; }
+.panel-check { display:flex; align-items:center; color:var(--fg); font-size:0.85rem;
+               margin-top:0.5rem; }
+.panel-picks { display:flex; flex-direction:column; }
+.panel-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.8rem;
+              color:var(--muted); overflow-wrap:anywhere; margin:0.2rem 0; }
+details.panel-other { border-top:1px solid var(--line); margin-top:1rem; padding-top:0.5rem; }
+details.panel-other summary { cursor:pointer; font-size:0.85rem; color:var(--muted); }
+details.panel-acc { border-top:1px solid var(--line); }
+details.panel-acc:first-of-type { border-top:0; }
+details.panel-acc > summary { display:flex; align-items:center; gap:0.5rem; cursor:pointer;
+                              padding:0.45rem 0.9rem; font-size:0.9rem; color:var(--fg); }
+.panel-body { padding:0 0.9rem 0.9rem; }
+.panel-accordion .panel-group { padding:0 0.9rem; }
 "#;
 
 /// Runs in `<head>`, before the body is parsed, so the stored choice is on the

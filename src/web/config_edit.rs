@@ -165,6 +165,23 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 button type="button" id="add-destination" { "Add destination below" }
                 span id="destination-status" class="form-status" {}
             }
+            // The structured view of the JSON below. Its script fills it in;
+            // without JavaScript the JSON editor still works on its own.
+            section id="config-panel" class="config-panel" aria-label="Configuration by section" {
+                div class="panel-bar" {
+                    span id="panel-badge" class="panel-badge" {}
+                    span id="panel-hint" class="panel-hint" {
+                        "This view needs JavaScript. The JSON below works without it."
+                    }
+                }
+                fieldset id="panel-fields" class="panel-fields" {
+                    div class="panel-wide" {
+                        nav id="panel-index" class="panel-index" aria-label="Sections" {}
+                        div id="panel-detail" class="panel-detail" {}
+                    }
+                    div id="panel-accordion" class="panel-accordion" {}
+                }
+            }
             form id="config-form" {
                 label for="mail-password" { "New mail password (optional)" }
                 input type="password" id="mail-password" autocomplete="new-password"
@@ -177,6 +194,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 span id="status" {}
             }
             script { (maud::PreEscaped(FORMS_SCRIPT)) }
+            script { (maud::PreEscaped(PANEL_SCRIPT)) }
             script { (maud::PreEscaped(save_script(&csrf))) }
         },
     )
@@ -201,6 +219,10 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 /// `createTextNode`, never `innerHTML`: the ids come from whatever is in the
 /// textarea, and building markup out of them would make the editor its own
 /// injection vector.
+/// The structured view of the config. See the file's header for what it
+/// may and may not do; the tests below hold it to that.
+const PANEL_SCRIPT: &str = include_str!("config_panel.js");
+
 const FORMS_SCRIPT: &str = r#"
 (function () {
   var area = document.getElementById('config-json');
@@ -231,7 +253,13 @@ const FORMS_SCRIPT: &str = r#"
     return cfg;
   }
 
-  function render(cfg) { area.value = JSON.stringify(cfg, null, 2); }
+  // Setting the value fires no event, so a programmatic write announces
+  // itself. The config panel listens for this, and this script ignores its
+  // own announcements.
+  function render(cfg) {
+    area.value = JSON.stringify(cfg, null, 2);
+    area.dispatchEvent(new CustomEvent('config-json-changed', { detail: { origin: 'forms' } }));
+  }
 
   function sourceIds() {
     var ids = [];
@@ -426,6 +454,9 @@ const FORMS_SCRIPT: &str = r#"
   });
 
   area.addEventListener('input', refreshPicker);
+  area.addEventListener('config-json-changed', function (e) {
+    if (!e.detail || e.detail.origin !== 'forms') refreshPicker();
+  });
   applyPreset();
   refreshPicker();
 })();
@@ -744,6 +775,58 @@ mod tests {
     /// The forms deliberately have no server side. If one ever grows an
     /// endpoint, the hardened write path stops being the only way config
     /// reaches disk and the operator stops seeing what will be written.
+    /// The panel edits the document in the textarea and nothing else: no
+    /// request of its own, and no markup built from strings, since names and
+    /// ids in the document would otherwise become markup.
+    #[test]
+    fn the_panel_script_only_edits_the_document() {
+        for forbidden in [
+            "fetch",
+            "XMLHttpRequest",
+            "sendBeacon",
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+        ] {
+            assert!(
+                !super::PANEL_SCRIPT.contains(forbidden),
+                "the panel script must not use {}",
+                forbidden
+            );
+        }
+        assert!(
+            !super::PANEL_SCRIPT.contains("</script"),
+            "that would end the inline script early"
+        );
+    }
+
+    /// The script looks its elements up by id and does nothing if one is
+    /// missing, so a renamed id would switch the panel off without a sound.
+    #[tokio::test]
+    async fn every_element_the_panel_looks_for_is_on_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = rendered_config_page(dir.path()).await;
+
+        let mut ids = Vec::new();
+        let mut rest = super::PANEL_SCRIPT;
+        while let Some(at) = rest.find("getElementById('") {
+            rest = &rest[at + "getElementById('".len()..];
+            let end = rest.find('\'').unwrap();
+            ids.push(&rest[..end]);
+        }
+        assert!(ids.len() >= 8, "found only {:?}", ids);
+        for id in ids {
+            assert!(
+                page.contains(&format!("id=\"{}\"", id)),
+                "the panel looks for #{} but the page has no such element",
+                id
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_forms_add_no_second_write_path() {
         let dir = tempfile::tempdir().unwrap();
