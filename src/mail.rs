@@ -175,6 +175,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for mail_send::
 
 /// One connection per job, opened on the first message and reopened once if
 /// it drops.
+///
+/// The reconnect-once retry (see `Mailer::send` below) can then deliver a
+/// message twice, if the server accepted it but its final reply was lost to
+/// the dropped connection. That is preferred to dropping the message.
 pub struct SmtpMailer {
     config: MailConfig,
     connection: Option<Box<dyn Connection>>,
@@ -195,6 +199,10 @@ impl SmtpMailer {
     async fn connect(&self) -> Result<Box<dyn Connection>, SendError> {
         let client = SmtpClientBuilder::new(self.config.smtp_hostname.clone(), self.config.smtp_port)
             .map_err(|_| SendError::Connect)?
+            // A manual send holds the one job slot, so a server that stops
+            // answering must not hold it for the library default of an hour
+            // per command.
+            .timeout(std::time::Duration::from_secs(60))
             .implicit_tls(false)
             .credentials((self.config.address.clone(), self.config.password.clone()))
             .connect()
