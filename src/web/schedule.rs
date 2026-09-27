@@ -192,6 +192,27 @@ MAILTO=ops@example.com
         .is_empty());
     }
 
+    /// The shape a deployed entry actually has: a `cd`, a `flock` with its
+    /// own arguments in front of the binary, output redirection, and a
+    /// healthcheck ping carrying the exit status after it. The binary is
+    /// found in the middle, and nothing else on the line survives.
+    #[test]
+    fn a_compound_entry_with_flock_and_a_ping_is_recognised_and_dropped() {
+        let line = "17 * * * * scraper cd /var/lib/scraper && flock -n /var/lock/scraper.lock \
+                    /usr/bin/wandering_inn_scraper >> /var/lib/scraper/scraper.log 2>&1; \
+                    curl -fsS -m 10 --retry 5 https://hc.example.com/ping/0f5e8c1a-secret-token/$? \
+                    >/dev/null 2>&1";
+        let runs = parse_schedule(line, &at("2026-09-26T18:05:00Z"));
+        assert_eq!(runs.len(), 1, "{:?}", runs);
+        assert_eq!(runs[0].summary, "hourly at :17");
+        assert_eq!(runs[0].next, Some(at("2026-09-26T18:17:00Z")));
+
+        let rendered = format!("{:?}", runs);
+        for secret in ["secret-token", "hc.example.com", "/var/lib/scraper", "scraper.lock", "flock"] {
+            assert!(!rendered.contains(secret), "{} leaked: {}", secret, rendered);
+        }
+    }
+
     #[test]
     fn a_daily_run_rolls_over_midnight() {
         let runs = parse_schedule(
