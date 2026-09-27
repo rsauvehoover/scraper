@@ -140,6 +140,60 @@ scraper's data directory. A service started anywhere else starts cleanly and
 reports every configured source as configured but not yet scraped — that is
 the signature of a wrong working directory, not of missing databases.
 
+#### Which user
+
+Run the web service and the scheduled scrape as the same unprivileged user,
+and make that user the owner of the whole data directory. Neither process
+needs root: the scrape fetches and parses third-party HTML, and the web
+service is network-facing, so root is the wrong default for both.
+
+They must be the *same* user, because the web service needs write access to
+`db/` even though it only reads. It opens each database read-only at the SQL
+level, but SQLite still has to create the `-wal` and `-shm` files beside a
+database when no other connection holds them. A reader that cannot write the
+directory fails its first query with `attempt to write a readonly database`.
+One owner for everything also means no file created by one process is left
+unwritable by the other.
+
+An example unit, with the data directory at `/var/lib/scraper`:
+
+```ini
+[Unit]
+Description=scraper web frontend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=scraper
+Group=scraper
+WorkingDirectory=/var/lib/scraper
+ExecStart=/usr/bin/wandering_inn_scraper web --bind 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scraper
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+And the scheduled scrape as the same user, in `/etc/cron.d/scraper`:
+
+```
+17 * * * * scraper cd /var/lib/scraper && /usr/bin/wandering_inn_scraper
+```
+
+Behind an HTTPS reverse proxy, also pass `--secure-cookies`, and pass
+`--client-ip-from` with the header the proxy sets; see `web --help`.
+
+When moving an existing root-owned deployment, stop the service and wait for
+any running scrape to finish, then `chown -R` the entire data directory,
+including any `db/*-wal` and `db/*-shm` files, before starting either process
+as the new user. `find <dir> ! -user scraper` should print nothing.
+
 ### Operational notes
 
 Sessions and login rate-limit state are held in memory, so a restart drops
