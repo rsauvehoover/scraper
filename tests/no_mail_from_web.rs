@@ -65,8 +65,11 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     Whole,
-    /// Only from the file's `mod tests` line to its end. Every file here
-    /// keeps its tests module last.
+    /// Only inside the file's tests block: from a line that is exactly
+    /// `mod tests {` right after a line that is exactly `#[cfg(test)]`
+    /// (blank lines between allowed), to the next line that is exactly `}`
+    /// at column 0. Anything else, code after the block included, is
+    /// scanned.
     Tests,
 }
 
@@ -91,10 +94,21 @@ fn offenders(
         }
         let source = fs::read_to_string(path).unwrap();
         let mut in_tests = false;
+        let mut previous = "";
         for (n, line) in source.lines().enumerate() {
-            in_tests |= line.trim_start().starts_with("mod tests");
-            if in_tests && part == Some(Part::Tests) {
-                continue;
+            if !in_tests && line.trim() == "mod tests {" && previous == "#[cfg(test)]" {
+                in_tests = true;
+            }
+            if !line.trim().is_empty() {
+                previous = line.trim();
+            }
+            if in_tests {
+                if line == "}" {
+                    in_tests = false;
+                }
+                if part == Some(Part::Tests) {
+                    continue;
+                }
             }
             let code = line.split("//").next().unwrap_or("");
             if matches(code) {
@@ -389,6 +403,34 @@ fn the_run_job_check_catches_a_call_elsewhere() {
 
     assert_eq!(found.len(), 1, "expected only handler.rs: {:?}", found);
     assert!(found[0].contains("handler.rs"), "{:?}", found);
+}
+
+/// Fails closed: the exemption covers only a `#[cfg(test)] mod tests { }`
+/// block, not code after it, and not a look-alike line such as
+/// `mod tests_support;`.
+#[test]
+fn the_tests_exemption_ends_at_the_block() {
+    let check = |content: &str| {
+        let (dir, files) = scratch(&[("send_jobs.rs", content)]);
+        offenders(dir.path(), &files, &RECIPIENT_ALLOWED, names_recipient)
+    };
+
+    let inside = "fn f() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() { let r = Recipient { name, email }; }\n}\n";
+    let found = check(inside);
+    assert!(found.is_empty(), "inside the tests block is allowed: {:?}", found);
+
+    let after = format!("{}\nfn g() {{ let r = Recipient {{ name, email }}; }}\n", inside);
+    let found = check(&after);
+    assert_eq!(found.len(), 1, "code after the tests block is scanned: {:?}", found);
+    assert!(found[0].contains("send_jobs.rs:8:"), "{:?}", found);
+
+    let look_alike = "mod tests_support;\nfn g() { let r = Recipient { name, email }; }\n";
+    let found = check(look_alike);
+    assert_eq!(found.len(), 1, "mod tests_support; starts no exemption: {:?}", found);
+
+    let no_cfg = "mod tests {\n    fn t() { let r = Recipient { name, email }; }\n}\n";
+    let found = check(no_cfg);
+    assert_eq!(found.len(), 1, "mod tests without #[cfg(test)] starts no exemption: {:?}", found);
 }
 
 /// send_jobs.rs may name `Recipient` in its tests module only, and
