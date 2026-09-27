@@ -792,11 +792,20 @@ mod tests {
     #[tokio::test]
     async fn a_second_send_is_refused_while_one_runs() {
         let (state, _) = send_state();
-        state.sends.try_start("test-source", "Test Serial", &[]).unwrap();
+        let id = state.sends.try_start("test-source", "Test Serial", &[]).unwrap();
+        let link = format!(r#"<a href="/send/{}">See its progress</a>"#, id);
         let res = router(Arc::clone(&state))
             .oneshot(send_post(&state, &format!("v={}&d=0", volume_id(&state)), None)).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(res).await.contains("A send is in progress"));
+        let text = body_text(res).await;
+        assert!(text.contains("A send is in progress"), "{}", text);
+        assert!(text.contains(&link), "the refusal links to the running send: {}", text);
+
+        // The form says so on GET too, with the same link.
+        let uri = format!("/source/test-source/send?v={}", volume_id(&state));
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &uri, String::new())).await.unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("A send is in progress") && text.contains(&link), "{}", text);
     }
 
     #[tokio::test]

@@ -72,6 +72,11 @@
       submit.disabled = t.disabled;
     };
     dests.forEach(function (d) { d.addEventListener('change', refresh); });
+    // One click, one send: the server refuses a second while the first
+    // runs, but the reader should not have to see that.
+    form.addEventListener('submit', function () { submit.disabled = true; });
+    // Back to a page the browser kept would otherwise leave it disabled.
+    root.addEventListener('pageshow', refresh);
     refresh();
   }
 })(typeof window !== 'undefined' ? window : this);

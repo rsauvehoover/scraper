@@ -193,11 +193,14 @@ fn render(
         html! {
             p class="summary" { a href={ "/source/" (source_id) } { "Back to the contents" } }
             @if let Some(r) = refusal {
-                p class="error" { (r.message()) }
+                p class="error" {
+                    (r.message())
+                    @if matches!(r, Refusal::Busy) { (progress_link(state)) }
+                }
             } @else {
                 // Said before the reader fills in the form, not only after.
                 @if snapshot.load_error.is_some() { p class="error" { (Refusal::ConfigNotLoaded.message()) } }
-                @if busy { p class="error" { (Refusal::Busy.message()) } }
+                @if busy { p class="error" { (Refusal::Busy.message()) (progress_link(state)) } }
             }
             (form_body(source_id, &resolved, &mail, &chosen, &csrf, pairs))
             script { (PreEscaped(SEND_SCRIPT)) }
@@ -205,6 +208,12 @@ fn render(
     );
     let status = if refusal.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
     (status, markup).into_response()
+}
+
+/// After the Busy message: a link to the running send.
+fn progress_link(state: &AppState) -> Markup {
+    let Some(job) = state.sends.latest() else { return html! {} };
+    html! { " " a href={ "/send/" (job.id) } { "See its progress" } }
 }
 
 fn form_body(
