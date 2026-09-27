@@ -13,6 +13,7 @@
 //! through `get` first. Nothing in the type system enforces it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::config::{Config, SourceConfig};
@@ -29,9 +30,37 @@ pub struct SourceEntry {
     // Private: `db()` is the only route in, so the mutex-poisoning policy is
     // decided once, here, rather than re-decided at every call site.
     db: Mutex<SourceDatabase>,
+    // Unique per constructed entry, never reused within the process. See
+    // `generation()`.
+    generation: u64,
 }
 
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 impl SourceEntry {
+    fn new(config: SourceConfig, db: SourceDatabase) -> Self {
+        SourceEntry {
+            config,
+            db: Mutex::new(db),
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Identifies this entry, as opposed to the source it describes.
+    ///
+    /// A reload replaces every entry, and anything memoised against an
+    /// entry has to be able to tell the replacement apart from the
+    /// original even though both carry the same source id. The statistics
+    /// cache is the case that needs it: it validates on `PRAGMA
+    /// data_version`, which is a per-connection counter, so a replacement
+    /// entry's fresh connection can report exactly the value the old one's
+    /// statistics were cached under while the data has since changed. The
+    /// cached statistics also embed the configured display name, which a
+    /// reload may have changed with no data change at all.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Lock this source's database.
     ///
     /// Poisoning is recovered rather than propagated. A query-only SQLite read
@@ -53,10 +82,7 @@ impl SourceEntry {
     /// database cannot do.
     #[cfg(test)]
     pub fn for_test(config: SourceConfig, db: SourceDatabase) -> Self {
-        SourceEntry {
-            config,
-            db: Mutex::new(db),
-        }
+        SourceEntry::new(config, db)
     }
 }
 
@@ -176,13 +202,7 @@ impl SourceRegistry {
             }
 
             order.push(source.id.clone());
-            entries.insert(
-                source.id.clone(),
-                SourceEntry {
-                    config: source.clone(),
-                    db: Mutex::new(db),
-                },
-            );
+            entries.insert(source.id.clone(), SourceEntry::new(source.clone(), db));
         }
 
         SourceRegistry {
@@ -200,13 +220,7 @@ impl SourceRegistry {
         for source in config.enabled_sources() {
             let db = SourceDatabase::open_in_memory(&source.id).unwrap();
             order.push(source.id.clone());
-            entries.insert(
-                source.id.clone(),
-                SourceEntry {
-                    config: source.clone(),
-                    db: Mutex::new(db),
-                },
-            );
+            entries.insert(source.id.clone(), SourceEntry::new(source.clone(), db));
         }
         SourceRegistry {
             entries,

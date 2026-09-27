@@ -214,6 +214,7 @@ fn data_version(entry: &SourceEntry) -> Option<i64> {
 }
 
 struct Cached {
+    generation: u64,
     version: Option<i64>,
     stat: Arc<SourceStat>,
 }
@@ -253,7 +254,10 @@ impl StatsCache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = guard.get(&entry.config.id) {
-                if cached.version == version {
+                // Same entry AND same data_version. The version alone is
+                // only comparable within one connection; see
+                // `SourceEntry::generation`.
+                if cached.generation == entry.generation() && cached.version == version {
                     return Ok(Arc::clone(&cached.stat));
                 }
             }
@@ -271,6 +275,7 @@ impl StatsCache {
         guard.insert(
             entry.config.id.clone(),
             Cached {
+                generation: entry.generation(),
                 version,
                 stat: Arc::clone(&stat),
             },
@@ -514,5 +519,93 @@ mod tests {
             "cache must observe the writer's commit, not serve stale data"
         );
         assert_eq!(second.total_words, 5);
+    }
+
+    /// Fixture for the two tests below: a WAL database with one chapter,
+    /// written through its own connection, which is returned so a test can
+    /// commit more later.
+    fn one_chapter_db(id: &str) -> (crate::db::SourceDatabase, isize) {
+        use crate::db::SourceDatabase;
+        let writer = SourceDatabase::open(id).unwrap();
+        let vol = writer.add_volume("Volume 1").unwrap();
+        writer
+            .add_chapter("Chapter 1", "https://example.com/c1", vol)
+            .unwrap();
+        let ch1 = writer.get_chapters_by_volume(vol).unwrap()[0].id;
+        writer.add_chapter_data(ch1, "<p>one two three</p>").unwrap();
+        (writer, vol)
+    }
+
+    fn entry_named(id: &str, name: &str) -> crate::db::SourceEntry {
+        use crate::config::SourceConfig;
+        use crate::db::{SourceDatabase, SourceEntry};
+        SourceEntry::for_test(
+            SourceConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                ..SourceConfig::default()
+            },
+            SourceDatabase::open_query_only(id).unwrap(),
+        )
+    }
+
+    /// A registry reload replaces every entry with one holding a FRESH
+    /// connection. `PRAGMA data_version` is a per-connection counter, so its
+    /// values are only comparable within one connection: a new connection
+    /// can report the very number the old one's cached statistics were
+    /// stored under, even though the scraper committed in between. Keyed on
+    /// source id and data_version alone, that is a cache hit on stale data.
+    #[test]
+    #[serial]
+    fn a_replacement_entry_does_not_inherit_a_stale_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let (writer, vol) = one_chapter_db("t");
+
+        let cache = StatsCache::new();
+        let before = entry_named("t", "T");
+        assert_eq!(cache.get(&before).unwrap().total_chapters, 1);
+
+        // The scraper commits while nobody asks the old entry anything.
+        writer
+            .add_chapter("Chapter 2", "https://example.com/c2", vol)
+            .unwrap();
+        let ch2 = writer
+            .get_chapters_by_volume(vol)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "Chapter 2")
+            .unwrap()
+            .id;
+        writer.add_chapter_data(ch2, "<p>four five</p>").unwrap();
+
+        // Then a reload builds a replacement entry for the same source.
+        let after = entry_named("t", "T");
+        assert_eq!(
+            cache.get(&after).unwrap().total_chapters,
+            2,
+            "a replacement entry must not be served the old entry's statistics"
+        );
+    }
+
+    /// `SourceStat` carries the configured display name, so a rename in
+    /// config.json with no data change at all must still reach the page
+    /// once the registry is rebuilt.
+    #[test]
+    #[serial]
+    fn a_renamed_source_shows_its_new_name_after_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let (_writer, _vol) = one_chapter_db("t");
+
+        let cache = StatsCache::new();
+        assert_eq!(cache.get(&entry_named("t", "Old Name")).unwrap().name, "Old Name");
+        assert_eq!(
+            cache.get(&entry_named("t", "New Name")).unwrap().name,
+            "New Name",
+            "a rebuilt entry must not be served statistics built from the old config"
+        );
     }
 }
