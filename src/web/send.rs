@@ -98,6 +98,7 @@ pub async fn job_status(
                 @if failed > 0 { ", " (failed) " failed" }
                 @if job.finished { ". Finished." } @else { ". This page refreshes every 3 seconds." }
             }
+            div class="table-wrap" {
             table class="jobs" {
                 thead { tr { th { "Item" } th { "To" } th { "Version" } th { "State" } } }
                 tbody {
@@ -110,6 +111,7 @@ pub async fn job_status(
                         }
                     }
                 }
+            }
             }
             p class="summary" { a href={ "/source/" (job.source_id) } { "Back to the contents" } }
         },
@@ -174,7 +176,13 @@ fn render(
     let csrf = session_token(headers)
         .and_then(|t| state.sessions.csrf_for(&t))
         .unwrap_or_default();
-    let chosen = send_plan::choices(pairs);
+    // After a config change the ticked indices may name different people,
+    // so the reader chooses again from the fresh list.
+    let chosen = if matches!(refusal, Some(Refusal::ConfigChanged)) {
+        Vec::new()
+    } else {
+        send_plan::choices(pairs)
+    };
     let busy = state.sends.is_running();
     let markup = page(
         &format!("Send from {}", stat.name),

@@ -679,7 +679,10 @@ mod tests {
         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let replaced = String::from_utf8_lossy(&body).replace("config=", "config=stale");
         let res = router(Arc::clone(&state)).oneshot(Request::from_parts(parts, Body::from(replaced))).await.unwrap();
-        assert!(body_text(res).await.contains("destination list changed"));
+        let text = body_text(res).await;
+        assert!(text.contains("destination list changed"), "{}", text);
+        // The indices may now name different people, so none is ticked.
+        assert!(!text.contains(r#"id="dest-0" checked"#), "{}", text);
         assert!(state.sends.latest().is_none());
     }
 

@@ -134,7 +134,7 @@ impl SendJobs {
 // `pub(crate)`, not `pub`: `BuildError` is itself `pub(crate)` (see
 // `download.rs`), and a `pub` item naming a less-visible type is a
 // `private_interfaces` warning. Nothing outside the crate needs these —
-// `send.rs` and `app.rs` (both inside `src/web`) are the only callers.
+// `send.rs` (inside `src/web`) is the only caller.
 pub(crate) type BuildFn = fn(&SourceConfig, &Item, bool) -> Result<Attachment, BuildError>;
 
 /// The same builds the download links serve.
