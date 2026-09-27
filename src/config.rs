@@ -389,8 +389,79 @@ pub fn load_config_from(path: &std::path::Path) -> Config {
     }
 }
 
+/// The scraper's path: a config that fails to parse aborts the run, as it
+/// always has.
 fn parse_and_migrate(raw: &str) -> Config {
-    match serde_json::from_str::<Config>(raw) {
+    try_parse_and_migrate(raw.as_bytes()).unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// Why a config could not be loaded, carrying nothing from the file itself.
+///
+/// serde_json's messages quote the value that failed to parse, and
+/// config.json holds the mail password. This is what gets shown on a page
+/// and written to a log, so it keeps the position and the kind of fault and
+/// drops the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLoadError {
+    Missing,
+    Unreadable(std::io::ErrorKind),
+    Invalid {
+        line: usize,
+        column: usize,
+        category: &'static str,
+    },
+}
+
+impl ConfigLoadError {
+    pub fn from_io(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => ConfigLoadError::Missing,
+            kind => ConfigLoadError::Unreadable(kind),
+        }
+    }
+
+    fn from_serde(e: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        let category = match e.classify() {
+            Category::Io => "read error",
+            Category::Syntax => "syntax error",
+            Category::Data => "invalid value",
+            Category::Eof => "unexpected end of file",
+        };
+        ConfigLoadError::Invalid {
+            line: e.line(),
+            column: e.column(),
+            category,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigLoadError::Missing => write!(f, "config file not found"),
+            ConfigLoadError::Unreadable(kind) => {
+                write!(f, "config file could not be read ({:?})", kind)
+            }
+            ConfigLoadError::Invalid {
+                line,
+                column,
+                category,
+            } => write!(f, "{} at line {}, column {}", category, line, column),
+        }
+    }
+}
+
+impl std::error::Error for ConfigLoadError {}
+
+/// The web service's path: a config that fails to parse is reported, not
+/// fatal, so a bad hand edit cannot take a running server down.
+pub fn parse_config(raw: &[u8]) -> Result<Config, ConfigLoadError> {
+    try_parse_and_migrate(raw).map_err(|e| ConfigLoadError::from_serde(&e))
+}
+
+fn try_parse_and_migrate(raw: &[u8]) -> Result<Config, serde_json::Error> {
+    match serde_json::from_slice::<Config>(raw) {
         Ok(mut config) => {
             println!("Loaded config");
             println!("Delay is {}ms", config.request_delay);
@@ -446,11 +517,9 @@ fn parse_and_migrate(raw: &str) -> Config {
                 println!("Source enabled: {} ({})", source.name, source.id);
             }
 
-            config
+            Ok(config)
         }
-        Err(e) => {
-            panic!("{}", e);
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -490,6 +559,57 @@ fn migrate_legacy_config(mut config: Config) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// config.json holds the mail password, and serde_json's own error
+    /// messages quote the offending value. A load error is shown on a page
+    /// and written to a log, so it must carry the position and the kind of
+    /// fault, never the text.
+    #[test]
+    fn a_config_load_error_never_quotes_the_file() {
+        let raw = br#"{"RequestDelay": "s3cret-value-from-the-file"}"#;
+
+        // The hazard is real: serde's message repeats the value verbatim.
+        let serde_message = serde_json::from_slice::<Config>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            serde_message.contains("s3cret-value-from-the-file"),
+            "precondition: {}",
+            serde_message
+        );
+
+        let err = parse_config(raw).unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("s3cret-value-from-the-file"),
+            "a load error quoted the file: {}",
+            shown
+        );
+        assert!(
+            matches!(err, ConfigLoadError::Invalid { line: 1, .. }),
+            "{:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_valid_config_parses() {
+        let config = parse_config(br#"{"RequestDelay": 5}"#).unwrap();
+        assert_eq!(config.request_delay, 5);
+    }
+
+    #[test]
+    fn io_failures_map_to_missing_or_unreadable() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            ConfigLoadError::from_io(&Error::from(ErrorKind::NotFound)),
+            ConfigLoadError::Missing
+        );
+        assert_eq!(
+            ConfigLoadError::from_io(&Error::from(ErrorKind::PermissionDenied)),
+            ConfigLoadError::Unreadable(ErrorKind::PermissionDenied)
+        );
+    }
 
     #[test]
     fn debug_output_never_contains_the_password() {
