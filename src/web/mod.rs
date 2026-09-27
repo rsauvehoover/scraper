@@ -5,6 +5,7 @@ pub mod download;
 pub mod reload;
 pub mod sanitize;
 pub mod schedule;
+pub mod send;
 pub mod send_jobs;
 pub mod send_plan;
 pub mod toc;

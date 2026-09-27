@@ -13,11 +13,14 @@ use axum::Router;
 use maud::html;
 use tokio::sync::Semaphore;
 
+use crate::config::MailConfig;
+use crate::mail::Mailer;
 use crate::web::reload::LiveRegistry;
 use crate::stats::cache::StatsCache;
 use crate::web::auth::{
     hash_password, load_credential, store_credential, verify_password, RateLimiter, SessionStore,
 };
+use crate::web::send_jobs::SendJobs;
 use crate::web::views::page;
 
 const SESSION_COOKIE: &str = "scraper_session";
@@ -131,6 +134,12 @@ pub struct AppState {
     /// EPUB generation is CPU-bound and each build holds several megabytes,
     /// so concurrent builds are capped rather than unbounded.
     pub epub_permits: Arc<Semaphore>,
+    /// Manual sends, running and recent. See `web::send_jobs`.
+    pub sends: Arc<SendJobs>,
+    /// Makes the mailer for one send job from the mail settings in use.
+    /// Tests substitute a recording one; nothing in the test suite opens a
+    /// network connection.
+    pub mailer: Arc<dyn Fn(MailConfig) -> Box<dyn Mailer> + Send + Sync>,
 }
 
 impl AppState {
@@ -155,6 +164,11 @@ impl AppState {
             client_ip_from: ClientIpSource::Peer,
             schedule_file: None,
             epub_permits: Arc::new(Semaphore::new(2)),
+            sends: Arc::new(SendJobs::new()),
+            mailer: Arc::new(|_| {
+                let (m, _) = crate::test_support::RecordingMailer::failing_on(0, crate::mail::SendError::Other);
+                Box::new(m)
+            }),
         }
     }
 }
@@ -175,6 +189,16 @@ pub(crate) fn session_token(headers: &HeaderMap) -> Option<String> {
         })
         .find(|(k, _)| *k == SESSION_COOKIE)
         .map(|(_, v)| v.to_string())
+}
+
+/// Whether `supplied` is this session's CSRF token. Pages that write send it
+/// as a header from script or as a `csrf` form field.
+pub(crate) fn csrf_matches(state: &AppState, headers: &HeaderMap, supplied: &str) -> bool {
+    let Some(token) = session_token(headers) else { return false };
+    match state.sessions.csrf_for(&token) {
+        Some(expected) => !expected.is_empty() && expected == supplied,
+        None => false,
+    }
 }
 
 /// Rejects every request without a valid session. Applied to the whole
@@ -317,6 +341,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/source/{source_id}/volume/{volume_id}/epub",
             get(crate::web::download::volume_epub),
         )
+        .route(
+            "/source/{source_id}/send",
+            get(crate::web::send::send_form).post(crate::web::send::send_submit),
+        )
+        .route("/send/{job_id}", get(crate::web::send::job_status))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_session,
@@ -350,6 +379,8 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
         client_ip_from: args.client_ip_from,
         schedule_file: args.schedule_file.clone(),
         epub_permits: Arc::new(Semaphore::new(2)),
+        sends: Arc::new(SendJobs::new()),
+        mailer: Arc::new(|config| Box::new(crate::mail::SmtpMailer::new(config))),
     });
 
     // Warm the statistics cache before accepting traffic, so the first
@@ -459,7 +490,194 @@ mod tests {
         ("GET", "/source/test-source/chapter/1/raw"),
         ("GET", "/source/test-source/chapter/1/epub"),
         ("GET", "/source/test-source/volume/1/epub"),
+        ("GET", "/source/test-source/send"),
+        ("POST", "/source/test-source/send"),
+        ("GET", "/send/0000"),
     ];
+
+    /// State with two destinations and a recording mailer. The first lists
+    /// the source; the second does not.
+    fn send_state() -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<crate::test_support::Sent>>>) {
+        use crate::config::{Config, SourceConfig, UserConfig};
+        let mut config = Config::default();
+        config.sources = vec![SourceConfig { id: "test-source".into(), name: "Test Serial".into(), enabled: true, ..SourceConfig::default() }];
+        config.mail.password = "synthetic-pw-918273".into();
+        let mut listed = UserConfig { name: "Test Reader".into(), email: "reader@example.com".into(), strip_colour: true, ..Default::default() };
+        listed.sources.insert("test-source".into(), Default::default());
+        config.mail.destinations = vec![
+            listed,
+            UserConfig { name: "Second Reader".into(), email: "second@example.org".into(), ..Default::default() },
+        ];
+        let (mailer, sent) = crate::test_support::RecordingMailer::new();
+        let mailer = std::sync::Mutex::new(Some(mailer));
+        let state = AppState {
+            registry: LiveRegistry::fixed_with_config(config),
+            mailer: Arc::new(move |_| {
+                let m = mailer.lock().unwrap().take().expect("one job per test");
+                Box::new(m) as Box<dyn crate::mail::Mailer>
+            }),
+            ..AppState::for_test()
+        };
+        {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("First Chapter", "https://example.com/c1", vol).unwrap();
+            let c = db.get_chapters_by_volume(vol).unwrap()[0].id;
+            db.add_chapter_data(c, "<p>one two three</p>").unwrap();
+        }
+        (Arc::new(state), sent)
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn authed(state: &AppState, method: &str, uri: &str, body: String) -> Request<Body> {
+        let token = state.sessions.create();
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", format!("scraper_session={}", token))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// A POST body as the form would send it, with a valid CSRF token for a
+    /// fresh session. Returns the request.
+    fn send_post(state: &AppState, fields: &str, csrf: Option<&str>) -> Request<Body> {
+        let token = state.sessions.create();
+        let real = state.sessions.csrf_for(&token).unwrap();
+        let (_, mail) = state.registry.snapshot_and_mail();
+        let fp = crate::web::send_plan::fingerprint(&mail);
+        let csrf = csrf.map(str::to_string).unwrap_or(real);
+        Request::builder()
+            .method("POST")
+            .uri("/source/test-source/send")
+            .header("cookie", format!("scraper_session={}", token))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("{}&config={}&csrf={}", fields, fp, csrf)))
+            .unwrap()
+    }
+
+    fn volume_id(state: &AppState) -> i64 {
+        let registry = state.registry.snapshot();
+        let db = registry.get("test-source").unwrap().db();
+        db.connection().query_row("SELECT id FROM volumes", [], |r| r.get(0)).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "Task 7"]
+    async fn the_contents_page_is_a_selection_form() {
+        let (state, _) = send_state();
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", "/source/test-source", String::new())).await.unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains(r#"action="/source/test-source/send""#), "{}", text);
+        assert!(text.contains(r#"name="v""#) && text.contains(r#"name="c""#), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn the_form_offers_every_destination_and_marks_an_unusual_one() {
+        let (state, _) = send_state();
+        let uri = format!("/source/test-source/send?v={}", volume_id(&state));
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &uri, String::new())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = body_text(res).await;
+        assert!(text.contains("Test Reader") && text.contains("Second Reader"), "{}", text);
+        assert_eq!(text.matches("Does not normally receive this series").count(), 1, "{}", text);
+        assert!(!text.contains("synthetic-pw-918273"));
+        // Each destination's Colour/Stripped radio is pre-checked; its
+        // checkbox must not be. maud writes `checked` right after `id`.
+        for i in 0..2 {
+            assert!(!text.contains(&format!(r#"id="dest-{}" checked"#, i)),
+                    "no destination is ticked for you: {}", text);
+        }
+        assert!(text.contains(r#"value="stripped" checked"#), "Test Reader starts on Stripped: {}", text);
+    }
+
+    #[tokio::test]
+    async fn a_send_without_the_csrf_token_is_refused_and_starts_nothing() {
+        let (state, _) = send_state();
+        let req = send_post(&state, &format!("v={}&d=0", volume_id(&state)), Some("wrong"));
+        let res = router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(state.sends.latest().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_send_redirects_to_its_status_and_runs() {
+        // The job's build opens `db/test-source.db` by path; point the cwd
+        // at an empty scratch directory so it can never find the
+        // repository's own `db/`.
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::CwdGuard::change_to(dir.path());
+        let (state, _) = send_state();
+        let req = send_post(&state, &format!("v={}&d=0&colour-0=stripped", volume_id(&state)), None);
+        let res = router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let location = res.headers()[header::LOCATION].to_str().unwrap().to_string();
+        assert!(location.starts_with("/send/"), "{}", location);
+
+        // The job runs on its own task; the fixture database is in memory,
+        // so the build fails, which is enough to show the job ran and ended.
+        for _ in 0..100 {
+            if state.sends.latest().map_or(false, |j| j.finished) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job = state.sends.latest().unwrap();
+        assert!(job.finished);
+        assert_eq!(job.emails.len(), 1);
+        assert!(job.emails[0].strip_colour);
+
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &location, String::new())).await.unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("Test Reader"), "{}", text);
+        assert!(!text.contains("http-equiv=\"refresh\""), "a finished job stops refreshing: {}", text);
+    }
+
+    #[tokio::test]
+    async fn refusals_re_render_the_form_and_start_nothing() {
+        let (state, _) = send_state();
+        let v = volume_id(&state);
+        for (fields, expect) in [
+            (format!("v={}", v), "Tick at least one destination."),
+            ("d=0".to_string(), "Nothing to send."),
+        ] {
+            let res = router(Arc::clone(&state)).oneshot(send_post(&state, &fields, None)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            assert!(body_text(res).await.contains(expect));
+        }
+        let stale = send_post(&state, &format!("v={}&d=0", v), None);
+        let (parts, body) = stale.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let replaced = String::from_utf8_lossy(&body).replace("config=", "config=stale");
+        let res = router(Arc::clone(&state)).oneshot(Request::from_parts(parts, Body::from(replaced))).await.unwrap();
+        assert!(body_text(res).await.contains("destination list changed"));
+        assert!(state.sends.latest().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_send_is_refused_while_one_runs() {
+        let (state, _) = send_state();
+        state.sends.try_start("test-source", "Test Serial", &[]).unwrap();
+        let res = router(Arc::clone(&state))
+            .oneshot(send_post(&state, &format!("v={}&d=0", volume_id(&state)), None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains("A send is in progress"));
+    }
+
+    #[tokio::test]
+    async fn a_running_job_refreshes_and_the_index_links_to_it() {
+        let (state, _) = send_state();
+        let id = state.sends.try_start("test-source", "Test Serial", &[]).unwrap();
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &format!("/send/{}", id), String::new())).await.unwrap();
+        assert!(body_text(res).await.contains(r#"http-equiv="refresh""#));
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", "/", String::new())).await.unwrap();
+        assert!(body_text(res).await.contains(&format!("/send/{}", id)));
+    }
 
     #[tokio::test]
     async fn every_route_requires_authentication() {

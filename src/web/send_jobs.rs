@@ -135,16 +135,9 @@ impl SendJobs {
 // `download.rs`), and a `pub` item naming a less-visible type is a
 // `private_interfaces` warning. Nothing outside the crate needs these —
 // `send.rs` and `app.rs` (both inside `src/web`) are the only callers.
-//
-// `#[allow(dead_code)]`: not wired into a route yet. `send.rs` (a later
-// task) is the caller; until then nothing outside this module's own tests
-// reaches it, and those substitute a fake `BuildFn` rather than calling this
-// directly. Mirrors `SourceConfig::royal_road` in `src/config.rs`.
-#[allow(dead_code)]
 pub(crate) type BuildFn = fn(&SourceConfig, &Item, bool) -> Result<Attachment, BuildError>;
 
 /// The same builds the download links serve.
-#[allow(dead_code)]
 pub(crate) fn build_item(source: &SourceConfig, item: &Item, strip_colour: bool) -> Result<Attachment, BuildError> {
     match item {
         Item::Volume { id, .. } => build_volume(source, *id, strip_colour),
@@ -165,8 +158,6 @@ impl Drop for FinishOnDrop {
     }
 }
 
-// Same reason as `build_item` above: wired up by a later task's route.
-#[allow(dead_code)]
 pub(crate) async fn run_job(
     jobs: Arc<SendJobs>,
     id: String,

@@ -520,15 +520,9 @@ pub async fn put_config(
 ) -> Response {
     // SameSite=Strict already blocks the cross-site form case; this is the
     // second layer, and the one that does not depend on browser behaviour.
-    let expected = session_csrf(&state, &headers);
-    let supplied = headers
-        .get("x-csrf-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    match expected {
-        Some(ref token) if !token.is_empty() && token == supplied => {}
-        _ => return (StatusCode::FORBIDDEN, "Missing or invalid CSRF token").into_response(),
+    let supplied = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !crate::web::app::csrf_matches(&state, &headers, supplied) {
+        return (StatusCode::FORBIDDEN, "Missing or invalid CSRF token").into_response();
     }
 
     // Not `.ok()`. An unreadable or malformed `config.json` used to become an

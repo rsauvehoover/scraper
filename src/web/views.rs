@@ -192,6 +192,19 @@ details.panel-acc > summary { display:flex; align-items:center; gap:0.5rem; curs
                               padding:0.45rem 0.9rem; font-size:0.9rem; color:var(--fg); }
 .panel-body { padding:0 0.9rem 0.9rem; }
 .panel-accordion .panel-group { padding:0 0.9rem; }
+/* Manual send: the form and the job status page. */
+.table-wrap { overflow-x:auto; }
+.send-list { list-style:none; margin:0 0 1rem; padding:0; }
+.send-list li { display:flex; gap:0.75rem; padding:0.3rem 0; border-bottom:1px solid var(--line); }
+.send-list li span:first-child { flex:1; min-width:0; }
+.send-list .detail, .dest-email, .dest-unusual { color:var(--muted); font-size:0.85rem; }
+.dest-unusual { font-style:italic; }
+table.dests td { vertical-align:top; }
+table.dests label.variant { white-space:nowrap; margin-right:0.75rem; }
+.send-actions { display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; margin-top:1.25rem; }
+.state-sent { color:var(--ok); }
+.state-failed { color:var(--error); }
+.state-waiting { color:var(--muted); }
 "#;
 
 /// Runs in `<head>`, before the body is parsed, so the stored choice is on the
@@ -268,12 +281,20 @@ const THEME_SCRIPT: &str = r#"
 
 /// Shared chrome. Every page goes through here.
 pub fn page(title: &str, body: Markup) -> Markup {
+    page_with_refresh(title, None, body)
+}
+
+/// `page`, reloading itself every `refresh_seconds` when that is set.
+pub fn page_with_refresh(title: &str, refresh_seconds: Option<u32>, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                @if let Some(seconds) = refresh_seconds {
+                    meta http-equiv="refresh" content=(seconds);
+                }
                 title { (title) " — Scraper" }
                 style { (PreEscaped(PALETTE)) (PreEscaped(BASE)) }
                 // Before <body>, on purpose. See PREPAINT_SCRIPT.
@@ -506,6 +527,7 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
             (skipped_note(registry.skipped()))
             (unreadable_note(&unreadable))
             (schedule_note(&state, &chrono::Local::now()))
+            (crate::web::send::job_note(&state))
             p class="summary" {
                 (stats.len()) " sources · " (format_thousands(total_chapters)) " chapters · "
                 (format_thousands(total_words)) " words"
@@ -962,9 +984,7 @@ mod tests {
     ///   open failure that is not "never scraped".
     fn build_test_state() -> std::sync::Arc<crate::web::app::AppState> {
         use crate::db::{SourceDatabase, SourceRegistry};
-        use crate::stats::cache::StatsCache;
         use crate::web::app::AppState;
-        use crate::web::auth::{hash_password, RateLimiter, SessionStore};
 
         std::fs::create_dir_all("db").unwrap();
 
@@ -990,15 +1010,7 @@ mod tests {
 
         std::sync::Arc::new(AppState {
             registry: crate::web::reload::LiveRegistry::fixed(SourceRegistry::from_config(&config)),
-            stats: StatsCache::new(),
-            sessions: SessionStore::new(std::time::Duration::from_secs(3600)),
-            limiter: RateLimiter::new(10, std::time::Duration::from_secs(900)),
-            credential: hash_password("hunter2-hunter2").unwrap(),
-            config_path: std::path::PathBuf::from("config.json"),
-            secure_cookies: false,
-            client_ip_from: crate::web::app::ClientIpSource::Peer,
-            schedule_file: None,
-            epub_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            ..AppState::for_test()
         })
     }
 
