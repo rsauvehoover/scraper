@@ -14,6 +14,13 @@ use std::time::{Duration, Instant};
 use crate::config::{parse_config, Config, ConfigLoadError, MailConfig};
 use crate::db::SourceRegistry;
 
+/// See `LiveRegistry::snapshot_and_mail`.
+pub struct SendSnapshot {
+    pub registry: Arc<SourceRegistry>,
+    pub mail: MailConfig,
+    pub load_error: Option<ConfigLoadError>,
+}
+
 pub struct LiveRegistry {
     current: RwLock<Arc<SourceRegistry>>,
     // Held for the length of a check, rebuild included, so only one request
@@ -97,16 +104,22 @@ impl LiveRegistry {
         live
     }
 
-    /// The registry and the mail settings of the configuration in use, from
-    /// the same reload. A send reads both, and must not pair sources from one
-    /// config with destinations from another.
+    /// The registry, the mail settings of the configuration in use, and why
+    /// the file on disk is not that configuration, all from the same reload.
+    /// A send reads all three, and must not pair sources from one config with
+    /// destinations from another, nor send to the last good destinations
+    /// because the error was read after a reload cleared it.
     ///
-    /// Unlike `snapshot`, this waits for a reload in progress: the pair can
+    /// Unlike `snapshot`, this waits for a reload in progress: the three can
     /// only be read consistently under the lock that swaps them.
-    pub fn snapshot_and_mail(&self) -> (Arc<SourceRegistry>, MailConfig) {
+    pub fn snapshot_and_mail(&self) -> SendSnapshot {
         let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
         self.check_if_due(&mut control);
-        (self.current(), control.applied.mail.clone())
+        SendSnapshot {
+            registry: self.current(),
+            mail: control.applied.mail.clone(),
+            load_error: control.error.clone(),
+        }
     }
 
     /// The registry to use for this request, reloading first if a check is
@@ -354,11 +367,16 @@ mod tests {
             "{:?}",
             registry.load_error()
         );
+        // A send reads the error with the last good configuration.
+        let send = registry.snapshot_and_mail();
+        assert_eq!(ids(&send.registry), ["alpha"]);
+        assert!(matches!(send.load_error, Some(ConfigLoadError::Invalid { .. })));
 
         // Fixing the file clears the error and applies the new content.
         write_config(&["alpha", "beta"]);
         assert_eq!(ids(&registry.snapshot()), ["alpha", "beta"]);
         assert_eq!(registry.load_error(), None);
+        assert_eq!(registry.snapshot_and_mail().load_error, None);
     }
 
     #[test]
@@ -423,7 +441,7 @@ mod tests {
         let (_dir, _cwd) = scratch();
         write_config(&["first-source"]);
         let live = live(Duration::ZERO);
-        let (_, mail) = live.snapshot_and_mail();
+        let mail = live.snapshot_and_mail().mail;
         assert!(mail.destinations.is_empty());
 
         let mut doc: serde_json::Value =
@@ -436,7 +454,7 @@ mod tests {
         });
         std::fs::write(CONFIG, serde_json::to_vec(&doc).unwrap()).unwrap();
 
-        let (_, mail) = live.snapshot_and_mail();
+        let mail = live.snapshot_and_mail().mail;
         assert_eq!(mail.destinations.len(), 1);
         assert_eq!(mail.destinations[0].email, "reader@example.com");
     }
@@ -450,6 +468,6 @@ mod tests {
             ..Default::default()
         });
         let live = LiveRegistry::fixed_with_config(config);
-        assert_eq!(live.snapshot_and_mail().1.destinations[0].name, "Test Reader");
+        assert_eq!(live.snapshot_and_mail().mail.destinations[0].name, "Test Reader");
     }
 }

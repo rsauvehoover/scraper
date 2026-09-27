@@ -550,7 +550,7 @@ mod tests {
     fn send_post(state: &AppState, fields: &str, csrf: Option<&str>) -> Request<Body> {
         let token = state.sessions.create();
         let real = state.sessions.csrf_for(&token).unwrap();
-        let (_, mail) = state.registry.snapshot_and_mail();
+        let mail = state.registry.snapshot_and_mail().mail;
         let fp = crate::web::send_plan::fingerprint(&mail);
         let csrf = csrf.map(str::to_string).unwrap_or(real);
         Request::builder()
@@ -660,6 +660,109 @@ mod tests {
         let text = body_text(res).await;
         assert!(text.contains("Test Reader"), "{}", text);
         assert!(!text.contains("http-equiv=\"refresh\""), "a finished job stops refreshing: {}", text);
+    }
+
+    /// State that reloads from a real `config.json` in the current directory
+    /// (`test-source`, one destination), over a real `db/test-source.db`
+    /// holding one downloaded chapter in one volume, with a recording mailer.
+    /// The caller holds a `CwdGuard` into a scratch directory and is serial.
+    fn file_backed_send_state() -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<crate::test_support::Sent>>>) {
+        std::fs::create_dir_all("db").unwrap();
+        {
+            let db = crate::db::SourceDatabase::open("test-source").unwrap();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("First Chapter", "https://example.com/c1", vol).unwrap();
+            let c = db.get_chapters_by_volume(vol).unwrap()[0].id;
+            db.add_chapter_data(c, "<p>one two three</p>").unwrap();
+        }
+        let config = serde_json::json!({
+            "Sources": [{ "Id": "test-source", "Name": "Test Serial", "Enabled": true }],
+            "Mail": {
+                "Name": "Example Sender", "Address": "sender@example.com",
+                "Password": "synthetic-pw-918273",
+                "SmtpHostname": "smtp.example.com", "SmtpPort": 587,
+                "Destinations": [{ "Name": "Test Reader", "Email": "reader@example.com",
+                                   "Sources": { "test-source": {} } }]
+            }
+        });
+        std::fs::write("config.json", serde_json::to_vec(&config).unwrap()).unwrap();
+        // Checks only on `reload_now`, so a test controls when a change lands.
+        let registry = LiveRegistry::load(PathBuf::from("config.json"), Duration::from_secs(3600)).unwrap();
+
+        let (mailer, sent) = crate::test_support::RecordingMailer::new();
+        let mailer = std::sync::Mutex::new(Some(mailer));
+        let state = AppState {
+            registry,
+            mailer: Arc::new(move |_| {
+                let m = mailer.lock().unwrap().take().expect("one job per test");
+                Box::new(m) as Box<dyn crate::mail::Mailer>
+            }),
+            ..AppState::for_test()
+        };
+        (Arc::new(state), sent)
+    }
+
+    async fn wait_for_the_job(state: &AppState) -> crate::web::send_jobs::Job {
+        for _ in 0..500 {
+            if state.sends.latest().map_or(false, |j| j.finished) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job = state.sends.latest().unwrap();
+        assert!(job.finished, "the job did not finish in time");
+        job
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_send_builds_the_download_bytes_and_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::CwdGuard::change_to(dir.path());
+        let (state, sent) = file_backed_send_state();
+        let v = volume_id(&state);
+
+        let req = send_post(&state, &format!("v={}&d=0&colour-0=stripped", v), None);
+        let res = router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+
+        let job = wait_for_the_job(&state).await;
+        assert_eq!(job.emails.len(), 1);
+        assert_eq!(job.emails[0].state, crate::web::send_jobs::EmailState::Sent, "{:?}", job.emails[0].state);
+        let source = state.registry.snapshot().get("test-source").unwrap().config.clone();
+        let expected = crate::web::download::build_volume(&source, v, true).unwrap().filename;
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{:?}", *sent);
+        assert_eq!(sent[0].to, "reader@example.com");
+        assert_eq!(sent[0].filename, expected);
+    }
+
+    /// A bad edit leaves the last good destinations in use, but nothing may
+    /// be sent to them until the file loads again, and the form says so
+    /// before the reader fills it in.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_send_is_refused_while_the_config_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::CwdGuard::change_to(dir.path());
+        let (state, sent) = file_backed_send_state();
+        let v = volume_id(&state);
+        let not_loaded = crate::web::send_plan::Refusal::ConfigNotLoaded.message();
+
+        std::fs::write("config.json", r#"{"Sources": ["#).unwrap();
+        assert!(state.registry.reload_now().is_some());
+
+        let uri = format!("/source/test-source/send?v={}", v);
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &uri, String::new())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_text(res).await.contains(&not_loaded), "the form warns first");
+
+        // The fingerprint `send_post` uses is the last good list's, so only
+        // the load error stands in the way.
+        let req = send_post(&state, &format!("v={}&d=0", v), None);
+        let res = router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(res).await.contains(&not_loaded));
+        assert!(state.sends.latest().is_none());
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

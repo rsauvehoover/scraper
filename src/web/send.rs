@@ -42,11 +42,14 @@ pub async fn send_submit(
         return (StatusCode::FORBIDDEN, "Missing or invalid CSRF token").into_response();
     }
 
-    let (registry, mail) = state.registry.snapshot_and_mail();
+    // One read, so a reload cannot clear the error between reading it and
+    // reading the destinations this send would use.
+    let snapshot = state.registry.snapshot_and_mail();
+    let (registry, mail) = (snapshot.registry, snapshot.mail);
     let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
-    if state.registry.load_error().is_some() {
+    if snapshot.load_error.is_some() {
         return render(&state, &headers, &source_id, &pairs, Some(Refusal::ConfigNotLoaded));
     }
     let stat = match state.stats.get(entry) {
@@ -161,7 +164,8 @@ fn render(
     pairs: &[(String, String)],
     refusal: Option<Refusal>,
 ) -> Response {
-    let (registry, mail) = state.registry.snapshot_and_mail();
+    let snapshot = state.registry.snapshot_and_mail();
+    let (registry, mail) = (snapshot.registry, snapshot.mail);
     let Some(entry) = registry.get(source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
@@ -188,8 +192,13 @@ fn render(
         &format!("Send from {}", stat.name),
         html! {
             p class="summary" { a href={ "/source/" (source_id) } { "Back to the contents" } }
-            @if let Some(r) = refusal { p class="error" { (r.message()) } }
-            @else if busy { p class="error" { (Refusal::Busy.message()) } }
+            @if let Some(r) = refusal {
+                p class="error" { (r.message()) }
+            } @else {
+                // Said before the reader fills in the form, not only after.
+                @if snapshot.load_error.is_some() { p class="error" { (Refusal::ConfigNotLoaded.message()) } }
+                @if busy { p class="error" { (Refusal::Busy.message()) } }
+            }
             (form_body(source_id, &resolved, &mail, &chosen, &csrf, pairs))
             script { (PreEscaped(SEND_SCRIPT)) }
         },
