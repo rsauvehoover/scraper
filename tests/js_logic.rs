@@ -1,6 +1,6 @@
 //! Runs the JavaScript logic tests in `tests/js/` under node, so `cargo test`
-//! covers the code that decides what the config panel does to the document
-//! and which table-of-contents volumes open.
+//! covers the code that decides what the config panel does to the document,
+//! which table-of-contents volumes open, and what the send controls say.
 //!
 //! Skipped, with a note, where node is not installed: nothing else in the
 //! suite needs it. That makes this the same kind of gate as the tests that
@@ -29,7 +29,7 @@ fn javascript_logic_passes_under_node() {
         .filter(|p| p.to_string_lossy().ends_with(".test.js"))
         .collect();
     files.sort();
-    assert!(files.len() >= 2, "expected the panel and folding tests, found {:?}", files);
+    assert!(files.len() >= 3, "expected the panel, folding and send tests, found {:?}", files);
 
     let out = Command::new("node")
         .arg("--test")

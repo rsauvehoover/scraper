@@ -56,6 +56,7 @@ pub async fn source_toc(
             // with the volume folded. The newest volume starts open; the script
             // then applies whatever this reader left open last time, stored
             // under this series' id.
+            form id="send-pick" method="get" action={ "/source/" (source_id) "/send" } {
             div id="volumes" data-storage-key={ "toc-open:" (source_id) } {
             @for (i, volume) in stat.volumes.iter().enumerate() {
                 // Volumes are listed by id, so the last is the newest, the same
@@ -63,16 +64,21 @@ pub async fn source_toc(
                 @let newest = i + 1 == stat.volumes.len();
                 details class="volume" data-volume=(volume.id) open[newest] {
                     summary {
+                    // `volume.chapters` includes pending chapters so the
+                    // listing below stays complete, but `stat.total_chapters`
+                    // in the header counts downloaded chapters only. Using
+                    // the raw length here made one page report two different
+                    // chapter counts for the same data; pending chapters get
+                    // their own figure instead. Same expression as `views.rs`.
+                    @let downloaded_chapters =
+                        volume.chapters.len() - volume.pending_chapters;
+                    // A volume with nothing downloaded has nothing to send.
+                    @if downloaded_chapters > 0 {
+                        input type="checkbox" class="pick" name="v" value=(volume.id)
+                              aria-label={ "Select " (volume.name) };
+                    }
                     h2 { (volume.name) }
                     p class="summary" {
-                        // `volume.chapters` includes pending chapters so the
-                        // listing below stays complete, but `stat.total_chapters`
-                        // in the header counts downloaded chapters only. Using
-                        // the raw length here made one page report two different
-                        // chapter counts for the same data; pending chapters get
-                        // their own figure instead. Same expression as `views.rs`.
-                        @let downloaded_chapters =
-                            volume.chapters.len() - volume.pending_chapters;
                         (downloaded_chapters) " chapters, "
                         (format_thousands(volume.words)) " words"
                         @if volume.pending_chapters > 0 {
@@ -89,6 +95,10 @@ pub async fn source_toc(
                     ol class="chapters" {
                         @for chapter in &volume.chapters {
                             li {
+                                @if chapter.downloaded {
+                                    input type="checkbox" class="pick" name="c" value=(chapter.id)
+                                          aria-label={ "Select " (chapter.name) };
+                                }
                                 a href={ "/source/" (source_id) "/chapter/" (chapter.id) } {
                                     (chapter.name)
                                 }
@@ -119,7 +129,17 @@ pub async fn source_toc(
                 }
             }
             }
+            // The selection is the query string of this form, so sending
+            // needs no script. With script, send_select.js hides the bar
+            // until something is ticked and says what.
+            div class="send-bar" id="send-bar" {
+                span class="count" id="send-count" { "Tick volumes or chapters to send them." }
+                button type="button" id="send-clear" class="toggle-all" hidden { "Clear" }
+                button type="submit" id="send-open" { "Send selected" }
+            }
+            }
             script { (PreEscaped(TOC_SCRIPT)) }
+            script { (PreEscaped(crate::web::send::SEND_SCRIPT)) }
         },
     )
     .into_response()
@@ -437,6 +457,16 @@ mod tests {
             assert!(!super::TOC_SCRIPT.contains(forbidden), "the folding script must not use {}", forbidden);
         }
         assert!(!super::TOC_SCRIPT.contains("</script"), "that would end the inline script early");
+    }
+
+    /// The send script is inlined on this page too, so it gets the same check.
+    #[test]
+    fn the_send_script_only_touches_the_page() {
+        let script = crate::web::send::SEND_SCRIPT;
+        for forbidden in ["fetch", "XMLHttpRequest", "innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "document.write"] {
+            assert!(!script.contains(forbidden), "the send script must not use {}", forbidden);
+        }
+        assert!(!script.contains("</script"), "that would end the inline script early");
     }
 
     async fn body_of(response: axum::response::Response) -> String {

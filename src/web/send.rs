@@ -18,7 +18,7 @@ use crate::web::send_jobs::{build_item, run_job, EmailState};
 use crate::web::send_plan::{self, fingerprint, form_pairs, Refusal, Resolved, Selection, MAX_EMAILS};
 use crate::web::views::{page, page_with_refresh};
 
-const SEND_SCRIPT: &str = include_str!("send_select.js");
+pub(crate) const SEND_SCRIPT: &str = include_str!("send_select.js");
 
 pub async fn send_form(
     State(state): State<Arc<AppState>>,

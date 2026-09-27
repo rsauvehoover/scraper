@@ -569,13 +569,37 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Task 7"]
     async fn the_contents_page_is_a_selection_form() {
         let (state, _) = send_state();
         let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", "/source/test-source", String::new())).await.unwrap();
         let text = body_text(res).await;
         assert!(text.contains(r#"action="/source/test-source/send""#), "{}", text);
         assert!(text.contains(r#"name="v""#) && text.contains(r#"name="c""#), "{}", text);
+    }
+
+    /// Only what can be sent gets a checkbox: a pending chapter has no
+    /// content to build an EPUB from.
+    #[tokio::test]
+    async fn pending_items_get_no_checkbox() {
+        // The `toc_distinguishes_pending_chapters_from_downloaded_ones`
+        // fixture shape: one downloaded chapter, one pending, one volume.
+        let state = test_state();
+        let (downloaded, pending) = {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Downloaded Chapter", "https://example.com/c1", vol).unwrap();
+            db.add_chapter("Pending Chapter", "https://example.com/c2", vol).unwrap();
+            let cs = db.get_chapters_by_volume(vol).unwrap();
+            let id = |name: &str| cs.iter().find(|c| c.name == name).unwrap().id;
+            let (downloaded, pending) = (id("Downloaded Chapter"), id("Pending Chapter"));
+            db.add_chapter_data(downloaded, "<p>one</p>").unwrap();
+            (downloaded, pending)
+        };
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", "/source/test-source", String::new())).await.unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains(&format!(r#"name="c" value="{}""#, downloaded)), "{}", text);
+        assert!(!text.contains(&format!(r#"name="c" value="{}""#, pending)), "{}", text);
     }
 
     #[tokio::test]

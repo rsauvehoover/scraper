@@ -76,8 +76,8 @@ td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
 ol.chapters { list-style:none; padding:0; margin:0; }
 ol.chapters li { display:flex; gap:0.75rem; align-items:baseline;
                  padding:0.3rem 0; border-bottom:1px solid var(--line); font-size:0.92rem; }
-ol.chapters li a:first-child { flex:1; color:var(--fg); text-decoration:none; }
-ol.chapters li a:first-child:hover { text-decoration:underline; }
+ol.chapters li a:first-of-type { flex:1; color:var(--fg); text-decoration:none; }
+ol.chapters li a:first-of-type:hover { text-decoration:underline; }
 ol.chapters .words, ol.chapters .date { color:var(--muted); font-size:0.82rem;
                                         font-variant-numeric:tabular-nums; }
 ol.chapters .dl { color:var(--accent); font-size:0.82rem; text-decoration:none; }
@@ -92,13 +92,13 @@ button.toggle-all:hover { border-color:var(--accent); }
 details.volume { border-bottom:1px solid var(--line); }
 details.volume:first-of-type { border-top:1px solid var(--line); }
 details.volume > summary { list-style:none; cursor:pointer; padding:0.7rem 0 0.6rem;
-                           display:grid; grid-template-columns:1.1rem 1fr; column-gap:0.35rem; }
+                           display:grid; grid-template-columns:1.1rem 1rem 1fr; column-gap:0.35rem; }
 details.volume > summary::-webkit-details-marker { display:none; }
 details.volume > summary::before { content:"\25B8"; color:var(--muted); font-size:0.85rem;
                                    line-height:1.9; transition:transform 120ms ease; }
 details.volume[open] > summary::before { transform:rotate(90deg); }
-details.volume > summary h2 { font-size:1.15rem; margin:0; grid-column:2; }
-details.volume > summary .summary { grid-column:2; margin:0; }
+details.volume > summary h2 { font-size:1.15rem; margin:0; grid-column:3; }
+details.volume > summary .summary { grid-column:3; margin:0; }
 details.volume > summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px;
                                          border-radius:3px; }
 details.volume > ol.chapters { margin:0 0 1rem 1.45rem; }
@@ -109,6 +109,23 @@ details.volume > ol.chapters li:last-child { border-bottom:0; }
 @media (max-width: 640px) {
   details.volume > ol.chapters { margin-left:0; }
 }
+/* `[type]` so this outranks the general checkbox rule further down. */
+input.pick[type="checkbox"] { margin:0 0.35rem 0 0; width:1rem; height:1rem;
+                              accent-color:var(--accent); align-self:center;
+                              cursor:pointer; flex:none; }
+/* The checkbox column is kept for a volume with nothing to send, and a
+   pending chapter's title is indented by the checkbox, its margin and the
+   row's gap, so headings and titles line up with or without one. */
+details.volume > summary input.pick { grid-column:2; grid-row:1; margin:0; }
+ol.chapters li > a:first-child { margin-left:2.1rem; }
+.send-bar { position:sticky; bottom:0; margin-top:1rem; padding:0.7rem 0;
+            padding-bottom:calc(0.7rem + env(safe-area-inset-bottom, 0px));
+            background:var(--bg); border-top:1px solid var(--line);
+            display:flex; flex-wrap:wrap; gap:0.5rem 1rem; align-items:center; }
+.send-bar .count { flex:1 1 auto; }
+/* `display:flex` above would otherwise override the `hidden` attribute. */
+.send-bar[hidden] { display:none; }
+.send-bar button { margin:0; }
 iframe.reader { width:100%; height:78vh; border:1px solid var(--line);
                 background:var(--surface); border-radius:3px; }
 form.login { max-width:20rem; margin:5rem auto; display:flex; flex-direction:column; gap:0.5rem; }
@@ -823,10 +840,17 @@ mod tests {
         // The one deliberate exception: chapter titles read as text, not
         // links, and must keep using --fg rather than the new base rule.
         assert!(
-            BASE.contains("ol.chapters li a:first-child { flex:1; color:var(--fg);"),
+            BASE.contains("ol.chapters li a:first-of-type { flex:1; color:var(--fg);"),
             "chapter titles must keep their deliberate --fg colour: {}",
             BASE
         );
+    }
+
+    /// An author `display` rule beats the browser's `[hidden]` rule, so the
+    /// send bar needs its own or send_select.js cannot hide it.
+    #[test]
+    fn the_send_bar_can_be_hidden() {
+        assert!(BASE.contains(".send-bar[hidden] { display:none; }"), "{}", BASE);
     }
 
     /// Without `color-scheme` the browser renders native widgets (form
