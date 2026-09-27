@@ -117,7 +117,9 @@ pub async fn volume_epub(
     AxumPath((source_id, volume_id)): AxumPath<(String, i64)>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let Some(entry) = state.registry.get(&source_id) else {
+    // One snapshot for the whole request; see `LiveRegistry::snapshot`.
+    let registry = state.registry.snapshot();
+    let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
@@ -210,7 +212,9 @@ pub async fn chapter_epub(
     AxumPath((source_id, chapter_id)): AxumPath<(String, i64)>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let Some(entry) = state.registry.get(&source_id) else {
+    // One snapshot for the whole request; see `LiveRegistry::snapshot`.
+    let registry = state.registry.snapshot();
+    let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();

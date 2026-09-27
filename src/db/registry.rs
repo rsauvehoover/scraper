@@ -244,6 +244,25 @@ impl SourceRegistry {
     pub fn skipped(&self) -> &[SkippedSource] {
         &self.skipped
     }
+
+    /// Whether any source skipped as not yet scraped would now be admitted.
+    ///
+    /// Probes quietly: this runs on every reload check, and a source still
+    /// waiting for its first scrape is not worth a log line each time.
+    /// Sources skipped as broken are not probed; they are retried when the
+    /// configuration changes or the service restarts, since a fault that
+    /// was logged once does not need re-logging every few seconds.
+    pub fn a_skipped_source_is_now_ready(&self) -> bool {
+        self.skipped
+            .iter()
+            .filter(|s| s.reason == SkipReason::NotYetScraped)
+            .any(|s| {
+                matches!(
+                    SourceDatabase::open_query_only(&s.id).map(|db| db.has_scraper_schema()),
+                    Ok(Ok(true))
+                )
+            })
+    }
 }
 
 #[cfg(test)]

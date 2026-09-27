@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
-use crate::db::{SkipReason, SkippedSource};
+use crate::db::{SkipReason, SkippedSource, SourceRegistry};
 use crate::stats::cache::SourceStat;
 use crate::web::app::AppState;
 use crate::web::toc::format_thousands;
@@ -238,11 +238,15 @@ pub fn page(title: &str, body: Markup) -> Markup {
 /// broken, and it must not quietly present a total that is missing a source
 /// either. The cause goes to the log; the page names the sources it could not
 /// read so the omission is visible from the browser.
-fn collect_stats(state: &AppState, page_name: &str) -> (Vec<Arc<SourceStat>>, Vec<String>) {
+fn collect_stats(
+    state: &AppState,
+    registry: &SourceRegistry,
+    page_name: &str,
+) -> (Vec<Arc<SourceStat>>, Vec<String>) {
     let mut stats = Vec::new();
     let mut unreadable = Vec::new();
 
-    for entry in state.registry.entries() {
+    for entry in registry.entries() {
         match state.stats.get(entry) {
             Ok(stat) => stats.push(stat),
             Err(e) => {
@@ -270,6 +274,29 @@ fn unreadable_note(unreadable: &[String]) -> Markup {
                 "Could not read statistics for: " (unreadable.join(", "))
                 ". The totals below exclude them; see the server log for the cause."
             }
+        }
+    }
+}
+
+/// Says so when the configuration file on disk is not the one in use, and
+/// what that means for the next scrape, which reads the file as it is.
+///
+/// The error carries a position and a kind of fault, never text from the
+/// file: see `ConfigLoadError`.
+pub(crate) fn config_load_note(state: &AppState) -> Markup {
+    use crate::config::ConfigLoadError;
+    let Some(error) = state.registry.load_error() else {
+        return html! {};
+    };
+    let consequence = match error {
+        ConfigLoadError::Missing => "The next scrape will find no sources until it is restored.",
+        _ => "The next scrape will fail until it is fixed.",
+    };
+    html! {
+        p class="error" {
+            "The configuration file could not be loaded (" (error.to_string()) "). "
+            "This site is still using the last configuration that loaded. "
+            (consequence)
         }
     }
 }
@@ -313,7 +340,10 @@ fn skipped_note(skipped: &[SkippedSource]) -> Markup {
 }
 
 pub async fn index(State(state): State<Arc<AppState>>) -> Response {
-    let (stats, unreadable) = collect_stats(&state, "the source overview");
+    // One snapshot for the whole page, so the notes and the table can never
+    // come from two different registries.
+    let registry = state.registry.snapshot();
+    let (stats, unreadable) = collect_stats(&state, &registry, "the source overview");
 
     let total_words: usize = stats.iter().map(|s| s.total_words).sum();
     let total_chapters: usize = stats.iter().map(|s| s.total_chapters).sum();
@@ -322,7 +352,8 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
     page(
         "Sources",
         html! {
-            (skipped_note(state.registry.skipped()))
+            (config_load_note(&state))
+            (skipped_note(registry.skipped()))
             (unreadable_note(&unreadable))
             p class="summary" {
                 (stats.len()) " sources · " (format_thousands(total_chapters)) " chapters · "
@@ -375,12 +406,13 @@ pub async fn index(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
-    let (stats, unreadable) = collect_stats(&state, "the statistics page");
+    let registry = state.registry.snapshot();
+    let (stats, unreadable) = collect_stats(&state, &registry, "the statistics page");
 
     page(
         "Statistics",
         html! {
-            (skipped_note(state.registry.skipped()))
+            (skipped_note(registry.skipped()))
             (unreadable_note(&unreadable))
             p class="summary" {
                 "Word counts exclude the contents of style and script elements. "
@@ -806,7 +838,7 @@ mod tests {
         ];
 
         std::sync::Arc::new(AppState {
-            registry: SourceRegistry::from_config(&config),
+            registry: crate::web::reload::LiveRegistry::fixed(SourceRegistry::from_config(&config)),
             stats: StatsCache::new(),
             sessions: SessionStore::new(std::time::Duration::from_secs(3600)),
             limiter: RateLimiter::new(10, std::time::Duration::from_secs(900)),

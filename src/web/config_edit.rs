@@ -47,16 +47,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 "current one."
                 @if !password_set { " No password is currently set." }
             }
-            // The registry and the statistics cache are built once, at
-            // startup. A save that adds, removes or renames a source is
-            // written to disk immediately and picked up by the next scraper
-            // run, but this UI keeps showing the old set until the service is
-            // restarted. Saying so here and in the save confirmation, because
-            // "Saved" on its own reads as "in effect".
-            p class="note" {
-                "Changes are written immediately, but this server reads the source list once "
-                "at startup. Restart the web service for source changes to appear here."
-            }
+            (crate::web::views::config_load_note(&state))
             // The forms below splice into the textarea, client-side, and
             // change nothing about how a save is performed: no new endpoint,
             // no change to PUT /config, so the CSRF check, `prepare_for_write`
@@ -546,15 +537,19 @@ pub async fn put_config(
         changed_keys(&current, &prepared).join(", ")
     );
 
-    (
-        StatusCode::OK,
-        // The save script shows this text verbatim. The restart caveat
-        // belongs in the confirmation, not only on the page above it: an
-        // operator who adds a source and sees a bare "Saved" reasonably
-        // concludes the service is already using it.
-        "Saved. Restart the web service for source changes to take effect here.",
-    )
-        .into_response()
+    // Reload before answering, so the page the operator goes to next already
+    // uses what they saved. `prepare_for_write` validated the document, so a
+    // failure here means the two checks disagree; the write has happened
+    // regardless, so it is reported rather than refused. The save script
+    // shows this text verbatim.
+    let message = match state.registry.reload_now() {
+        None => "Saved.".to_string(),
+        Some(e) => format!(
+            "Saved, but the service could not load it ({}). It is still using the previous configuration.",
+            e
+        ),
+    };
+    (StatusCode::OK, message).into_response()
 }
 
 #[cfg(test)]
@@ -594,6 +589,24 @@ mod tests {
     fn state_with_session(path: PathBuf) -> (Arc<AppState>, HeaderMap) {
         let mut state = AppState::for_test();
         state.config_path = path;
+        session_for(state)
+    }
+
+    /// As `state_with_session`, but with a registry that really reloads from
+    /// `path`. The timed check is set to an hour, so anything a test sees
+    /// change came from the save itself, not the timer.
+    fn live_state_with_session(path: PathBuf) -> (Arc<AppState>, HeaderMap) {
+        let mut state = AppState::for_test();
+        state.config_path = path.clone();
+        state.registry = crate::web::reload::LiveRegistry::load(
+            path,
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        session_for(state)
+    }
+
+    fn session_for(state: AppState) -> (Arc<AppState>, HeaderMap) {
         let state = Arc::new(state);
 
         let token = state.sessions.create();
@@ -793,6 +806,75 @@ mod tests {
             json!("royal-road-1"),
             "and the spliced source must actually be written"
         );
+    }
+
+    /// The restart this used to need is gone: a save rebuilds the source list
+    /// before it answers.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_saved_source_is_live_without_a_restart() {
+        use crate::test_support::CwdGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        crate::db::SourceDatabase::open("test-source").unwrap();
+        crate::db::SourceDatabase::open("second-source").unwrap();
+        let path = write_config(dir.path(), &serde_json::to_string_pretty(&sample_config()).unwrap());
+        let (state, headers) = live_state_with_session(path.clone());
+        assert!(state.registry.snapshot().get("second-source").is_none());
+
+        let mut candidate = read_redacted(&path).unwrap();
+        candidate["Sources"].as_array_mut().unwrap().push(json!({
+            "Id": "second-source",
+            "Name": "Second Serial",
+            "Enabled": true,
+            "TocUrl": "https://example.com/second/",
+            "Auth": {"Type": "None"},
+            "Metadata": {"Author": "A. Writer", "Description": "Test"},
+            "PostProcessors": []
+        }));
+        let response = put_config(State(Arc::clone(&state)), headers, Json(candidate)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert!(!body.contains("Restart"), "the confirmation still asks for a restart: {}", body);
+
+        assert!(
+            state.registry.snapshot().get("second-source").is_some(),
+            "a saved source must be live as soon as the save answers"
+        );
+    }
+
+    /// A password written as a number fails typed parsing, and serde's own
+    /// message for that quotes the value. The note shown for a config that
+    /// will not load must not.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_load_error_note_never_quotes_the_file() {
+        use crate::test_support::CwdGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let path = write_config(dir.path(), &serde_json::to_string_pretty(&sample_config()).unwrap());
+        let (state, headers) = live_state_with_session(path.clone());
+
+        let mut broken = sample_config();
+        broken["Mail"]["Password"] = json!(918273645);
+        std::fs::write(&path, serde_json::to_string_pretty(&broken).unwrap()).unwrap();
+        assert!(state.registry.reload_now().is_some(), "precondition: the edit must not load");
+
+        let config_page = body_of(get_config(State(Arc::clone(&state)), headers).await).await;
+        let index_page =
+            body_of(crate::web::views::index(State(Arc::clone(&state))).await).await;
+
+        for (name, page) in [("/config", &config_page), ("/", &index_page)] {
+            assert!(
+                page.contains("could not be loaded"),
+                "{} must say the file on disk is not in use: {}",
+                name,
+                page
+            );
+            assert!(!page.contains("918273645"), "{} quoted the password: {}", name, page);
+        }
     }
 
     /// The documented normal path — operator leaves the write-only password

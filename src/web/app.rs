@@ -13,8 +13,7 @@ use axum::Router;
 use maud::html;
 use tokio::sync::Semaphore;
 
-use crate::config::load_config_from;
-use crate::db::SourceRegistry;
+use crate::web::reload::LiveRegistry;
 use crate::stats::cache::StatsCache;
 use crate::web::auth::{
     hash_password, load_credential, store_credential, verify_password, RateLimiter, SessionStore,
@@ -110,7 +109,7 @@ pub enum ClientIpSource {
 }
 
 pub struct AppState {
-    pub registry: SourceRegistry,
+    pub registry: LiveRegistry,
     pub stats: StatsCache,
     pub sessions: SessionStore,
     pub limiter: RateLimiter,
@@ -137,7 +136,7 @@ impl AppState {
         }];
 
         AppState {
-            registry: SourceRegistry::from_config_for_test(&config),
+            registry: LiveRegistry::fixed(crate::db::SourceRegistry::from_config_for_test(&config)),
             stats: StatsCache::new(),
             sessions: SessionStore::new(Duration::from_secs(3600)),
             limiter: RateLimiter::new(10, Duration::from_secs(900)),
@@ -326,8 +325,9 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let credential = load_credential(&args.auth_file)?;
-    let config = load_config_from(&args.config_file);
-    let registry = SourceRegistry::from_config(&config);
+    // Re-checked at most this often, on a request. The config editor does
+    // not wait for it: a save reloads immediately.
+    let registry = LiveRegistry::load(args.config_file.clone(), Duration::from_secs(2))?;
 
     let state = Arc::new(AppState {
         registry,
@@ -348,7 +348,8 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
     // runs before `TcpListener::bind`, so a panic here leaves no HTTP surface
     // at all — the operator would see a process that exits on start, with the
     // only clue in the log, for a fault that affects exactly one source.
-    for entry in state.registry.entries() {
+    let registry = state.registry.snapshot();
+    for entry in registry.entries() {
         match state.stats.get(entry) {
             Ok(stat) => println!(
                 "{}: {} chapters, {} words",
@@ -365,10 +366,10 @@ pub async fn serve(args: WebArgs) -> Result<(), Box<dyn std::error::Error>> {
     // in detail by `SourceRegistry::from_config` — so this is a one-line
     // summary an operator scanning startup output can see at a glance,
     // rather than having to notice their absence from the loop above.
-    if !state.registry.skipped().is_empty() {
+    if !registry.skipped().is_empty() {
         println!(
             "{} configured source(s) not registered at startup; see warnings above",
-            state.registry.skipped().len()
+            registry.skipped().len()
         );
     }
 
@@ -826,7 +827,8 @@ mod tests {
         // exercises the real path. Without seeding, /raw can only 404 and the
         // header assertions below would never run.
         {
-            let entry = state.registry.get("test-source").expect("fixture source");
+            let registry = state.registry.snapshot();
+            let entry = registry.get("test-source").expect("fixture source");
             let db = entry.db();
             let vol = db.add_volume("Volume 1").unwrap();
             db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
@@ -839,7 +841,8 @@ mod tests {
         }
 
         let chapter_id = {
-            let entry = state.registry.get("test-source").unwrap();
+            let registry = state.registry.snapshot();
+            let entry = registry.get("test-source").unwrap();
             let db = entry.db();
             let v = db.get_latest_volume().unwrap().unwrap();
             db.get_chapters_by_volume(v.id).unwrap()[0].id
@@ -893,7 +896,8 @@ mod tests {
         let state = test_state();
 
         let (downloaded_id, pending_id) = {
-            let entry = state.registry.get("test-source").expect("fixture source");
+            let registry = state.registry.snapshot();
+            let entry = registry.get("test-source").expect("fixture source");
             let db = entry.db();
             let vol = db.add_volume("Volume 1").unwrap();
             db.add_chapter("Downloaded Chapter", "https://example.com/c1", vol)

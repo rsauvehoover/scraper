@@ -98,10 +98,12 @@ cannot write to the directory cannot open the database at all.
 
 It never creates a database, though, so a source that is configured but has
 never been scraped has no `db/{source-id}.db` for it to read. Such a source is
-skipped at startup with a warning on stderr and does not appear in the UI;
-run the scraper for it once and restart. The same applies to a database that
-exists but has no tables. One unreadable source never stops the server from
-starting.
+named on the Sources page as configured but not yet scraped, and appears
+properly once its first scrape has created the database, with no restart. The
+same applies to a database that exists but has no tables yet. A database that
+exists but cannot be opened is named as unreadable, and is retried when the
+configuration changes or the service restarts. One unreadable source never
+stops the server from starting.
 
 The admin password is read once at process startup and held in memory for
 the life of the process. Rotating it with `--set-password` writes the new
@@ -109,12 +111,12 @@ credential to `--auth-file` immediately, but the running server keeps using
 the old one until it is restarted. If the old password still works after a
 rotation, that means "restart pending", not "rotation failed".
 
-The configuration editor writes `config.json` immediately, and the next
-scraper run reads the new file, but this server reads the source list once at
-startup. Adding, removing or renaming a source therefore does not change what
-the UI shows until the web service is restarted — the save confirmation says
-so. Mail and EPUB settings have no such caveat: only the scraper reads those,
-and it reads them per run.
+The server follows `config.json` without a restart. A save in the
+configuration editor applies before the confirmation comes back, and an edit
+made by hand is picked up on the next page load, checked at most every two
+seconds. A file that fails to load is not applied: the site keeps the last
+configuration that loaded and says so on the Sources and Configuration pages,
+because the next scrape reads the file as it is and will fail on it.
 
 The server and the scraper are one binary, so a binary upgrade replaces the
 file on disk without restarting whatever process is already running it.

@@ -22,7 +22,9 @@ pub async fn source_toc(
     State(state): State<Arc<AppState>>,
     AxumPath(source_id): AxumPath<String>,
 ) -> Response {
-    let Some(entry) = state.registry.get(&source_id) else {
+    // One snapshot for the whole request; see `LiveRegistry::snapshot`.
+    let registry = state.registry.snapshot();
+    let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     // This page is one source, so there is nothing to degrade to: a scan that
@@ -108,7 +110,9 @@ pub async fn chapter_page(
     State(state): State<Arc<AppState>>,
     AxumPath((source_id, chapter_id)): AxumPath<(String, i64)>,
 ) -> Response {
-    let Some(entry) = state.registry.get(&source_id) else {
+    // One snapshot for the whole request; see `LiveRegistry::snapshot`.
+    let registry = state.registry.snapshot();
+    let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
 
@@ -193,7 +197,9 @@ pub async fn chapter_raw(
     AxumPath((source_id, chapter_id)): AxumPath<(String, i64)>,
     Query(query): Query<ReaderQuery>,
 ) -> Response {
-    let Some(entry) = state.registry.get(&source_id) else {
+    // One snapshot for the whole request; see `LiveRegistry::snapshot`.
+    let registry = state.registry.snapshot();
+    let Some(entry) = registry.get(&source_id) else {
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
 
@@ -347,7 +353,8 @@ mod tests {
     /// pending chapter, and return the two chapter ids in that order.
     #[cfg(test)]
     fn seed_one_downloaded_one_pending(state: &crate::web::app::AppState) -> (i64, i64) {
-        let entry = state.registry.get("test-source").expect("fixture source");
+        let registry = state.registry.snapshot();
+        let entry = registry.get("test-source").expect("fixture source");
         let db = entry.db();
         let vol = db.add_volume("Volume 1").unwrap();
         db.add_chapter("Chapter 1", "https://example.com/c1", vol).unwrap();
