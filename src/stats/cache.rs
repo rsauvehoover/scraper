@@ -60,6 +60,24 @@ pub struct SourceStat {
     pub latest_published: Option<String>,
 }
 
+impl SourceStat {
+    /// A zeroed `SourceStat` for tests that only care about `volumes`, so a
+    /// fixture does not have to spell out every derived total by hand.
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        SourceStat {
+            source_id: String::new(),
+            name: String::new(),
+            volumes: Vec::new(),
+            total_words: 0,
+            total_chapters: 0,
+            pending_chapters: 0,
+            mean_chapter_words: 0,
+            latest_published: None,
+        }
+    }
+}
+
 /// Extract a `YYYY/MM/DD` path segment triple as `YYYY-MM-DD`.
 ///
 /// WordPress sources (The Wandering Inn) put the publication date in the URI.

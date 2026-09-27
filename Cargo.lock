@@ -3958,6 +3958,7 @@ dependencies = [
  "color-name",
  "croner",
  "epub-builder",
+ "form_urlencoded",
  "hex",
  "image",
  "imageproc",
