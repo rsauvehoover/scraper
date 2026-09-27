@@ -225,7 +225,15 @@ inconsistent database.
 Binaries will be found `target/release/bundle` and `target/wix` directories
 
 ### Linux/MacOS
+
+Building needs Rust 1.88 or newer (running the tests needs 1.93.1). Debian's
+packaged `rustc` is older than that, so install Rust with
+[rustup](https://rustup.rs) rather than apt. Packaging is last verified with
+`cargo-bundle` 0.12.0. 0.11 ignores the `[package.metadata.bundle.linux]`
+table, so it also builds, but without `Terminal=true` in the desktop entry:
+
 ```bash
+cargo install cargo-bundle --version 0.12.0 --locked
 cargo bundle --release --format deb
 ```
 

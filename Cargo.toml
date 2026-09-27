@@ -2,6 +2,11 @@
 name = "wandering_inn_scraper"
 version = "2.4.0"
 edition = "2018"
+# The newest minimum among the build dependencies (`time`, `cookie_store`).
+# Declared so an older toolchain stops with that, not with a resolution
+# failure deep in the dependency tree. Running the tests needs 1.93.1, for
+# the `serial_test` dev-dependency.
+rust-version = "1.88"
 description = "A scraper for the web serial The Wandering Inn"
 authors = ["Frederic Sauve-Hoover"]
 license = "MIT"
@@ -35,7 +40,12 @@ path = "src/lib.rs"
 name = "scraper"
 identifier = "rsauvehoover/wandering-inn-scraper"
 resources = ["src/assets", "src/font"]
-linux_use_terminal = true
+
+# cargo-bundle 0.12 reads this from its own table and rejects the old
+# top-level `linux_use_terminal` key outright. Older versions ignore this
+# table, which costs only `Terminal=true` in the desktop entry.
+[package.metadata.bundle.linux]
+use_terminal = true
 
 [profile.release]
 opt-level = 2
