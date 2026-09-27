@@ -134,6 +134,33 @@ file on disk without restarting whatever process is already running it.
 After upgrading, restart the web service explicitly and check the version in
 the page footer rather than trusting the installed package version.
 
+### Sending by hand
+
+Tick volumes or chapters on a series' contents page and press Send selected.
+A chapter that has not been downloaded yet, and a volume with nothing
+downloaded, have no checkbox, since there is nothing to send. The form lists
+what will be sent and every configured destination; tick the destinations
+and choose Colour or Stripped for each (it starts from the destination's
+StripColour setting). One EPUB is sent per email, the same file the
+download link gives you. A ticked chapter inside a ticked volume is left
+out, since the volume contains it.
+
+- A destination that does not list the series is still offered, and marked.
+- At most 50 emails per send, and one send at a time.
+- Sending is refused while config.json fails to load, and if the destination
+  list changed after the form was opened.
+- A manual send's SMTP commands time out after 60 seconds; the scraper's
+  own automatic send keeps the library's default of an hour per command. A
+  command that times out, or whose final server reply is lost, is retried
+  once on a fresh connection, so a message can occasionally arrive twice.
+- A job that loses its connection or has its login refused fails every
+  email still queued with that one reason, rather than trying each in turn.
+- The status page lists each email as sent or failed with a short reason. It
+  is kept in memory; a restart clears it.
+- The mail server's replies and the password never appear on the page or in
+  the log. Each attempt is logged with the series, the item and the
+  destination's name.
+
 ### Running as a service
 
 The server reads the admin credential at startup and refuses to serve without
