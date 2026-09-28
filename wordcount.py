@@ -11,10 +11,15 @@ ROOT = Path(__file__).parent
 DB_DIR = ROOT / "db"
 CONFIG_PATH = ROOT / "config.json"
 TAG_RE = re.compile(r"<[^>]+>")
+# <style> and <script> element contents are markup, not prose. Royal Road
+# injects a honeypot style block into every chapter; counting its CSS text
+# inflated every Royal Road total. Kept in agreement with
+# src/stats/wordcount.rs by tests/wordcount_parity.rs.
+DROP_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def strip_html(html: str) -> str:
-    text = TAG_RE.sub(" ", html)
+    text = TAG_RE.sub(" ", DROP_RE.sub(" ", html))
     return re.sub(r"\s+", " ", text).strip()
 
 

@@ -2,17 +2,12 @@ use std::path::Path;
 
 use clap::Parser;
 
-mod config;
-mod db;
-mod epub;
-mod error;
-mod mail;
-mod postprocess;
-mod sources;
-
-use db::{migration, SourceDatabase};
-use postprocess::ProcessorRegistry;
-use sources::{ScraperClient, ScraperRegistry};
+use wandering_inn_scraper::config;
+use wandering_inn_scraper::db::{migration, SourceDatabase};
+use wandering_inn_scraper::epub;
+use wandering_inn_scraper::postprocess::ProcessorRegistry;
+use wandering_inn_scraper::sources::{ScraperClient, ScraperRegistry};
+use wandering_inn_scraper::web::app::{serve, WebArgs};
 
 /// Multi-source web serial scraper
 #[derive(Parser, Debug)]
@@ -45,11 +40,29 @@ struct Args {
     /// Chapter title for --pull-chapter (default: parsed from the page)
     #[arg(long, requires = "pull_chapter", value_name = "NAME")]
     title: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Serve the web frontend
+    Web(WebArgs),
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    if let Some(Command::Web(web_args)) = args.command {
+        if let Err(e) = serve(web_args).await {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = config::load_config();
 
     // Migrate legacy database if needed

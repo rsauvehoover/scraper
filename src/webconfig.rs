@@ -1,0 +1,480 @@
+//! Reading and writing `config.json` for the web editor.
+//!
+//! Everything here operates on `serde_json::Value`, never on the typed structs
+//! in `crate::config`. Three reasons, all load-bearing:
+//!
+//! 1. Those structs have no `Serialize` derive.
+//! 2. `load_config()` mutates `epub_gen` from the mail destinations before
+//!    returning, so serialising its output would bake derived values into the file.
+//! 3. The live config contains `Sources[].Selectors.IgnoredVolumes`, which the
+//!    `Selectors` struct does not model. Serde drops unknown fields silently, so
+//!    a typed round-trip would delete it from disk.
+//!
+//! Validation still goes through the typed structs — we parse the candidate to
+//! prove the scraper could load it, then write the `Value`. Validation without
+//! normalisation.
+
+use std::io::{self, Write};
+use std::path::Path;
+
+use serde_json::Value;
+
+use crate::config::Config;
+
+/// Read `config.json` with the password removed.
+///
+/// The existing password is never sent to a client. The client learns only
+/// whether one is set, so the editor can render "leave blank to keep".
+pub fn read_redacted(path: &Path) -> io::Result<Value> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut value: Value =
+        serde_json::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if let Some(mail) = value.get_mut("Mail").and_then(|m| m.as_object_mut()) {
+        let was_set = mail
+            .remove("Password")
+            .and_then(|p| p.as_str().map(|s| !s.is_empty()))
+            .unwrap_or(false);
+        mail.insert("PasswordSet".to_string(), Value::Bool(was_set));
+    }
+
+    Ok(value)
+}
+
+/// Splice the stored password back into a candidate config.
+///
+/// A blank or absent `Mail.Password` means "leave unchanged". The editor's
+/// password field is write-only, so this is the normal path, not the exception.
+///
+/// A candidate with no `Mail` object at all is rejected when the current
+/// config has one. Both `Config` and `MailConfig` are `#[serde(default)]`, so
+/// such a body validates cleanly and would replace the live sender address,
+/// destinations and password with defaults — the whole mail section deleted
+/// by an omission, reported as a successful save.
+pub fn merge_password(candidate: &mut Value, current: &Value) -> Result<(), String> {
+    let Some(mail) = candidate.get_mut("Mail").and_then(|m| m.as_object_mut()) else {
+        if current.get("Mail").map(Value::is_object) == Some(true) {
+            return Err("configuration has no Mail object; \
+                        saving it would delete the current mail settings"
+                .to_string());
+        }
+        return Ok(());
+    };
+
+    // The client never receives the stored password, so it cannot echo it
+    // back; a non-empty value here is always a new one the operator typed.
+    let supplied_new_password = mail
+        .get("Password")
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| !p.is_empty());
+
+    // `read_redacted` puts this in; it is a rendering detail and must never
+    // reach disk.
+    mail.remove("PasswordSet");
+
+    if supplied_new_password {
+        return Ok(());
+    }
+
+    match current.get("Mail").and_then(|m| m.get("Password")) {
+        Some(existing) => {
+            mail.insert("Password".to_string(), existing.clone());
+        }
+        // Nothing stored to preserve. Leave the key out rather than writing
+        // an empty string, which `read_redacted` would then report as "no
+        // password set" anyway.
+        None => {
+            mail.remove("Password");
+        }
+    }
+
+    Ok(())
+}
+
+/// Prove the scraper could load this config.
+///
+/// Parses into the typed `Config`; the `Value` is what actually gets written.
+/// Private: see `prepare_for_write` for why this must not be called on its own.
+fn validate(candidate: &Value) -> Result<(), String> {
+    serde_json::from_value::<Config>(candidate.clone())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Merge the stored password into a candidate config and prove the scraper
+/// could load the result.
+///
+/// A single entry point on purpose. `validate` alone is not public, because the
+/// two steps are order-dependent in a way nothing else enforces: serde's
+/// deserialisation errors quote the offending field's value, so validating a
+/// candidate whose `Mail.Password` has not yet been reconciled would put a
+/// client-supplied secret into an error string. Merging first guarantees the
+/// field is a well-formed `String` before validation ever looks at it.
+pub fn prepare_for_write(mut candidate: Value, current: &Value) -> Result<Value, String> {
+    merge_password(&mut candidate, current)?;
+    validate(&candidate)?;
+    Ok(candidate)
+}
+
+/// Read the config that is about to be replaced.
+///
+/// Separate from `read_redacted` because the caller needs the real password,
+/// not the `PasswordSet` flag. The error is deliberately not swallowed: a
+/// caller that treats an unreadable or malformed `config.json` as an empty
+/// object hands `merge_password` nothing to preserve, and the write that
+/// follows replaces a live credential with an empty string over a
+/// now-syntactically-valid file.
+pub fn read_current(path: &Path) -> io::Result<Value> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Top-level keys whose contents differ. Names only — never values.
+///
+/// Feeds the audit log, which must never become a second copy of the password.
+pub fn changed_keys(before: &Value, after: &Value) -> Vec<String> {
+    let empty = serde_json::Map::new();
+    let b = before.as_object().unwrap_or(&empty);
+    let a = after.as_object().unwrap_or(&empty);
+
+    let mut keys: Vec<String> = a
+        .iter()
+        .filter(|(k, v)| b.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.extend(b.keys().filter(|k| !a.contains_key(*k)).cloned());
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Write `config.json` atomically, preserving its mode.
+///
+/// Temp file in the same directory, then rename. Rename is atomic, so the
+/// hourly scraper sees either the old file or the new one — never a torn read,
+/// and never an absent one. The absent case matters most: `load_config()`
+/// panics on a malformed file but silently falls back to defaults on a missing
+/// one, which would scrape with the wrong settings and mail the results.
+///
+/// The temp file name is derived from the target's own file name plus the
+/// process id, which is enough to avoid collisions between separate runs of
+/// this process but not between two concurrent writers racing each other, and
+/// a crash between creating the temp file and the rename leaves it behind
+/// uncollected. Both are accepted for this single-writer deployment rather
+/// than left unstated.
+pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
+    // `Path::parent()` returns `Some("")` for a bare relative filename like
+    // "config.json" (not `None`), so the empty case must be filtered
+    // explicitly — `unwrap_or_else` alone does not catch it.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // Preserve the previous file before replacing it.
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        std::fs::copy(path, &backup)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let existing_mode = current_mode(path);
+
+    let file_name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("config.json"));
+    let tmp = dir.join(format!(
+        "{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    {
+        let mut file = open_private(&tmp)?;
+        let body = serde_json::to_string_pretty(value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        file.write_all(body.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+
+    apply_mode(&tmp, existing_mode)?;
+    std::fs::rename(&tmp, path)?;
+
+    // Durability of the rename itself.
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+// This crate also ships a Windows MSI (`cargo wix`), so this arm is live
+// code, not dead code. Windows has no unix mode bits and an ACL story is out
+// of scope here, so permissions are left to OS defaults on non-unix targets.
+#[cfg(not(unix))]
+fn current_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn open_private(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+// Permissions are left to OS defaults on non-unix targets; see the note on
+// `current_mode` above.
+#[cfg(not(unix))]
+fn open_private(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+#[cfg(unix)]
+fn apply_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = mode.unwrap_or(0o600);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+// Permissions are left to OS defaults on non-unix targets; see the note on
+// `current_mode` above.
+#[cfg(not(unix))]
+fn apply_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Obviously-synthetic fixture. Never use a real credential here.
+    fn sample() -> serde_json::Value {
+        json!({
+            "Mail": {
+                "Name": "Epub Mail Sender",
+                "Address": "sender@example.com",
+                "Password": "abcdefghijklmnop",
+                "Destinations": [
+                    {"Name": "Test Reader", "Email": "reader@example.com", "Sources": {"test-source": {}}}
+                ]
+            },
+            "EpubGen": {"Volumes": true, "Chapters": true, "StripColour": false},
+            "Sources": [{
+                "Id": "test-source",
+                "Name": "Test Serial",
+                "Enabled": true,
+                "TocUrl": "https://example.com/toc/",
+                "Selectors": {
+                    "VolumeWrapper": "volume-wrapper",
+                    "SelectorType": "class",
+                    "IgnoredVolumes": ["Volume 0"]
+                },
+                "Auth": {"Type": "None"},
+                "Metadata": {"Author": "A. Writer", "Description": "Test"},
+                "PostProcessors": ["strip-links"]
+            }]
+        })
+    }
+
+    fn write_sample(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("config.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&sample()).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn read_redacted_never_exposes_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let redacted = read_redacted(&path).unwrap();
+        let serialised = serde_json::to_string(&redacted).unwrap();
+
+        assert!(redacted["Mail"].get("Password").is_none(), "password key must be absent");
+        assert!(
+            !serialised.contains("abcdefghijklmnop"),
+            "password value must not appear anywhere in the response"
+        );
+        assert_eq!(redacted["Mail"]["PasswordSet"], json!(true));
+    }
+
+    #[test]
+    fn blank_password_preserves_the_existing_one() {
+        let current = sample();
+        let mut candidate = sample();
+        candidate["Mail"]["Password"] = json!("");
+
+        merge_password(&mut candidate, &current).unwrap();
+
+        assert_eq!(candidate["Mail"]["Password"], json!("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn absent_password_preserves_the_existing_one() {
+        let current = sample();
+        let mut candidate = sample();
+        candidate["Mail"].as_object_mut().unwrap().remove("Password");
+
+        merge_password(&mut candidate, &current).unwrap();
+
+        assert_eq!(candidate["Mail"]["Password"], json!("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn a_candidate_without_mail_is_refused_when_one_is_stored() {
+        // Config and MailConfig are both #[serde(default)], so this body would
+        // otherwise validate and write a config with no mail section at all.
+        let current = sample();
+        let mut candidate = sample();
+        candidate.as_object_mut().unwrap().remove("Mail");
+
+        let err = merge_password(&mut candidate, &current)
+            .expect_err("dropping the stored mail settings must not be silent");
+        assert!(err.contains("Mail"), "the error must say what is missing: {}", err);
+    }
+
+    #[test]
+    fn a_candidate_without_mail_is_allowed_when_none_is_stored() {
+        // Nothing to lose: refusing here would block a legitimate save on a
+        // config that never had a mail section.
+        let mut current = sample();
+        current.as_object_mut().unwrap().remove("Mail");
+        let mut candidate = sample();
+        candidate.as_object_mut().unwrap().remove("Mail");
+
+        assert!(merge_password(&mut candidate, &current).is_ok());
+    }
+
+    #[test]
+    fn supplied_password_replaces_the_existing_one() {
+        let current = sample();
+        let mut candidate = sample();
+        candidate["Mail"]["Password"] = json!("qrstuvwxyz012345");
+
+        merge_password(&mut candidate, &current).unwrap();
+
+        assert_eq!(candidate["Mail"]["Password"], json!("qrstuvwxyz012345"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_file_mode_600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let mut updated = sample();
+        updated["EpubGen"]["StripColour"] = serde_json::json!(true);
+        write_atomic(&path, &updated).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode must survive the write, got {mode:o}");
+    }
+
+    #[test]
+    fn write_preserves_keys_the_typed_structs_do_not_model() {
+        // Sources[].Selectors.IgnoredVolumes is nested a level too deep for the
+        // Selectors struct, so serde silently drops it on load. A typed
+        // round-trip would delete it from disk; a Value round-trip must not.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        write_atomic(&path, &current).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["Sources"][0]["Selectors"]["IgnoredVolumes"],
+            serde_json::json!(["Volume 0"])
+        );
+    }
+
+    #[test]
+    fn write_leaves_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let mut updated = sample();
+        updated["EpubGen"]["Volumes"] = serde_json::json!(false);
+        write_atomic(&path, &updated).unwrap();
+
+        let backup = dir.path().join("config.json.bak");
+        assert!(backup.exists(), "previous config must be kept");
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&backup).unwrap()).unwrap();
+        assert_eq!(restored["EpubGen"]["Volumes"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn validate_rejects_config_the_scraper_could_not_load() {
+        let mut broken = sample();
+        broken["Sources"] = serde_json::json!("not an array");
+        assert!(validate(&broken).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_the_real_shape() {
+        assert!(validate(&sample()).is_ok());
+    }
+
+    #[test]
+    fn prepare_for_write_restores_a_blank_password_and_validates() {
+        let current = sample();
+        let mut candidate = sample();
+        candidate["Mail"]["Password"] = json!("");
+
+        let prepared = prepare_for_write(candidate, &current).unwrap();
+
+        assert_eq!(prepared["Mail"]["Password"], json!("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_a_structurally_invalid_config() {
+        let current = sample();
+        let mut broken = sample();
+        broken["Sources"] = json!("not an array");
+        broken["Mail"]["Password"] = json!("");
+
+        assert!(prepare_for_write(broken, &current).is_err());
+    }
+
+    #[test]
+    fn changed_keys_reports_names_never_values() {
+        let before = sample();
+        let mut after = sample();
+        after["Mail"]["Password"] = serde_json::json!("qrstuvwxyz012345");
+        after["EpubGen"]["StripColour"] = serde_json::json!(true);
+
+        let keys = changed_keys(&before, &after);
+
+        assert!(keys.contains(&"Mail".to_string()));
+        assert!(keys.contains(&"EpubGen".to_string()));
+        for key in &keys {
+            assert!(!key.contains("qrstuvwxyz"), "audit output must not carry values");
+        }
+    }
+}
