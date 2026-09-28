@@ -108,6 +108,7 @@ details.volume > ol.chapters li:last-child { border-bottom:0; }
 }
 @media (max-width: 640px) {
   details.volume > ol.chapters { margin-left:0; }
+  table.dests label.variant { display:block; }
 }
 /* `[type]` so this outranks the general checkbox rule further down. */
 input.pick[type="checkbox"] { margin:0 0.35rem 0 0; width:1rem; height:1rem;
@@ -155,7 +156,7 @@ details.adder summary { cursor:pointer; font-weight:500; font-size:0.92rem; }
                               color:var(--fg); font-size:0.85rem; }
 .picks { display:flex; flex-wrap:wrap; margin-top:0.35rem; font-size:0.85rem;
          color:var(--muted); }
-input[type="checkbox"] { width:auto; margin-right:0.35rem; }
+input[type="checkbox"], input[type="radio"] { width:auto; margin-right:0.35rem; }
 .adder button { margin-top:1rem; }
 .adder .form-status { margin-left:0.75rem; font-size:0.88rem; }
 /* Configuration panel. Class selectors only, and colours only in the pairs
@@ -217,6 +218,9 @@ details.panel-acc > summary { display:flex; align-items:center; gap:0.5rem; curs
 .send-list .detail, .dest-email, .dest-unusual { color:var(--muted); font-size:0.85rem; }
 .dest-unusual { font-style:italic; }
 table.dests td { vertical-align:top; }
+/* The checkbox and the colour choice take only their own width; the name
+   column takes the rest, rather than the table sharing it out evenly. */
+table.dests td:first-child, table.dests td:last-child { width:1%; white-space:nowrap; }
 table.dests label.variant { white-space:nowrap; margin-right:0.75rem; }
 .send-actions { display:flex; flex-wrap:wrap; gap:0.75rem 1rem; align-items:center; margin-top:1.25rem; }
 .state-sent { color:var(--ok); }
@@ -851,6 +855,18 @@ mod tests {
     #[test]
     fn the_send_bar_can_be_hidden() {
         assert!(BASE.contains(".send-bar[hidden] { display:none; }"), "{}", BASE);
+    }
+
+    /// `input { width:100% }` is meant for text fields. A radio button that
+    /// inherits it fills its label and pushes the label's text out of view,
+    /// which is how the send form's Colour / Stripped choice first shipped.
+    #[test]
+    fn checkboxes_and_radios_keep_their_own_width() {
+        assert!(
+            BASE.contains(r#"input[type="checkbox"], input[type="radio"] { width:auto;"#),
+            "{}",
+            BASE
+        );
     }
 
     /// Without `color-scheme` the browser renders native widgets (form
