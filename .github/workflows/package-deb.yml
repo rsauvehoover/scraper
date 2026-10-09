@@ -1,0 +1,149 @@
+name: Package deb
+
+# Builds the Debian package, checks it, and installs it in a clean container.
+# A release calls this from release-plz.yml with `release-tag` set, and only
+# then is anything uploaded. A pull request that touches packaging runs the
+# same build and checks without publishing, as a dry run.
+#
+# Built inside debian:trixie so the binary links against the glibc of the
+# release it is installed on; a newer build host would produce a binary that
+# refuses to start there.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to build
+        type: string
+        required: true
+      release-tag:
+        description: Release to attach the package to; empty builds without publishing
+        type: string
+        default: ""
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/package-deb.yml
+      - .github/workflows/release-plz.yml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a package built today and one built next month come from the
+  # same compiler. Cargo.toml's rust-version is the floor, not this.
+  RUST_TOOLCHAIN: "1.98.1"
+  CARGO_BUNDLE_VERSION: "0.12.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    outputs:
+      deb: ${{ steps.bundle.outputs.deb }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          # libssl-dev is for building cargo-bundle; the scraper itself
+          # links no OpenSSL.
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config libssl-dev nodejs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run tests
+        run: cargo test --locked
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
+      - name: Build package
+        id: bundle
+        # `--format deb`: without it cargo-bundle also attempts an AppImage on
+        # Linux and exits 1 after writing a good .deb.
+        run: |
+          cargo bundle --release --format deb
+          deb=$(basename target/release/bundle/deb/*.deb)
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+      - name: Check package
+        env:
+          DEB: target/release/bundle/deb/${{ steps.bundle.outputs.deb }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -eu
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB"
+          name=$(dpkg-deb --field "$DEB" Package)
+          version=$(dpkg-deb --field "$DEB" Version)
+          arch=$(dpkg-deb --field "$DEB" Architecture)
+          # A release must match its tag; a dry run must match Cargo.toml.
+          if [ -n "$RELEASE_TAG" ]; then
+            expected=${RELEASE_TAG#v}
+          else
+            expected=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          fi
+          echo "package=$name version=$version arch=$arch expected=$expected"
+          test "$name" = scraper
+          test "$version" = "$expected"
+          test "$arch" = amd64
+          # cargo-bundle lists paths without dpkg's usual leading "./".
+          dpkg-deb --contents "$DEB" | grep -Eq ' (\./)?usr/bin/wandering_inn_scraper$'
+      - name: Checksum
+        working-directory: target/release/bundle/deb
+        run: sha256sum "${{ steps.bundle.outputs.deb }}" | tee SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/deb/SHA256SUMS
+          if-no-files-found: error
+
+  # A fresh container with nothing from the build: the package has to install
+  # and run on a bare trixie with only its declared dependencies.
+  install-check:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deb
+      - name: Verify checksum
+        run: sha256sum -c SHA256SUMS
+      - name: Install and run
+        env:
+          DEB: ${{ needs.build.outputs.deb }}
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y "./$DEB"
+          wandering_inn_scraper --version
+          dpkg -s scraper | grep -E '^(Package|Version|Status):'
+
+  publish:
+    needs: [build, install-check]
+    # Only a release run has a tag; a pull request or manual run has none.
+    if: startsWith(inputs.release-tag, 'v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deb
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release-tag }}
+          DEB: ${{ needs.build.outputs.deb }}
+        run: |
+          sha256sum -c SHA256SUMS
+          gh release upload "$TAG" "$DEB" SHA256SUMS

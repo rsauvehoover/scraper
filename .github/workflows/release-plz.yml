@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
 
+# Read-only unless a job asks for more.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: release-plz-${{ github.ref }}
@@ -19,12 +19,17 @@ jobs:
   # Keeps a release PR open with the version bump and changelog.
   release-plz-pr:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: MarcoIeni/release-plz-action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         with:
           command: release-pr
         env:
@@ -33,59 +38,58 @@ jobs:
   # Tags and creates the GitHub release once the release PR is merged.
   # The release PR is opened by GITHUB_TOKEN, so CI does not run on it;
   # tests run here as the gate before releasing instead.
+  #
+  # The tag is pushed with GITHUB_TOKEN too, and GitHub starts no workflow
+  # from an event that token caused, so packaging cannot trigger on the tag.
+  # It is called from here instead.
   release-plz-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
       tag: ${{ steps.release.outputs.releases_created == 'true' && fromJSON(steps.release.outputs.releases)[0].tag || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --verbose
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - uses: MarcoIeni/release-plz-action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         id: release
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Builds, checks and attaches the .deb and SHA256SUMS. See package-deb.yml.
   bundle-linux:
     needs: release-plz-release
     if: needs.release-plz-release.outputs.releases_created == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-plz-release.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-bundle
-        run: cargo install cargo-bundle
-      - name: Build
-        run: cargo bundle --release
-      - name: Tar bundle
-        run: |
-          deb_file=$(basename target/release/bundle/deb/*.deb)
-          tar -czvf "$deb_file.tar.gz" -C target/release/bundle/deb "$deb_file"
-          echo "ARTIFACT_NAME=$deb_file.tar.gz" >> "$GITHUB_ENV"
-      - name: Upload linux artifact
-        run: gh release upload "$TAG" "./$ARTIFACT_NAME"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-plz-release.outputs.tag }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/package-deb.yml
+    with:
+      ref: ${{ needs.release-plz-release.outputs.tag }}
+      release-tag: ${{ needs.release-plz-release.outputs.tag }}
 
   bundle-windows:
     needs: release-plz-release
     if: needs.release-plz-release.outputs.releases_created == 'true'
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-plz-release.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
       - name: Install cargo-wix
         run: cargo install cargo-wix
       - name: Build
