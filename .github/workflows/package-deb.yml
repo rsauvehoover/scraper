@@ -92,7 +92,8 @@ jobs:
           test "$name" = scraper
           test "$version" = "$expected"
           test "$arch" = amd64
-          dpkg-deb --contents "$DEB" | grep -q ' \./usr/bin/wandering_inn_scraper$'
+          # cargo-bundle lists paths without dpkg's usual leading "./".
+          dpkg-deb --contents "$DEB" | grep -Eq ' (\./)?usr/bin/wandering_inn_scraper$'
       - name: Checksum
         working-directory: target/release/bundle/deb
         run: sha256sum "${{ steps.bundle.outputs.deb }}" | tee SHA256SUMS
