@@ -48,8 +48,10 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
+          # libssl-dev is for building cargo-bundle; the scraper itself
+          # links no OpenSSL.
           apt-get install -y --no-install-recommends \
-            ca-certificates curl build-essential pkg-config nodejs
+            ca-certificates curl build-essential pkg-config libssl-dev nodejs
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
