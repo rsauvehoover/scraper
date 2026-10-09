@@ -295,6 +295,15 @@ Confirm with `dpkg-deb -f <file> Package`. Renaming the package also means a
 new install does not upgrade an older one in place — both ship the same
 binary path, so remove the old package before installing the new one.
 
+Each release also carries a CI-built package, so installing does not need a
+local toolchain. `.github/workflows/package-deb.yml` builds it inside
+`debian:trixie`, runs the tests, checks the package name, version and binary
+path, installs it in a clean container, and attaches two assets:
+`wandering_inn_scraper_<version>_amd64.deb` and `SHA256SUMS`. Check the
+download with `sha256sum -c SHA256SUMS`. The binary is linked against
+trixie's glibc, so it needs Debian 13 or another system with glibc 2.41 or
+newer.
+
 ### Windows
 NOTE: `cargo wix` doesn't show any output by default, run with `-v` and `--nocapture` flags to see verbose output.
 ```bash
