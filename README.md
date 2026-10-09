@@ -57,14 +57,243 @@ entry is matched by URL and updated in place, so the chapter is never duplicated
 in the same form the TOC will use (same scheme/host/path; a trailing-slash difference is tolerated).
 Re-running with an already-seeded URL is a no-op.
 
+## Web frontend
+
+`wandering_inn_scraper web` serves a read-only view of the scraped data plus a
+configuration editor. It runs alongside the scraper and never writes to the
+databases through SQLite.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bind` | `127.0.0.1:8080` | Address to listen on |
+| `--auth-file` | `web-auth.json` | Admin credential (argon2id), mode 600 |
+| `--config-file` | `config.json` | The configuration this service edits |
+| `--secure-cookies` | off | Set the Secure flag on the session cookie; turn on when TLS reaches this service directly |
+| `--trust-forwarded-for` | off | Trust `X-Forwarded-For` for login rate limiting; only enable behind a reverse proxy that overwrites the header |
+| `--set-password` | | Prompt for a new admin password, write it, and exit |
+
+The server is a subcommand of the scraper binary, not a separate one:
+`wandering_inn_scraper web`. The packaging step produces one binary per
+invocation, so a second binary would mean a second package to build, ship,
+and version — the subcommand keeps it to one.
+
+Set a password before the first run; the server refuses to start without one:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+The admin credential is deliberately kept out of `config.json`, because this
+service can rewrite `config.json`.
+
+Run it from the same working directory as the scraper: `config.json`, `db/`
+and `build/` are all resolved relative to the process's current directory,
+not the binary's location.
+
+It opens the databases with `PRAGMA query_only`, so it never writes through
+SQLite. It still needs filesystem **write** permission on `db/` — that is not
+a mistake: SQLite's WAL mode requires even a read-only connection to be able
+to create and update the `-shm` shared-memory index file, so a reader that
+cannot write to the directory cannot open the database at all.
+
+It never creates a database, though, so a source that is configured but has
+never been scraped has no `db/{source-id}.db` for it to read. Such a source is
+named on the Sources page as configured but not yet scraped, and appears
+properly once its first scrape has created the database, with no restart. The
+same applies to a database that exists but has no tables yet. A database that
+exists but cannot be opened is named as unreadable, and is retried when the
+configuration changes or the service restarts. One unreadable source never
+stops the server from starting.
+
+The admin password is read once at process startup and held in memory for
+the life of the process. Rotating it with `--set-password` writes the new
+credential to `--auth-file` immediately, but the running server keeps using
+the old one until it is restarted. If the old password still works after a
+rotation, that means "restart pending", not "rotation failed".
+
+The server follows `config.json` without a restart. A save in the
+configuration editor applies before the confirmation comes back, and an edit
+made by hand is picked up on the next page load, checked at most every two
+seconds. A file that fails to load is not applied: the site keeps the last
+configuration that loaded and says so on the Sources and Configuration pages,
+because the next scrape reads the file as it is and will fail on it.
+
+The Configuration page shows the config two ways: the raw JSON, and a panel
+listing each source, destination and global section as editable fields. The
+JSON is the document and the panel is a view over it. Editing a field changes
+that one value in the JSON, and an edit to the JSON that parses redraws the
+panel; while the JSON does not parse, the panel shows the last version that
+did and Save is disabled. Keys the panel does not model are listed read-only
+under "Other settings" and are kept as they are, because the panel never
+rebuilds an entry from its fields. A source's id is shown but changed only in
+the JSON, since it names the source's database. The panel has no way to save
+of its own; Save sends the JSON, as before.
+
+The server and the scraper are one binary, so a binary upgrade replaces the
+file on disk without restarting whatever process is already running it.
+After upgrading, restart the web service explicitly and check the version in
+the page footer rather than trusting the installed package version.
+
+### Sending by hand
+
+Tick volumes or chapters on a series' contents page and press Send selected.
+A chapter that has not been downloaded yet, and a volume with nothing
+downloaded, have no checkbox, since there is nothing to send. The form lists
+what will be sent and every configured destination; tick the destinations
+and choose Colour or Stripped for each (it starts from the destination's
+StripColour setting). One EPUB is sent per email, the same file the
+download link gives you. A ticked chapter inside a ticked volume is left
+out, since the volume contains it.
+
+- A destination that does not list the series is still offered, and marked.
+- At most 50 emails per send, and one send at a time.
+- Sending is refused while config.json fails to load, and if the destination
+  list changed after the form was opened.
+- A manual send's SMTP commands time out after 60 seconds; the scraper's
+  own automatic send keeps the library's default of an hour per command. A
+  command that times out, or whose final server reply is lost, is retried
+  once on a fresh connection, so a message can occasionally arrive twice.
+- A job that loses its connection or has its login refused fails every
+  email still queued with that one reason, rather than trying each in turn.
+- The status page lists each email as sent or failed with a short reason. It
+  is kept in memory; a restart clears it.
+- The mail server's replies and the password never appear on the page or in
+  the log. Each attempt is logged with the series, the item and the
+  destination's name.
+
+### Running as a service
+
+The server reads the admin credential at startup and refuses to serve without
+one. Set it before enabling a service unit:
+
+```bash
+wandering_inn_scraper web --set-password
+```
+
+Enabling the unit first is not harmful, but the service exits immediately with
+an error naming the missing file, and a unit with `Restart=on-failure` repeats
+that every few seconds until the credential exists.
+
+`config.json`, `db/` and the credential file are all resolved relative to the
+process working directory, so a unit must set its working directory to the
+scraper's data directory. A service started anywhere else starts cleanly and
+reports every configured source as configured but not yet scraped — that is
+the signature of a wrong working directory, not of missing databases.
+
+#### Which user
+
+Run the web service and the scheduled scrape as the same unprivileged user,
+and make that user the owner of the whole data directory. Neither process
+needs root: the scrape fetches and parses third-party HTML, and the web
+service is network-facing, so root is the wrong default for both.
+
+They must be the *same* user, because the web service needs write access to
+`db/` even though it only reads. It opens each database read-only at the SQL
+level, but SQLite still has to create the `-wal` and `-shm` files beside a
+database when no other connection holds them. A reader that cannot write the
+directory fails its first query with `attempt to write a readonly database`.
+One owner for everything also means no file created by one process is left
+unwritable by the other.
+
+An example unit, with the data directory at `/var/lib/scraper`:
+
+```ini
+[Unit]
+Description=scraper web frontend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=scraper
+Group=scraper
+WorkingDirectory=/var/lib/scraper
+ExecStart=/usr/bin/wandering_inn_scraper web --bind 127.0.0.1:8080 \
+    --schedule-file /etc/cron.d/scraper
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scraper
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+And the scheduled scrape as the same user, in `/etc/cron.d/scraper`:
+
+```
+17 * * * * scraper cd /var/lib/scraper && /usr/bin/wandering_inn_scraper
+```
+
+`--schedule-file` makes the Sources page show the schedule and the next run,
+e.g. "Scrapes run hourly at :17 · next 18:17 server time, in 12 min". It
+expects system crontab format (a file under `/etc/cron.d`, or `/etc/crontab`)
+and picks out the entries that run a scrape. Only the timing fields are shown:
+the commands never reach the page, since they often carry secrets such as a
+healthcheck ping URL. A user's own crontab is readable only by that user and
+by root, so the schedule has to live in a system crontab for an unprivileged
+service to show it.
+
+Next-run times are shown in the web service's time zone and must match the
+zone cron fires in, which is the system's. A host left on UTC shows UTC times;
+change the system zone (for example `timedatectl set-timezone Region/City`)
+rather than only setting `TZ` in the unit. With `TZ` set in the unit alone, an
+hourly entry still reads correctly, since only the minute matters, but a daily
+one is shown at the unit's local time while cron fires at the system's.
+
+Behind an HTTPS reverse proxy, also pass `--secure-cookies`, and pass
+`--client-ip-from` with the header the proxy sets; see `web --help`.
+
+When moving an existing root-owned deployment, stop the service and wait for
+any running scrape to finish, then `chown -R` the entire data directory,
+including any `db/*-wal` and `db/*-shm` files, before starting either process
+as the new user. `find <dir> ! -user scraper` should print nothing.
+
+### Operational notes
+
+Sessions and login rate-limit state are held in memory, so a restart drops
+both. Every upgrade therefore signs all users out, and so does every password
+rotation, because `--set-password` only takes effect on restart. Dropping the
+rate-limit state also means a restart clears an active lockout.
+
+While the service runs it holds each database open, so SQLite never
+checkpoints and `db/*.db-wal` and `db/*.db-shm` persist at rest. They do not
+appear when only the scraper runs, which checkpoints and closes. Anything
+copying `db/` must take the `-wal` sibling along with its `.db`, or go through
+`sqlite3 <file> ".backup <dest>"`; copying the `.db` alone can capture an
+inconsistent database.
+
 ## Build
 
 Binaries will be found `target/release/bundle` and `target/wix` directories
 
 ### Linux/MacOS
+
+Building needs Rust 1.88 or newer (running the tests needs 1.93.1). Debian's
+packaged `rustc` is older than that, so install Rust with
+[rustup](https://rustup.rs) rather than apt. Packaging is last verified with
+`cargo-bundle` 0.12.0. 0.11 ignores the `[package.metadata.bundle.linux]`
+table, so it also builds, but without `Terminal=true` in the desktop entry:
+
 ```bash
-cargo bundle --release
+cargo install cargo-bundle --version 0.12.0 --locked
+cargo bundle --release --format deb
 ```
+
+On Linux, a bare `cargo bundle --release` also attempts an AppImage, which
+needs `mksquashfs` from `squashfs-tools`. Without it the command exits 1
+*after* it has already written a complete `.deb`, so a script or CI job that
+trusts the exit code throws away a good package. `--format deb` avoids that;
+installing `squashfs-tools` also works.
+
+The `.deb` filename is built from the crate name while the package inside is
+named by `[package.metadata.bundle] name`, so the two disagree:
+`wandering_inn_scraper_<version>_<arch>.deb` contains the package `scraper`.
+Confirm with `dpkg-deb -f <file> Package`. Renaming the package also means a
+new install does not upgrade an older one in place — both ship the same
+binary path, so remove the old package before installing the new one.
 
 ### Windows
 NOTE: `cargo wix` doesn't show any output by default, run with `-v` and `--nocapture` flags to see verbose output.
@@ -102,7 +331,8 @@ Create a `config.json` file with the following structure:
         "SendFullVolumes": true,          // Default: send complete volume EPUBs
         "SendIndividualChapters": false,  // Default: send each chapter as separate EPUB
 
-        // Map of source ID to per-source overrides (empty map or omitted = all sources with defaults)
+        // The sources this destination is sent, each with optional overrides.
+        // Only listed sources are sent; an empty or omitted map means nothing is.
         "Sources": {
           "my-serial": {},                           // Inherits all defaults above
           "another-serial": {                        // Override specific settings for this source

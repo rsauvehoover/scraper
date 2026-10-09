@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MailConfig {
     pub name: String,
@@ -12,6 +12,36 @@ pub struct MailConfig {
     pub smtp_port: u16,
     pub destinations: Vec<UserConfig>,
 }
+
+impl std::fmt::Debug for MailConfig {
+    /// Deliberately hand-written. `Mail.Password` is a live Gmail app password;
+    /// a derived `Debug` puts it in any log line that formats a Config.
+    ///
+    /// Destructured, not field-accessed, on purpose: a field added to
+    /// `MailConfig` later must not be able to reach `Debug` output without
+    /// someone here choosing where it goes. Field access would let it vanish
+    /// silently; destructuring makes the compiler refuse to build until this
+    /// impl says what happens to it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MailConfig {
+            name,
+            address,
+            password: _,
+            smtp_hostname,
+            smtp_port,
+            destinations,
+        } = self;
+        f.debug_struct("MailConfig")
+            .field("name", name)
+            .field("address", address)
+            .field("password", &"<redacted>")
+            .field("smtp_hostname", smtp_hostname)
+            .field("smtp_port", smtp_port)
+            .field("destinations", destinations)
+            .finish()
+    }
+}
+
 impl Default for MailConfig {
     fn default() -> Self {
         MailConfig {
@@ -50,7 +80,9 @@ pub struct UserConfig {
     pub strip_colour: bool,
     pub send_full_volumes: bool,
     pub send_individual_chapters: bool,
-    /// Map of source ID to per-source overrides. Empty map means all sources with defaults.
+    /// Map of source ID to per-source overrides. A destination is sent exactly
+    /// the sources listed here; an empty or omitted map means it is sent
+    /// nothing. See `receives_source`.
     pub sources: HashMap<String, UserSourceConfig>,
 }
 impl Default for UserConfig {
@@ -67,9 +99,15 @@ impl Default for UserConfig {
 }
 
 impl UserConfig {
-    /// Check if this user should receive emails for the given source
+    /// Whether this destination is sent `source_id`: only if it lists it.
+    ///
+    /// An empty map used to mean every source. That made a newly added
+    /// source's first scrape, which flags every chapter for regeneration,
+    /// mail its entire back catalogue to every destination with an empty
+    /// map. Opting in per source means a new source reaches nobody until a
+    /// destination lists it.
     pub fn receives_source(&self, source_id: &str) -> bool {
-        self.sources.is_empty() || self.sources.contains_key(source_id)
+        self.sources.contains_key(source_id)
     }
 
     /// Get the resolved config for a specific source, merging per-source overrides with defaults.
@@ -341,70 +379,160 @@ impl Config {
 }
 
 pub fn load_config() -> Config {
-    if !std::path::Path::new("config.json").exists() {
-        println!("No config.json found, using default values");
+    load_config_from(std::path::Path::new("config.json"))
+}
+
+/// Load config from an explicit path. `load_config()` is this with
+/// `config.json`, preserved so the CLI is unchanged.
+pub fn load_config_from(path: &std::path::Path) -> Config {
+    if !path.exists() {
+        println!("No {} found, using default values", path.display());
         println!("Request delay is 1000ms");
         return Config::default();
     }
 
-    match std::fs::read_to_string("config.json") {
-        Ok(str) => match serde_json::from_str::<Config>(&str) {
-            Ok(mut config) => {
-                println!("Loaded config");
-                println!("Delay is {}ms", config.request_delay);
-                println!(
-                    "Sending from <{}> at <{}>",
-                    config.mail.name, config.mail.address
-                );
-                for dest in &config.mail.destinations {
-                    println!("Sending to <{}> at <{}>", dest.name, dest.email);
-                }
+    match std::fs::read_to_string(path) {
+        Ok(str) => parse_and_migrate(&str),
+        Err(e) => panic!("{}", e),
+    }
+}
 
-                for dest in &config.mail.destinations {
-                    if dest.sources.is_empty() {
-                        // User receives all sources — use top-level defaults
-                        if dest.strip_colour {
+/// The scraper's path: a config that fails to parse aborts the run, as it
+/// always has. The message says where and what kind of fault, never the
+/// offending text, because it lands in the scheduled job's log file and the
+/// file it describes holds the mail password.
+fn parse_and_migrate(raw: &str) -> Config {
+    try_parse_and_migrate(raw.as_bytes()).unwrap_or_else(|e| {
+        panic!(
+            "could not load config: {}",
+            ConfigLoadError::from_serde(&e)
+        )
+    })
+}
+
+/// Why a config could not be loaded, carrying nothing from the file itself.
+///
+/// serde_json's messages quote the value that failed to parse, and
+/// config.json holds the mail password. This is what gets shown on a page
+/// and written to a log, so it keeps the position and the kind of fault and
+/// drops the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLoadError {
+    Missing,
+    Unreadable(std::io::ErrorKind),
+    Invalid {
+        line: usize,
+        column: usize,
+        category: &'static str,
+    },
+}
+
+impl ConfigLoadError {
+    pub fn from_io(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => ConfigLoadError::Missing,
+            kind => ConfigLoadError::Unreadable(kind),
+        }
+    }
+
+    fn from_serde(e: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        let category = match e.classify() {
+            Category::Io => "read error",
+            Category::Syntax => "syntax error",
+            Category::Data => "invalid value",
+            Category::Eof => "unexpected end of file",
+        };
+        ConfigLoadError::Invalid {
+            line: e.line(),
+            column: e.column(),
+            category,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigLoadError::Missing => write!(f, "config file not found"),
+            ConfigLoadError::Unreadable(kind) => {
+                write!(f, "config file could not be read ({:?})", kind)
+            }
+            ConfigLoadError::Invalid {
+                line,
+                column,
+                category,
+            } => write!(f, "{} at line {}, column {}", category, line, column),
+        }
+    }
+}
+
+impl std::error::Error for ConfigLoadError {}
+
+/// The web service's path: a config that fails to parse is reported, not
+/// fatal, so a bad hand edit cannot take a running server down.
+pub fn parse_config(raw: &[u8]) -> Result<Config, ConfigLoadError> {
+    try_parse_and_migrate(raw).map_err(|e| ConfigLoadError::from_serde(&e))
+}
+
+fn try_parse_and_migrate(raw: &[u8]) -> Result<Config, serde_json::Error> {
+    match serde_json::from_slice::<Config>(raw) {
+        Ok(mut config) => {
+            println!("Loaded config");
+            println!("Delay is {}ms", config.request_delay);
+            // Names and counts, not addresses. This runs at startup for the
+            // long-running web service as well as for a one-shot scrape, so
+            // its output lands in a log file that outlives the process and is
+            // read by whoever can read logs. An address list there is a
+            // standing copy of everyone's mail address for no operational
+            // gain — the names identify the destinations well enough, and the
+            // config editor shows the addresses to an authenticated operator.
+            println!("Sending from <{}>", config.mail.name);
+            let names: Vec<&str> = config
+                .mail
+                .destinations
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            println!("Sending to {} destinations: {}", names.len(), names.join(", "));
+
+            for dest in &config.mail.destinations {
+                if dest.sources.is_empty() {
+                    // Not an error: a destination can be parked. But it is
+                    // sent nothing, and that should be visible in the log
+                    // rather than discovered by someone wondering why their
+                    // chapters stopped. Name only, as above.
+                    eprintln!(
+                        "warning: destination {} lists no sources and will be sent nothing",
+                        dest.name
+                    );
+                } else {
+                    for source_id in dest.sources.keys() {
+                        let resolved = dest.source_config(source_id);
+                        if resolved.strip_colour {
                             config.epub_gen.strip_colour = true;
                         }
-                        if dest.send_full_volumes {
+                        if resolved.send_full_volumes {
                             config.epub_gen.volumes = true;
                         }
-                        if dest.send_individual_chapters {
+                        if resolved.send_individual_chapters {
                             config.epub_gen.chapters = true;
-                        }
-                    } else {
-                        for source_id in dest.sources.keys() {
-                            let resolved = dest.source_config(source_id);
-                            if resolved.strip_colour {
-                                config.epub_gen.strip_colour = true;
-                            }
-                            if resolved.send_full_volumes {
-                                config.epub_gen.volumes = true;
-                            }
-                            if resolved.send_individual_chapters {
-                                config.epub_gen.chapters = true;
-                            }
                         }
                     }
                 }
-
-                // Backward compatibility: migrate legacy config to multi-source format
-                config = migrate_legacy_config(config);
-
-                // Print enabled sources
-                for source in config.enabled_sources() {
-                    println!("Source enabled: {} ({})", source.name, source.id);
-                }
-
-                config
             }
-            Err(e) => {
-                panic!("{}", e);
+
+            // Backward compatibility: migrate legacy config to multi-source format
+            config = migrate_legacy_config(config);
+
+            // Print enabled sources
+            for source in config.enabled_sources() {
+                println!("Source enabled: {} ({})", source.name, source.id);
             }
-        },
-        Err(e) => {
-            panic!("{}", e);
+
+            Ok(config)
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -439,4 +567,150 @@ fn migrate_legacy_config(mut config: Config) -> Config {
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// config.json holds the mail password, and serde_json's own error
+    /// messages quote the offending value. A load error is shown on a page
+    /// and written to a log, so it must carry the position and the kind of
+    /// fault, never the text.
+    #[test]
+    fn a_config_load_error_never_quotes_the_file() {
+        let raw = br#"{"RequestDelay": "s3cret-value-from-the-file"}"#;
+
+        // The hazard is real: serde's message repeats the value verbatim.
+        let serde_message = serde_json::from_slice::<Config>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            serde_message.contains("s3cret-value-from-the-file"),
+            "precondition: {}",
+            serde_message
+        );
+
+        let err = parse_config(raw).unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("s3cret-value-from-the-file"),
+            "a load error quoted the file: {}",
+            shown
+        );
+        assert!(
+            matches!(err, ConfigLoadError::Invalid { line: 1, .. }),
+            "{:?}",
+            err
+        );
+    }
+
+    /// The scraper still stops on a config it cannot parse, as it always
+    /// has, but its panic message is written to the scheduled job's log, so
+    /// it gets the same treatment as the web service's error.
+    #[test]
+    fn a_scrape_that_cannot_parse_its_config_does_not_log_the_value() {
+        let raw = r#"{"RequestDelay": "s3cret-value-from-the-file"}"#;
+        let payload = std::panic::catch_unwind(|| parse_and_migrate(raw)).unwrap_err();
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("line 1"), "{}", message);
+        assert!(
+            !message.contains("s3cret-value-from-the-file"),
+            "the panic quoted the file: {}",
+            message
+        );
+    }
+
+    fn destination(sources: &[&str]) -> UserConfig {
+        UserConfig {
+            name: "Test Reader".to_string(),
+            email: "reader@example.com".to_string(),
+            sources: sources
+                .iter()
+                .map(|id| (id.to_string(), UserSourceConfig::default()))
+                .collect(),
+            ..UserConfig::default()
+        }
+    }
+
+    /// A destination receives exactly the sources it lists. An empty map used
+    /// to mean every source, which made adding a source mail its whole back
+    /// catalogue to every such destination on the source's first scrape:
+    /// every newly downloaded chapter is flagged for regeneration.
+    #[test]
+    fn a_destination_with_no_sources_receives_nothing() {
+        assert!(!destination(&[]).receives_source("example-source"));
+    }
+
+    #[test]
+    fn a_destination_receives_only_what_it_lists() {
+        let dest = destination(&["example-source"]);
+        assert!(dest.receives_source("example-source"));
+        assert!(
+            !dest.receives_source("new-source"),
+            "a source added later must reach nobody until a destination lists it"
+        );
+    }
+
+    #[test]
+    fn an_omitted_sources_map_receives_nothing() {
+        let config = parse_config(
+            br#"{"Mail": {"Destinations": [{"Name": "Test Reader", "Email": "reader@example.com"}]}}"#,
+        )
+        .unwrap();
+        assert!(!config.mail.destinations[0].receives_source("example-source"));
+    }
+
+    /// EPUB generation is switched on by whatever the destinations will be
+    /// sent. A destination that is sent nothing must switch nothing on.
+    #[test]
+    fn a_destination_with_no_sources_turns_no_epub_generation_on() {
+        let config = parse_config(
+            br#"{
+                "EpubGen": {"Volumes": false, "Chapters": false, "StripColour": false},
+                "Mail": {"Destinations": [{
+                    "Name": "Test Reader", "Email": "reader@example.com",
+                    "SendFullVolumes": true, "SendIndividualChapters": true,
+                    "StripColour": true, "Sources": {}
+                }]}
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.epub_gen.volumes);
+        assert!(!config.epub_gen.chapters);
+        assert!(!config.epub_gen.strip_colour);
+    }
+
+    #[test]
+    fn a_valid_config_parses() {
+        let config = parse_config(br#"{"RequestDelay": 5}"#).unwrap();
+        assert_eq!(config.request_delay, 5);
+    }
+
+    #[test]
+    fn io_failures_map_to_missing_or_unreadable() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            ConfigLoadError::from_io(&Error::from(ErrorKind::NotFound)),
+            ConfigLoadError::Missing
+        );
+        assert_eq!(
+            ConfigLoadError::from_io(&Error::from(ErrorKind::PermissionDenied)),
+            ConfigLoadError::Unreadable(ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_password() {
+        let mail = MailConfig {
+            password: "abcdefghijklmnop".to_string(),
+            ..MailConfig::default()
+        };
+        let rendered = format!("{:?}", mail);
+        assert!(!rendered.contains("abcdefghijklmnop"));
+        assert!(rendered.contains("<redacted>"));
+    }
 }
