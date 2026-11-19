@@ -19,6 +19,27 @@ impl Default for Attachment {
     }
 }
 
+/// Send to Kindle rejects attachments over about 50 MB; stay under it.
+pub const MAX_ATTACHMENT_BYTES: usize = 45 * 1024 * 1024;
+
+pub fn attachment_too_large(attachment: &Attachment) -> bool {
+    attachment.bytes.len() > MAX_ATTACHMENT_BYTES
+}
+
+/// Sends unless the attachment is over the limit, which is reported and skipped.
+async fn send_epub_guarded(config: &MailConfig, dest: &UserConfig, attachment: &Attachment) {
+    if attachment_too_large(attachment) {
+        eprintln!(
+            "error: {} is {} bytes, over the {} byte send limit; not sent",
+            attachment.filename,
+            attachment.bytes.len(),
+            MAX_ATTACHMENT_BYTES
+        );
+        return;
+    }
+    send_epub(config, dest, attachment).await;
+}
+
 async fn send_epub(config: &MailConfig, dest: &UserConfig, attachment: &Attachment) {
     let message = MessageBuilder::new()
         .from((config.name.clone(), config.address.clone()))
@@ -64,21 +85,21 @@ pub async fn send_epubs(
         let src_cfg = dest.source_config(source_id);
         if src_cfg.send_full_volumes {
             for vol in volumes {
-                send_epub(config, &dest, vol).await;
+                send_epub_guarded(config, &dest, vol).await;
             }
             if src_cfg.strip_colour {
                 for vol in volumes_s {
-                    send_epub(config, &dest, vol).await;
+                    send_epub_guarded(config, &dest, vol).await;
                 }
             }
         }
         if src_cfg.send_individual_chapters {
             for chapter in chapters {
-                send_epub(config, &dest, chapter).await;
+                send_epub_guarded(config, &dest, chapter).await;
             }
             if src_cfg.strip_colour {
                 for chapter in chapters_s {
-                    send_epub(config, &dest, chapter).await;
+                    send_epub_guarded(config, &dest, chapter).await;
                 }
             }
         }
@@ -251,6 +272,14 @@ impl Mailer for SmtpMailer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_limit_is_inclusive() {
+        let at = Attachment { filename: "a.epub".into(), mime: "application/epub+zip".into(), bytes: vec![0; MAX_ATTACHMENT_BYTES] };
+        assert!(!attachment_too_large(&at));
+        let over = Attachment { bytes: vec![0; MAX_ATTACHMENT_BYTES + 1], ..at };
+        assert!(attachment_too_large(&over));
+    }
 
     #[test]
     fn connection_faults_are_connect_and_login_faults_are_login() {
