@@ -73,7 +73,9 @@ pub struct Resolved {
     pub unavailable: usize,
 }
 
-pub fn resolve(stat: &SourceStat, selection: &Selection) -> Resolved {
+/// `manga`: the source's single volume is never sent, so a ticked volume
+/// counts as unavailable, however the query string was built.
+pub fn resolve(stat: &SourceStat, selection: &Selection, manga: bool) -> Resolved {
     let mut items = Vec::new();
     let mut inside_volume = Vec::new();
     let mut found = 0;
@@ -81,7 +83,7 @@ pub fn resolve(stat: &SourceStat, selection: &Selection) -> Resolved {
     for volume in &stat.volumes {
         let id = volume.id as i64;
         let downloaded = volume.chapters.len() - volume.pending_chapters;
-        if selection.volumes.contains(&id) && downloaded > 0 {
+        if !manga && selection.volumes.contains(&id) && downloaded > 0 {
             found += 1;
             items.push(ItemLine {
                 item: Item::Volume { id, name: volume.name.clone() },
@@ -298,8 +300,17 @@ mod tests {
     }
 
     #[test]
+    fn a_manga_source_ignores_ticked_volumes() {
+        let r = resolve(&stat(), &Selection::parse(&pairs("v=1&c=11")), true);
+        assert_eq!(r.items.len(), 1);
+        assert!(matches!(r.items[0].item, Item::Chapter { id: 11, .. }));
+        assert!(r.inside_volume.is_empty());
+        assert_eq!(r.unavailable, 1);
+    }
+
+    #[test]
     fn items_come_in_contents_order_and_a_ticked_volume_absorbs_its_chapters() {
-        let r = resolve(&stat(), &Selection::parse(&pairs("c=20&v=1&c=11&c=21&c=999&v=3")));
+        let r = resolve(&stat(), &Selection::parse(&pairs("c=20&v=1&c=11&c=21&c=999&v=3")), false);
         let labels: Vec<_> = r.items.iter().map(|l| l.item.label().to_string()).collect();
         assert_eq!(labels, ["Volume 1", "2.01 Later"]);
         assert_eq!(r.inside_volume, ["1.02 Next"]);
@@ -311,7 +322,7 @@ mod tests {
 
     #[test]
     fn a_plan_is_each_destination_times_each_item_with_its_variant() {
-        let r = resolve(&stat(), &Selection::parse(&pairs("v=1&c=20")));
+        let r = resolve(&stat(), &Selection::parse(&pairs("v=1&c=20")), false);
         let m = mail();
         let got = plan(&r.items, &m, &fingerprint(&m), &choices(&pairs("d=1&d=0&colour-0=stripped&colour-1=colour"))).unwrap();
         let summary: Vec<_> = got.iter().map(|e| (e.dest_name.as_str(), e.item.label(), e.strip_colour)).collect();
@@ -328,7 +339,7 @@ mod tests {
     fn refusals() {
         let m = mail();
         let fp = fingerprint(&m);
-        let r = resolve(&stat(), &Selection::parse(&pairs("v=1")));
+        let r = resolve(&stat(), &Selection::parse(&pairs("v=1")), false);
         assert_eq!(plan(&[], &m, &fp, &choices(&pairs("d=0"))).unwrap_err(), Refusal::NothingSelected);
         assert_eq!(plan(&r.items, &m, &fp, &[]).unwrap_err(), Refusal::NoDestination);
         assert_eq!(plan(&r.items, &m, "stale", &choices(&pairs("d=0"))).unwrap_err(), Refusal::ConfigChanged);

@@ -259,15 +259,6 @@ impl SourceDatabase {
             })
     }
 
-    /// Whether a volume with this name exists
-    pub fn volume_exists(&self, name: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM volumes WHERE name = ?1)",
-            [name],
-            |row| row.get(0),
-        )
-    }
-
     /// Get a volume name by ID
     pub fn get_volume_name(&self, volume_id: isize) -> Result<String> {
         self.conn.query_row(
@@ -291,6 +282,51 @@ impl SourceDatabase {
                 },
             )
             .optional()
+    }
+
+    /// Every volume, oldest first
+    #[cfg(test)]
+    pub fn get_all_volumes(&self) -> Result<Vec<Volume>> {
+        self.conn
+            .prepare("SELECT id, name FROM volumes ORDER BY id")?
+            .query_map([], |row| Ok(Volume { id: row.get(0)?, name: row.get(1)? }))?
+            .collect()
+    }
+
+    /// Move every chapter into one volume named `name` and delete the rest.
+    /// The migration from the manga batch design: a volume already named
+    /// `name` is the target, else the oldest volume is renamed, else one is
+    /// created. The target's regenerate flag is cleared and chapter flags are
+    /// left as they are, so collapsing never queues a send. Returns how many
+    /// chapters moved; 0 once the source has its single volume. A chapter
+    /// present in two volumes violates `UNIQUE(name, uri, volumeid)` and
+    /// rolls the whole collapse back rather than losing a row.
+    pub fn collapse_volumes_into(&self, name: &str) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let named: Option<isize> = self
+            .conn
+            .query_row("SELECT id FROM volumes WHERE name = ?1", [name], |row| row.get(0))
+            .optional()?;
+        let oldest: Option<isize> = self
+            .conn
+            .query_row("SELECT id FROM volumes ORDER BY id LIMIT 1", [], |row| row.get(0))
+            .optional()?;
+        let target = match (named, oldest) {
+            (Some(id), _) => id,
+            (None, Some(id)) => {
+                self.conn.execute("UPDATE volumes SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])?;
+                id
+            }
+            (None, None) => self.add_volume(name)?,
+        };
+        let moved = self.conn.execute(
+            "UPDATE chapters SET volumeid = ?1 WHERE volumeid IS NULL OR volumeid != ?1",
+            [target],
+        )?;
+        self.conn.execute("DELETE FROM volumes WHERE id != ?1", [target])?;
+        self.conn.execute("UPDATE volumes SET regenerate_epub = 0 WHERE id = ?1", [target])?;
+        tx.commit()?;
+        Ok(moved)
     }
 
     /// Add a chapter to the database
@@ -376,76 +412,6 @@ impl SourceDatabase {
             }
             None => self.add_chapter(name, uri, volume_id),
         }
-    }
-
-    /// Add a chapter, or rename an existing one. An existing chapter keeps its
-    /// volume; a new chapter goes into `default_volume_id`.
-    pub fn upsert_chapter_keep_volume(
-        &self,
-        name: &str,
-        uri: &str,
-        default_volume_id: isize,
-    ) -> Result<()> {
-        let (with_slash, without_slash) = uri_variants(uri);
-        let existing: Option<(isize, String)> = self
-            .conn
-            .query_row(
-                "SELECT id, name FROM chapters WHERE uri IN (?1, ?2) ORDER BY id LIMIT 1",
-                [with_slash.as_str(), without_slash.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        match existing {
-            Some((id, existing_name)) => {
-                if existing_name != name {
-                    // OR IGNORE: pre-existing duplicate rows could collide
-                    // with UNIQUE(name, uri, volumeid)
-                    self.conn
-                        .prepare("UPDATE OR IGNORE chapters SET name = ?1 WHERE id = ?2")?
-                        .execute((name, id))?;
-                }
-                Ok(())
-            }
-            None => self.add_chapter(name, uri, default_volume_id),
-        }
-    }
-
-    /// Total bytes of image data across a volume's downloaded chapters
-    pub fn volume_image_bytes(&self, volume_id: isize) -> Result<u64> {
-        let bytes: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(LENGTH(i.data)), 0) FROM images i
-             JOIN chapters c ON c.id = i.chapter_id
-             WHERE c.volumeid = ?1 AND c.data_id IS NOT NULL",
-            [volume_id],
-            |row| row.get(0),
-        )?;
-        Ok(bytes as u64)
-    }
-
-    /// Whether any chapter in the volume has been downloaded
-    pub fn volume_has_downloaded_chapter(&self, volume_id: isize) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM chapters WHERE volumeid = ?1 AND data_id IS NOT NULL)",
-            [volume_id],
-            |row| row.get(0),
-        )
-    }
-
-    /// Move a chapter to another volume
-    pub fn set_chapter_volume(&self, chapter_id: isize, volume_id: isize) -> Result<()> {
-        self.conn
-            .prepare("UPDATE chapters SET volumeid = ?1 WHERE id = ?2")?
-            .execute([volume_id, chapter_id])?;
-        Ok(())
-    }
-
-    /// Number of volumes
-    pub fn count_volumes(&self) -> Result<usize> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM volumes", [], |row| row.get(0))?;
-        Ok(n as usize)
     }
 
     /// Add or update chapter data
@@ -987,6 +953,65 @@ mod tests {
     }
 
     #[test]
+    fn collapse_moves_every_chapter_into_one_volume_and_keeps_chapter_flags() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let v2 = db.add_volume("Volume 2").unwrap();
+        let v3 = db.add_volume("Volume 3").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        db.add_chapter("C2", "https://example.com/c2", v2).unwrap();
+        db.add_chapter("C3", "https://example.com/c3", v3).unwrap();
+        let c2 = db.get_chapters_by_volume(v2).unwrap()[0].id;
+        db.update_generated_chapter(c2, true).unwrap();
+        db.update_generated_volume(v1, true).unwrap();
+
+        assert_eq!(db.collapse_volumes_into("Example Series").unwrap(), 2);
+
+        let vols = db.get_all_volumes().unwrap();
+        assert_eq!(vols.len(), 1);
+        assert_eq!((vols[0].id, vols[0].name.as_str()), (v1, "Example Series"));
+        let names: Vec<String> = db.get_chapters_by_volume(v1).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["C1", "C2", "C3"]);
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [c2]);
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+
+        assert_eq!(db.collapse_volumes_into("Example Series").unwrap(), 0, "idempotent");
+        assert_eq!(db.get_all_volumes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn collapse_creates_the_volume_on_an_empty_database() {
+        let db = test_db();
+        assert_eq!(db.collapse_volumes_into("Example Series").unwrap(), 0);
+        let vols = db.get_all_volumes().unwrap();
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].name, "Example Series");
+    }
+
+    #[test]
+    fn collapse_prefers_an_existing_volume_with_the_name() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let named = db.add_volume("Example Series").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        assert_eq!(db.collapse_volumes_into("Example Series").unwrap(), 1);
+        let vols = db.get_all_volumes().unwrap();
+        assert_eq!((vols.len(), vols[0].id), (1, named));
+        assert_eq!(db.get_chapters_by_volume(named).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn collapse_surfaces_a_duplicate_chapter() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let v2 = db.add_volume("Volume 2").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v2).unwrap();
+        assert!(db.collapse_volumes_into("Example Series").is_err());
+        assert_eq!(db.get_all_volumes().unwrap().len(), 2, "the transaction rolled back");
+    }
+
+    #[test]
     fn chapter_only_flags_set_the_chapter_and_leave_the_volume() {
         let db = test_db();
         let vol = db.add_volume("Volume 1").unwrap();
@@ -997,35 +1022,4 @@ mod tests {
         assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
     }
 
-    #[test]
-    fn keep_volume_upsert_renames_but_never_moves_an_existing_chapter() {
-        let db = test_db();
-        let v1 = db.add_volume("Volume 1").unwrap();
-        let v2 = db.add_volume("Volume 2").unwrap();
-        db.add_chapter("old name", "https://example.com/c1/", v1).unwrap();
-        db.upsert_chapter_keep_volume("new name", "https://example.com/c1", v2).unwrap();
-        db.upsert_chapter_keep_volume("C2", "https://example.com/c2", v2).unwrap();
-        let rows = all_chapters(&db);
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].0.as_str(), rows[0].2), ("new name", Some(v1)));
-        assert_eq!((rows[1].0.as_str(), rows[1].2), ("C2", Some(v2)));
-    }
-
-    #[test]
-    fn volume_image_bytes_counts_only_downloaded_chapters() {
-        let db = test_db();
-        let vol = db.add_volume("Volume 1").unwrap();
-        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
-        db.add_chapter("C2", "https://example.com/c2", vol).unwrap();
-        let ids: Vec<isize> = db.get_empty_chapters().unwrap().iter().map(|c| c.id).collect();
-        db.store_chapter_content(ids[0], "<a/>", &[image(ids[0], 0, &[0; 300]), image(ids[0], 1, &[0; 200])], RegenerateFlags::ChapterAndVolume).unwrap();
-        assert_eq!(db.volume_image_bytes(vol).unwrap(), 500);
-        assert!(db.volume_has_downloaded_chapter(vol).unwrap());
-        assert_eq!(db.count_volumes().unwrap(), 1);
-        let v2 = db.add_volume("Volume 2").unwrap();
-        db.set_chapter_volume(ids[1], v2).unwrap();
-        assert_eq!(db.get_chapters_by_volume(v2).unwrap().len(), 1);
-        assert!(!db.volume_has_downloaded_chapter(v2).unwrap());
-        assert_eq!(db.volume_image_bytes(v2).unwrap(), 0);
-    }
 }

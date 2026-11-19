@@ -119,8 +119,12 @@ pub async fn volume_epub(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
-    // A manga source has no stripped variant; the output would be the same.
-    let strip_colour = query.strip_colour() && !source.is_manga();
+    // A manga source's single volume is never built; its chapters are
+    // downloaded one by one.
+    if source.is_manga() {
+        return (StatusCode::NOT_FOUND, MANGA_HAS_NO_VOLUMES).into_response();
+    }
+    let strip_colour = query.strip_colour();
 
     // Generation is CPU-bound and each build holds several megabytes, so a
     // burst of requests must not be allowed to exhaust memory.
@@ -172,6 +176,8 @@ pub(crate) enum BuildError {
     Internal,
 }
 
+const MANGA_HAS_NO_VOLUMES: &str = "Manga sources have no volume EPUBs";
+
 /// Build a volume EPUB. Blocking: call from `spawn_blocking`. `source` must
 /// have come from `SourceRegistry::get` (see the module header).
 pub(crate) fn build_volume(
@@ -179,6 +185,9 @@ pub(crate) fn build_volume(
     volume_id: i64,
     strip_colour: bool,
 ) -> Result<Attachment, BuildError> {
+    if source.is_manga() {
+        return Err(BuildError::NotFound(MANGA_HAS_NO_VOLUMES));
+    }
     let db = open(&source.id)?;
     // `QueryReturnedNoRows` means the volume genuinely does not exist — any
     // other error is a real backend fault (locked file, corruption, I/O) and
@@ -422,11 +431,11 @@ mod tests {
         );
     }
 
-    /// A manga batch is a volume: its EPUB is served, and `?stripped=1`
-    /// serves the same chapter page as the plain link.
+    /// A manga source's single volume is never built: the route refuses it
+    /// before touching the database.
     #[tokio::test]
     #[serial_test::serial]
-    async fn volume_epub_is_served_for_a_manga_source() {
+    async fn volume_epub_is_refused_for_a_manga_source() {
         use super::{volume_epub, DownloadQuery};
         use crate::config::{SourceConfig, SourceKind};
         use crate::web::app::AppState;
@@ -439,13 +448,11 @@ mod tests {
         std::fs::create_dir_all("db").unwrap();
 
         let vol = {
-            // File-backed: `open_query_only` in the handler opens this file.
             let db = crate::db::SourceDatabase::open("test-source").unwrap();
-            let vol = db.add_volume("Volume 1").unwrap();
+            let vol = db.add_volume("Example Series").unwrap();
             db.add_chapter("Chapter", "https://example.com/c1", vol).unwrap();
             let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
-            db.add_chapter_data(id, r#"<p><span style="color:#ff0000">red</span></p>"#)
-                .unwrap();
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
             vol
         };
 
@@ -456,38 +463,15 @@ mod tests {
             ..Default::default()
         }]));
 
-        let mut bodies = Vec::new();
-        for stripped in [None, Some("1".to_string())] {
-            let response = volume_epub(
-                State(Arc::clone(&state)),
-                AxumPath(("test-source".to_string(), vol as i64)),
-                Query(DownloadQuery { stripped }),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.headers().get("content-type").unwrap(),
-                "application/epub+zip"
-            );
-            bodies.push(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap());
-        }
-        // epub-builder stamps a fresh UUID and date into every build, so
-        // compare the chapter page, not the archive.
-        let page = |bytes: &[u8]| {
-            let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
-            let name = z
-                .file_names()
-                .map(|n| n.unwrap().into_owned())
-                .find(|n| n.ends_with("(Chapter).xhtml"))
-                .unwrap();
-            let mut f = z.by_name(&name).unwrap();
-            let mut out = String::new();
-            std::io::Read::read_to_string(&mut f, &mut out).unwrap();
-            out
-        };
-        let (plain, stripped) = (page(&bodies[0]), page(&bodies[1]));
-        assert!(plain.contains("color:#ff0000"), "{}", plain);
-        assert_eq!(plain, stripped, "?stripped=1 must serve the plain EPUB");
+        let response = volume_epub(
+            State(Arc::clone(&state)),
+            AxumPath(("test-source".to_string(), vol as i64)),
+            Query(DownloadQuery { stripped: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Manga sources have no volume EPUBs");
     }
 
     /// A manga source has no stripped variant: `?stripped=1` serves the same
@@ -594,5 +578,16 @@ mod tests {
         assert!(matches!(build_chapter(&source, pending, false), Err(BuildError::NotFound(_))));
         assert!(matches!(build_chapter(&source, 999_999, false), Err(BuildError::NotFound(_))));
         assert!(matches!(build_volume(&source, 999_999, false), Err(BuildError::NotFound(_))));
+
+        // The send job builds through this function too, so the manga
+        // refusal must hold here and not only on the route.
+        let manga = SourceConfig {
+            kind: crate::config::SourceKind::MangaWordpress,
+            ..source.clone()
+        };
+        assert!(matches!(
+            build_volume(&manga, vol, false),
+            Err(BuildError::NotFound("Manga sources have no volume EPUBs"))
+        ));
     }
 }
