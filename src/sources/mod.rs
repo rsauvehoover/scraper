@@ -4,6 +4,7 @@ pub mod manga;
 mod generic;
 mod registry;
 mod royal_road;
+pub mod tcb;
 mod traits;
 mod wandering_inn;
 
