@@ -120,9 +120,8 @@ pub fn assign_image_paths(html: &str, assigned: &[(String, String)]) -> String {
 /// Remove every normalised tag for `url`.
 pub fn drop_image(html: &str, url: &str) -> String {
     let re = Regex::new(&format!(
-        r#"<img src="{}" alt="[^"]*" style="{}"/>"#,
-        regex::escape(&attr_escape(url)),
-        regex::escape(IMG_STYLE)
+        r#"<img src="{}" alt="[^"]*" style="[^"]*"/>"#,
+        regex::escape(&attr_escape(url))
     ))
     .unwrap();
     re.replace_all(html, "").into_owned()

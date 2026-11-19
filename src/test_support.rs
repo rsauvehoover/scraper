@@ -78,3 +78,44 @@ impl Mailer for RecordingMailer {
         Ok(())
     }
 }
+
+use axum::http::{header::CONTENT_TYPE, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+
+/// One canned response for `serve_fixtures`.
+pub struct FixtureRoute {
+    pub path: &'static str,
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
+}
+
+/// Serve `routes` over HTTP on a loopback port until the test ends, and
+/// return the base URL (`http://127.0.0.1:{port}`). `routes` gets the base URL
+/// so bodies can link to other fixtures. Unknown paths answer 404.
+pub async fn serve_fixtures(routes: impl FnOnce(&str) -> Vec<FixtureRoute>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let routes = Arc::new(routes(&base));
+
+    let router = axum::Router::new().fallback(move |uri: Uri| {
+        let routes = Arc::clone(&routes);
+        async move { fixture_response(&routes, uri.path()) }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    base
+}
+
+fn fixture_response(routes: &[FixtureRoute], path: &str) -> Response {
+    match routes.iter().find(|r| r.path == path) {
+        Some(r) => (
+            StatusCode::from_u16(r.status).unwrap(),
+            [(CONTENT_TYPE, r.content_type)],
+            r.body.clone(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}

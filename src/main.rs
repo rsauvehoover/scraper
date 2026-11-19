@@ -159,7 +159,7 @@ async fn main() {
         // Download chapters
         if !args.skip_download {
             if let Err(e) = client
-                .download_all_chapters(&scraper, &db, config.request_delay)
+                .download_all_chapters(&scraper, &db, config.request_delay, &config.images)
                 .await
             {
                 println!("Error downloading chapters for {}: {}", source.id, e);
