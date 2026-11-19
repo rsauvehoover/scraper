@@ -34,11 +34,11 @@ use crate::web::app::AppState;
 pub struct DownloadQuery {
     /// `?stripped=1` serves the colour-stripped variant.
     #[serde(default)]
-    stripped: Option<String>,
+    pub(super) stripped: Option<String>,
 }
 
 impl DownloadQuery {
-    fn strip_colour(&self) -> bool {
+    pub(super) fn strip_colour(&self) -> bool {
         matches!(self.stripped.as_deref(), Some("1") | Some("true"))
     }
 }
@@ -264,7 +264,7 @@ pub(crate) fn build_chapter(
 
 /// A fresh query-only handle: rusqlite Connections are not Sync, so a
 /// blocking task opens its own rather than borrowing the registry's.
-fn open(source_id: &str) -> Result<crate::db::SourceDatabase, BuildError> {
+pub(super) fn open(source_id: &str) -> Result<crate::db::SourceDatabase, BuildError> {
     crate::db::SourceDatabase::open_query_only(source_id).map_err(|e| {
         eprintln!("opening database for {} failed: {}", source_id, e);
         BuildError::Internal

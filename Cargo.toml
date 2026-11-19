@@ -73,6 +73,8 @@ axum = "0.8.9"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "limit"] }
 maud = { version = "0.27.0", features = ["axum"] }
 ammonia = "4.1.4"
+futures-util = "0.3.31"
+zip = "9.0.5"
 base64 = "0.22.1"
 argon2 = "0.6.0"
 rand = "0.10.2"
@@ -85,5 +87,4 @@ form_urlencoded = "1.2.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serial_test = "4.0.1"
 tempfile = "3"
-zip = "9.0.5"
 tower = { version = "0.5.3", features = ["util"] }

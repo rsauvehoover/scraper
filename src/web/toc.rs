@@ -50,6 +50,17 @@ pub async fn source_toc(
                 p class="summary" {
                     (stat.total_chapters) " chapters, "
                     (format_thousands(stat.total_words)) " words"
+                    // Every EPUB the page offers, in one archive: chapters
+                    // for manga, volumes for a serial. Streamed, so it is
+                    // offered even for a series of gigabytes.
+                    @if stat.total_chapters > 0 {
+                        " · "
+                        a href={ "/source/" (source_id) "/epubs.zip" } { "All EPUBs (zip)" }
+                        @if !manga {
+                            " · "
+                            a href={ "/source/" (source_id) "/epubs.zip?stripped=1" } { "All EPUBs (zip, no colour)" }
+                        }
+                    }
                 }
                 @if !manga {
                     // Hidden until toc_folds.js runs, so a reader without
