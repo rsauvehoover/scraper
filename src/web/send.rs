@@ -59,7 +59,7 @@ pub async fn send_submit(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs), !entry.config.is_manga());
+    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs));
     let planned = match send_plan::plan(&resolved.items, &mail, field(&pairs, "config"), &send_plan::choices(&pairs)) {
         Ok(p) => p,
         Err(refusal) => return render(&state, &headers, &source_id, &pairs, Some(refusal)),
@@ -71,6 +71,7 @@ pub async fn send_submit(
 
     // Nothing between `try_start` and the spawn may fail or return early: an
     // unspawned job never finishes and blocks every later send until restart.
+    let max_attachment_bytes = mail.max_attachment_bytes();
     let mailer = (state.mailer)(mail);
     tokio::spawn(run_job(
         Arc::clone(&state.sends),
@@ -80,6 +81,7 @@ pub async fn send_submit(
         mailer,
         build_item,
         Arc::clone(&state.epub_permits),
+        max_attachment_bytes,
     ));
     (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/send/{}", id))]).into_response()
 }
@@ -176,7 +178,7 @@ fn render(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs), !entry.config.is_manga());
+    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs));
     let csrf = session_token(headers)
         .and_then(|t| state.sessions.csrf_for(&t))
         .unwrap_or_default();

@@ -19,21 +19,19 @@ impl Default for Attachment {
     }
 }
 
-/// Send to Kindle rejects attachments over about 50 MB; stay under it.
-pub const MAX_ATTACHMENT_BYTES: usize = 45 * 1024 * 1024;
-
-pub fn attachment_too_large(attachment: &Attachment) -> bool {
-    attachment.bytes.len() > MAX_ATTACHMENT_BYTES
+pub fn attachment_too_large(attachment: &Attachment, limit_bytes: usize) -> bool {
+    attachment.bytes.len() > limit_bytes
 }
 
 /// Sends unless the attachment is over the limit, which is reported and skipped.
 async fn send_epub_guarded(config: &MailConfig, dest: &UserConfig, attachment: &Attachment) {
-    if attachment_too_large(attachment) {
+    let limit = config.max_attachment_bytes();
+    if attachment_too_large(attachment, limit) {
         eprintln!(
             "error: {} is {} bytes, over the {} byte send limit; not sent",
             attachment.filename,
             attachment.bytes.len(),
-            MAX_ATTACHMENT_BYTES
+            limit
         );
         return;
     }
@@ -275,10 +273,10 @@ mod tests {
 
     #[test]
     fn the_limit_is_inclusive() {
-        let at = Attachment { filename: "a.epub".into(), mime: "application/epub+zip".into(), bytes: vec![0; MAX_ATTACHMENT_BYTES] };
-        assert!(!attachment_too_large(&at));
-        let over = Attachment { bytes: vec![0; MAX_ATTACHMENT_BYTES + 1], ..at };
-        assert!(attachment_too_large(&over));
+        let at = Attachment { filename: "a.epub".into(), mime: "application/epub+zip".into(), bytes: vec![0; 4096] };
+        assert!(!attachment_too_large(&at, 4096));
+        let over = Attachment { bytes: vec![0; 4097], ..at };
+        assert!(attachment_too_large(&over, 4096));
     }
 
     #[test]
@@ -310,6 +308,7 @@ mod tests {
             password: "synthetic-pw-918273".into(),
             smtp_hostname: "smtp.example.com".into(),
             smtp_port: 587,
+            max_attachment_mb: 17,
             destinations: vec![],
         });
         assert!(!format!("{:?}", mailer).contains("synthetic-pw-918273"));

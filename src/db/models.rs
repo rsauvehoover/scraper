@@ -16,6 +16,18 @@ pub struct Volume {
     pub name: String,
 }
 
+/// Which EPUB regeneration flags `store_chapter_content` sets to whether the
+/// HTML changed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegenerateFlags {
+    /// Neither the chapter's nor its volume's flag is touched
+    Untouched,
+    /// Only the chapter's flag
+    ChapterOnly,
+    /// The chapter's and its volume's flags
+    ChapterAndVolume,
+}
+
 /// An image downloaded for a chapter, stored in the source database
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChapterImage {

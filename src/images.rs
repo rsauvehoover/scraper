@@ -36,8 +36,8 @@ fn fit_dimensions(w: u32, h: u32, limits: &ImagesConfig) -> (u32, u32) {
 }
 
 /// Decode `bytes`, downscale to fit `limits`, and re-encode as JPEG, or PNG
-/// when the image has real transparency. JPEG and PNG inputs that already fit
-/// are returned unchanged. Animated formats keep their first frame.
+/// when the image has real transparency. A JPEG that already fits is returned
+/// unchanged; every other format is re-encoded. Animated formats keep their first frame.
 pub fn process_image(bytes: &[u8], limits: &ImagesConfig) -> Result<ProcessedImage, ScrapeError> {
     let reader = image::io::Reader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -47,21 +47,14 @@ pub fn process_image(bytes: &[u8], limits: &ImagesConfig) -> Result<ProcessedIma
     let (w, h) = (img.width(), img.height());
     let fits = w <= limits.max_width && h <= limits.max_height;
 
-    if fits {
-        let passthrough = match format {
-            Some(ImageFormat::Jpeg) => Some(("image/jpeg", "jpg")),
-            Some(ImageFormat::Png) => Some(("image/png", "png")),
-            _ => None,
-        };
-        if let Some((mime, ext)) = passthrough {
-            return Ok(ProcessedImage {
-                bytes: bytes.to_vec(),
-                mime,
-                ext,
-                width: w,
-                height: h,
-            });
-        }
+    if fits && format == Some(ImageFormat::Jpeg) {
+        return Ok(ProcessedImage {
+            bytes: bytes.to_vec(),
+            mime: "image/jpeg",
+            ext: "jpg",
+            width: w,
+            height: h,
+        });
     }
 
     let img = if fits {
@@ -162,13 +155,26 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_and_png_that_fit_pass_through_unchanged() {
+    fn only_a_fitting_jpeg_passes_through_unchanged() {
         let j = jpeg(800, 1200);
         let out = process_image(&j, &limits()).unwrap();
         assert_eq!(out.bytes, j);
         assert_eq!((out.mime, out.width, out.height), ("image/jpeg", 800, 1200));
+    }
+
+    #[test]
+    fn a_fitting_opaque_png_becomes_jpeg() {
+        let out = process_image(&png(500, 700, false), &limits()).unwrap();
+        assert_eq!((out.mime, out.ext, out.width, out.height), ("image/jpeg", "jpg", 500, 700));
+        assert_eq!(image::guess_format(&out.bytes).unwrap(), image::ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn a_fitting_translucent_png_stays_png_but_is_re_encoded() {
         let p = png(50, 50, true);
-        assert_eq!(process_image(&p, &limits()).unwrap().bytes, p);
+        let out = process_image(&p, &limits()).unwrap();
+        assert_eq!(out.mime, "image/png");
+        assert_eq!(image::guess_format(&out.bytes).unwrap(), image::ImageFormat::Png);
     }
 
     #[test]

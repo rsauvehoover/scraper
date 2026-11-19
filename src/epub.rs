@@ -342,19 +342,31 @@ pub fn build_volume_epub(
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
+    let manga = ctx.source.is_manga();
+    // Without a configured cover, a manga batch uses the first page of its
+    // first chapter with data, at its own path and added only once.
+    let mut page_cover_pending = manga;
     if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &volume.name) {
         epub.add_cover_image(
             format!("{}.png", &safe_volume_name),
             img_bytes.as_slice(),
             "image/png",
         )?;
+        page_cover_pending = false;
     }
 
     epub.inline_toc();
 
     let last_chapter_id = chapters.last().ok_or("No chapters found")?.id;
+    let mut added = 0;
     for chapter in chapters {
         let raw_data = match db.get_chapter_data(chapter.id) {
+            // A manga batch may hold a chapter not yet downloaded anywhere in
+            // it; a text volume tolerates that only for its last chapter.
+            Err(rusqlite::Error::QueryReturnedNoRows) if manga => {
+                println!("  No data for chapter ({}), skipping it.", chapter.name);
+                continue;
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) if chapter.id == last_chapter_id => {
                 println!(
                     "  Failed to fetch data for last chapter ({}), assuming unreleased content.",
@@ -368,7 +380,18 @@ pub fn build_volume_epub(
 
         let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
-        add_chapter_images(&mut epub, db, chapter.id)?;
+        if page_cover_pending {
+            let images = db.get_chapter_images(chapter.id)?;
+            if let Some((first, rest)) = images.split_first() {
+                epub.add_cover_image(&first.path, first.data.as_slice(), &first.mime)?;
+                page_cover_pending = false;
+                for img in rest {
+                    epub.add_resource(&img.path, img.data.as_slice(), &img.mime)?;
+                }
+            }
+        } else {
+            add_chapter_images(&mut epub, db, chapter.id)?;
+        }
         epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, sanitize_filename(&chapter.name)),
@@ -376,6 +399,11 @@ pub fn build_volume_epub(
             )
             .title(&chapter.name),
         )?;
+        added += 1;
+    }
+    // A manga batch whose chapters are all pending would be an empty book.
+    if manga && added == 0 {
+        return Err(format!("No downloaded chapters in {}", volume.name).into());
     }
 
     epub.generate(&mut output)?;
@@ -457,13 +485,7 @@ pub(crate) fn build_epubs_for_source(
     let mut chaps = Vec::<Attachment>::new();
     let mut chaps_stripped = Vec::<Attachment>::new();
 
-    if config.epub_gen.volumes && source.is_manga() {
-        println!("({}) Manga source: no volume epubs", source.id);
-        // Clear the flags anyway so they do not pile up for a build that never happens.
-        for volume in db.get_volumes_to_regenerate()? {
-            db.update_generated_volume(volume.id, false)?;
-        }
-    } else if config.epub_gen.volumes {
+    if config.epub_gen.volumes {
         let volumes = db.get_volumes_to_regenerate()?;
 
         if volumes.is_empty() {
@@ -479,7 +501,8 @@ pub(crate) fn build_epubs_for_source(
         for volume in volumes {
             println!("({}) Generating epub for {}", source.id, volume.name);
             let chapters = db.get_chapters_by_volume(volume.id)?;
-            if config.epub_gen.strip_colour {
+            // Manga batches get a plain EPUB only, like manga chapters.
+            if config.epub_gen.strip_colour && !source.is_manga() {
                 let stripped = generate_volume(
                     db,
                     &volume,
@@ -769,7 +792,7 @@ mod tests {
             height: 1,
             data: vec![byte; 3],
         };
-        db.store_chapter_content(id, &html, &[img], true).unwrap();
+        db.store_chapter_content(id, &html, &[img], crate::db::RegenerateFlags::ChapterAndVolume).unwrap();
         path
     }
 
@@ -857,7 +880,7 @@ mod tests {
                 data: one_by_one_png(),
             };
             let html = pages_html(&source, &chapter.name, &[path]);
-            db.store_chapter_content(chapter.id, &html, &[image], true).unwrap();
+            db.store_chapter_content(chapter.id, &html, &[image], crate::db::RegenerateFlags::ChapterAndVolume).unwrap();
         }
         (db, source)
     }
@@ -880,22 +903,107 @@ mod tests {
         assert!(opf.contains("<meta name=\"cover\""), "{}", opf);
     }
 
-    #[tokio::test]
-    async fn manga_source_builds_only_plain_chapter_epubs_whatever_the_flags_say() {
+    /// Store one PNG page for a manga chapter, flagging only the chapter.
+    fn store_manga_page(db: &SourceDatabase, source: &SourceConfig, chapter: &Chapter) {
+        let path = format!("images/{}-0.png", chapter.id);
+        let image = ChapterImage {
+            chapter_id: chapter.id,
+            seq: 0,
+            path: path.clone(),
+            source_url: format!("https://example.com/{}.png", chapter.id),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            data: one_by_one_png(),
+        };
+        let html = pages_html(source, &chapter.name, &[path]);
+        db.store_chapter_content(chapter.id, &html, &[image], crate::db::RegenerateFlags::ChapterOnly)
+            .unwrap();
+    }
+
+    #[test]
+    fn manga_volume_with_only_pending_chapters_is_an_error() {
         let (db, source) = manga_db_with_two_chapters();
+        let volume = Volume { id: db.add_volume("Volume 2").unwrap(), name: "Volume 2".into() };
+        db.add_chapter("C3", "https://example.com/c3", volume.id).unwrap();
+        let chapters = db.get_chapters_by_volume(volume.id).unwrap();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+
+        let result = build_volume_epub(&db, &volume, &chapters, &ctx, false);
+
+        assert_eq!(result.err().map(|e| e.to_string()), Some("No downloaded chapters in Volume 2".to_string()));
+    }
+
+    #[test]
+    fn manga_source_builds_plain_chapter_and_batch_epubs_only() {
+        let (db, source) = manga_db_with_two_chapters();
+        let v1 = db.add_volume("Example Series").unwrap();
+        db.update_generated_volume(v1, true).unwrap();
+        // A second batch, still open: a pending chapter followed by a stored one.
+        let v2 = db.add_volume("Volume 2").unwrap();
+        db.add_chapter("C3", "https://example.com/c3", v2).unwrap();
+        db.add_chapter("C4", "https://example.com/c4", v2).unwrap();
+        let v2_chapters = db.get_chapters_by_volume(v2).unwrap();
+        store_manga_page(&db, &source, &v2_chapters[1]);
+        db.update_generated_volume(v2, false).unwrap();
+
         let mut config = Config::default();
         config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
         config.mail.destinations.clear();
         let build = tempfile::tempdir().unwrap();
-        generate_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
-            .await
+        build_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
             .unwrap();
+
         let root = build.path().join(&source.id);
-        assert_eq!(std::fs::read_dir(root.join("chapters/individual")).unwrap().count(), 2);
+        assert!(root.join("volumes/Example Series.epub").exists());
+        assert!(!root.join("volumes/Volume 2.epub").exists());
+        assert!(!root.join("volumes_stripped_colour").exists());
+        assert_eq!(std::fs::read_dir(root.join("chapters/individual")).unwrap().count(), 3);
         assert!(!root.join("chapters/combined").exists());
         assert!(!root.join("chapters_stripped_colour").exists());
-        assert!(!root.join("volumes").exists() && !root.join("volumes_stripped_colour").exists());
         assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manga_batch_skips_a_pending_chapter_in_the_middle_and_uses_the_first_page_as_cover() {
+        let source = SourceConfig {
+            id: "manga-test".into(),
+            name: "Example Series".into(),
+            kind: SourceKind::MangaTcb,
+            ..Default::default()
+        };
+        let db = SourceDatabase::open_in_memory(&source.id).unwrap();
+        let vol = db.add_volume("Volume 1").unwrap();
+        for name in ["C1", "C2", "C3"] {
+            db.add_chapter(name, &format!("https://example.com/{}", name), vol).unwrap();
+        }
+        let chapters = db.get_chapters_by_volume(vol).unwrap();
+        store_manga_page(&db, &source, &chapters[0]);
+        store_manga_page(&db, &source, &chapters[2]);
+        let (c1, c3) = (chapters[0].id, chapters[2].id);
+        let volume = Volume { id: vol, name: "Volume 1".to_string() };
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+
+        let epub = build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+
+        assert!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}(C1).xhtml", c1)).is_some());
+        assert!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}(C3).xhtml", c3)).is_some());
+        let z = zip::ZipArchive::new(std::io::Cursor::new(epub.bytes.as_slice())).unwrap();
+        let names: Vec<&str> = z.file_names().collect();
+        assert!(!names.iter().any(|n| n.contains("(C2)")), "{:?}", names);
+        let first_page = format!("OEBPS/images/{}-0.png", c1);
+        assert_eq!(names.iter().filter(|n| **n == first_page).count(), 1, "{:?}", names);
+        let opf =
+            String::from_utf8(read_zip_entry(&epub.bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains("<meta name=\"cover\""), "{}", opf);
+        let cover_item = opf
+            .lines()
+            .find(|l| l.contains("<item") && l.contains("id=\"cover-image\""))
+            .unwrap_or_else(|| panic!("no cover item: {}", opf));
+        assert!(cover_item.contains(&format!("href=\"images/{}-0.png\"", c1)), "{}", opf);
     }
 
     #[tokio::test]
