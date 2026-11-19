@@ -1,6 +1,6 @@
 [workspace]
-# Binary crate, not published to crates.io
-publish = false
+# Binary crate, not on crates.io: versions come from the git tags, not the registry
+git_only = true
 git_release_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true

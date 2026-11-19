@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0](https://github.com/rsauvehoover/scraper/releases/tag/v2.7.0) - 2026-11-19
+
+### Added
+
+- manga batches, jpeg pages, gmail limit ([#33](https://github.com/rsauvehoover/scraper/pull/33))
+- manga sources for tcb and wordpress sites ([#31](https://github.com/rsauvehoover/scraper/pull/31))
+- embed chapter images in epubs ([#30](https://github.com/rsauvehoover/scraper/pull/30))
+
+### Fixed
+
+- manga tests on zip 9 file_names ([#36](https://github.com/rsauvehoover/scraper/pull/36))
+- zip 9 everywhere, vendor epub-builder ([#34](https://github.com/rsauvehoover/scraper/pull/34))
+
+### Other
+
+- bump imageproc from 0.23.0 to 0.23.1 ([#32](https://github.com/rsauvehoover/scraper/pull/32))
+- attach the .deb to an existing release by hand ([#29](https://github.com/rsauvehoover/scraper/pull/29))
+
 ## [2.6.1](https://github.com/rsauvehoover/scraper/releases/tag/v2.6.1) - 2026-10-09
 
 ### Added
