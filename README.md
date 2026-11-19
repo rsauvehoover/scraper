@@ -447,10 +447,61 @@ Create a `config.json` file with the following structure:
         "Description": "A great web serial"
       },
       "PostProcessors": ["strip-links"]
+    },
+
+    // Manga source on a TCB-style site: TocUrl is the series project page.
+    // "Kind" picks the scraper and wins over the id-prefix rule.
+    // "StartChapter" drops chapters numbered below it before they are indexed.
+    // Selectors.ChapterPattern (optional) defaults to "chapter-([0-9]+(?:\.[0-9]+)?)"
+    // and is applied to the chapter link URL; links that do not match are skipped.
+    {
+      "Id": "tcb-example-series",
+      "Name": "Example Series",
+      "Kind": "manga-tcb",
+      "Enabled": false,
+      "TocUrl": "https://tcbonepiecechapters.com/mangas/5/one-piece",
+      "StartChapter": 1198,
+      "Auth": { "Type": "None" },
+      "Metadata": { "Author": "Author Name" }
+    },
+
+    // Manga source on a WordPress comic site: TocUrl is the site home page.
+    // Chapters come from the latest-comics widget unless Selectors.ChapterEntry is set.
+    // Pages are the images under Selectors.MainContent (default "entry-content").
+    {
+      "Id": "wp-example-series",
+      "Name": "Example WordPress Series",
+      "Kind": "manga-wordpress",
+      "Enabled": false,
+      "TocUrl": "https://steel-ball-run.com/",
+      "Auth": { "Type": "None" },
+      "Metadata": { "Author": "Author Name" }
     }
   ]
 }
 ```
+
+### Manga sources
+
+A source with `"Kind": "manga-tcb"` or `"Kind": "manga-wordpress"` is a manga source. `Kind` selects the scraper before the id-prefix rule is considered.
+
+- `manga-tcb`: `TocUrl` is the series project page; chapters are the `/chapters/{id}/{slug}` links and pages are the `img.fixed-ratio-content` images.
+- `manga-wordpress`: `TocUrl` is the site home page; chapters come from the `ceo_latest_comics_widget` list (override with `Selectors.ChapterEntry`) and pages are the `<img>` tags under `Selectors.MainContent`, skipping theme and upload graphics.
+- The chapter number is the first capture group of `Selectors.ChapterPattern` applied to the link URL. The default is `chapter-([0-9]+(?:\.[0-9]+)?)`. Links that do not match are not chapters.
+- `StartChapter` drops chapters numbered below it before they are indexed.
+
+Behaviour:
+
+- One EPUB per chapter. There are no volume EPUBs, combined files or colour-stripped variants, and the web TOC shows no volume links.
+- Colour is kept and pages are scaled according to the `Images` block.
+- A chapter page with no images counts as not yet available and is retried on the next run.
+- With no `CoverImage` set, the first stored page becomes the cover.
+
+Rollout:
+
+1. For a finished series, add the source with no destination listing it and run the scraper. Everything downloads and nothing is sent. Then send chapters by hand from the web frontend.
+2. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape, so only chapters released later are sent.
+3. A chapter that failed during the backfill and succeeds on a later run counts as new and is mailed. Wait for a clean run before adding the source to a destination.
 
 ### Minimal Configuration
 
