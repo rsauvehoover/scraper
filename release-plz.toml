@@ -1,6 +1,8 @@
 [workspace]
 # Binary crate, not on crates.io: versions come from the git tags, not the registry
 git_only = true
+# The lib target exists for tests, nobody depends on it: an API change is not a major bump
+semver_check = false
 git_release_enable = true
 git_tag_name = "v{{ version }}"
 changelog_update = true
