@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::config::SourceConfig;
 use crate::error::{ScrapeError, ScrapeResult};
 
+use super::content_images::{extract_images, unwrap_image_links};
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
 
 /// Volume data from Royal Road's JavaScript
@@ -266,7 +267,7 @@ impl SourceScraper for RoyalRoadScraper {
         );
 
         let chapter_heading = format!("<h1>{}</h1>", chapter_title);
-        let body = content.display();
+        let (body, images) = extract_images(&unwrap_image_links(&content.display()));
         let footer = "</body></html>";
 
         let full_html = format!("{}\n{}\n{}\n{}\n", header, chapter_heading, body, footer);
@@ -277,6 +278,7 @@ impl SourceScraper for RoyalRoadScraper {
             is_patreon_only: false, // Royal Road doesn't have Patreon-only chapters in the same way
             next_chapter_url,
             next_chapter_title,
+            images,
         })
     }
 
@@ -295,5 +297,21 @@ impl SourceScraper for RoyalRoadScraper {
 
     fn post_processors(&self) -> &[String] {
         &self.config.post_processors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_chapter_lists_images_and_normalises_their_tags() {
+        let cfg = SourceConfig::default();
+        let scraper = RoyalRoadScraper::new(cfg);
+        let html = r#"<html><head><title>T</title></head><body><div class="chapter-content"><p>x</p><a href="/f"><img src="https://example.com/a.png?w=1" alt="art"></a></div></body></html>"#;
+        let c = scraper.parse_chapter(html, "Ch").await.unwrap();
+        assert_eq!(c.images, vec!["https://example.com/a.png"]);
+        assert!(c.html.contains(r#"<img src="https://example.com/a.png" alt="art" style="max-width:100%;height:auto"/>"#));
+        assert!(!c.html.contains("<a href=\"/f\""));
     }
 }

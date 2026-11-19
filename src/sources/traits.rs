@@ -21,6 +21,8 @@ pub struct ChapterContent {
     pub next_chapter_url: Option<String>,
     /// Title of next chapter (if available)
     pub next_chapter_title: Option<String>,
+    /// Image fetch URLs found in `html`, in document order, each unique
+    pub images: Vec<String>,
 }
 
 /// Trait for source scrapers
