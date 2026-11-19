@@ -84,4 +84,5 @@ form_urlencoded = "1.2.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serial_test = "4.0.1"
 tempfile = "3"
+zip = "6"
 tower = { version = "0.5.3", features = ["util"] }
