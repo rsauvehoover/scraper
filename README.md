@@ -329,9 +329,9 @@ Create a `config.json` file with the following structure:
   "RequestDelay": 1000,
 
   // Image handling for every source (defaults shown). Pages and chapter
-  // images are scaled down to fit these bounds, never up. Every image that
-  // is not translucent is stored as JPEG at JpegQuality; only a JPEG that
-  // already fits the bounds is stored untouched.
+  // images are scaled down to fit these bounds, never up. Images are stored
+  // as JPEG at JpegQuality (a translucent one as PNG, except manga pages, which
+  // are flattened onto white). A fitting JPEG is stored untouched; a fitting PNG is kept when it is smaller.
   "Images": {
     "MaxWidth": 2528,      // Two Kindle screen widths, so a double-page spread keeps detail
     "MaxHeight": 1680,     // Kindle Colorsoft / Paperwhite screen height
@@ -495,7 +495,7 @@ A source with `"Kind": "manga-tcb"` or `"Kind": "manga-wordpress"` is a manga so
 
 Behaviour:
 
-- Colour is kept; pages are scaled and re-encoded as JPEG according to the `Images` block (a JPEG that already fits is stored untouched).
+- Colour is kept; pages are scaled and re-encoded as JPEG according to the `Images` block, with any alpha channel flattened onto white. A page that already fits is stored untouched when that is smaller.
 - Every chapter sits in one volume named after the source. That volume is never built or sent: manga chapters go out one at a time, to destinations with `SendIndividualChapters`.
 - A chapter EPUB larger than `Mail.MaxAttachmentMb` is refused by the send guard and logged. Pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`; a full-colour series measured 15 to 41 MB per chapter with its pages stored untouched.
 - The web frontend lists a manga source as a flat chapter list with a send checkbox and an EPUB link per downloaded chapter. There is no volume EPUB.

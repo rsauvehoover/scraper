@@ -139,7 +139,7 @@ Shared behaviour:
 - `StartChapter` drops lower-numbered chapters before they are indexed
 - Every chapter of a manga source sits in one volume named after the source. That volume is never flagged, built or sent; the web TOC lists the source as a flat chapter list and only chapters can be ticked
 - Chapters go to destinations with `SendIndividualChapters`. A chapter EPUB over `Mail.MaxAttachmentMb` is refused by the send guard and logged; pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`
-- Stored images are JPEG at `Images.JpegQuality` unless translucent; a JPEG that already fits the limits is stored untouched
+- Stored images are JPEG at `Images.JpegQuality`; a translucent image stays PNG for text sources and is flattened onto white for manga. A JPEG that already fits the limits is stored untouched, and a fitting PNG is kept when it is smaller than its re-encode
 - A chapter page with zero images is "not yet available" and retried next run
 - A database from the batch design (volumes named `Volume N`) is collapsed into the series volume by the next run's index step; the collapse sets no flag
 - Rollout for a finished series: add the source with no destination listing it, run the scraper, then tick chapters on the web frontend's send page. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape; wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
