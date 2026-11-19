@@ -5,9 +5,10 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use maud::{html, PreEscaped};
+use maud::{html, Markup, PreEscaped};
 use serde::Deserialize;
 
+use crate::stats::cache::ChapterStat;
 use crate::web::app::AppState;
 use crate::web::sanitize::sanitize_chapter;
 use crate::web::views::page;
@@ -37,8 +38,9 @@ pub async fn source_toc(
             return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
         }
     };
-    // A manga source's batches list like volumes, but it has no colour
-    // variant, so it gets no "EPUB (no colour)" link.
+    // A manga source keeps every chapter in one volume that is never built
+    // or sent, so its page is a flat chapter list: no fold, no volume
+    // checkbox, no volume EPUB link.
     let manga = entry.config.is_manga();
 
     page(
@@ -49,17 +51,28 @@ pub async fn source_toc(
                     (stat.total_chapters) " chapters, "
                     (format_thousands(stat.total_words)) " words"
                 }
-                // Hidden until toc_folds.js runs, so a reader without
-                // JavaScript is not offered a button that does nothing.
-                button type="button" id="toggle-volumes" class="toggle-all"
-                       aria-controls="volumes" hidden { "Collapse all" }
+                @if !manga {
+                    // Hidden until toc_folds.js runs, so a reader without
+                    // JavaScript is not offered a button that does nothing.
+                    button type="button" id="toggle-volumes" class="toggle-all"
+                           aria-controls="volumes" hidden { "Collapse all" }
+                }
             }
+            form id="send-pick" method="get" action={ "/source/" (source_id) "/send" } {
+            @if manga {
+                ol class="chapters" {
+                    @for volume in &stat.volumes {
+                        @for chapter in &volume.chapters {
+                            (chapter_row(&source_id, chapter))
+                        }
+                    }
+                }
+            } @else {
             // Each volume folds natively. Its heading and its counts and
             // download links are the summary, so they stay visible and usable
             // with the volume folded. The newest volume starts open; the script
             // then applies whatever this reader left open last time, stored
             // under this series' id.
-            form id="send-pick" method="get" action={ "/source/" (source_id) "/send" } {
             div id="volumes" data-storage-key={ "toc-open:" (source_id) } {
             @for (i, volume) in stat.volumes.iter().enumerate() {
                 // Volumes are listed by id, so the last is the newest, the same
@@ -89,56 +102,28 @@ pub async fn source_toc(
                         }
                         " · "
                         a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
-                        @if !manga {
-                            " · "
-                            a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
-                                "EPUB (no colour)"
-                            }
+                        " · "
+                        a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
+                            "EPUB (no colour)"
                         }
                     }
                     }
                     ol class="chapters" {
                         @for chapter in &volume.chapters {
-                            li {
-                                @if chapter.downloaded {
-                                    input type="checkbox" class="pick" name="c" value=(chapter.id)
-                                          aria-label={ "Select " (chapter.name) };
-                                }
-                                a href={ "/source/" (source_id) "/chapter/" (chapter.id) } {
-                                    (chapter.name)
-                                }
-                                // A pending chapter has `words: 0`, same as a
-                                // genuinely empty one — `downloaded` is what
-                                // tells them apart, so the TOC must not
-                                // render both as "0 words".
-                                @if chapter.downloaded {
-                                    span class="words" { (format_thousands(chapter.words)) " words" }
-                                } @else {
-                                    span class="words pending" { "pending" }
-                                }
-                                @if let Some(published) = &chapter.published {
-                                    span class="date" { (published) }
-                                }
-                                // A pending chapter has no `raw_data` row, so
-                                // its EPUB link would 404 (`chapter_epub`
-                                // rejects it deliberately) — don't offer a
-                                // link that cannot work.
-                                @if chapter.downloaded {
-                                    a class="dl" href={
-                                        "/source/" (source_id) "/chapter/" (chapter.id) "/epub"
-                                    } { "EPUB" }
-                                }
-                            }
+                            (chapter_row(&source_id, chapter))
                         }
                     }
                 }
+            }
             }
             }
             // The selection is the query string of this form, so sending
             // needs no script. With script, send_select.js hides the bar
             // until something is ticked and says what.
             div class="send-bar" id="send-bar" {
-                span class="count" id="send-count" { "Tick volumes or chapters to send them." }
+                span class="count" id="send-count" {
+                    @if manga { "Tick chapters to send them." } @else { "Tick volumes or chapters to send them." }
+                }
                 button type="button" id="send-clear" class="toggle-all" hidden { "Clear" }
                 button type="submit" id="send-open" { "Send selected" }
             }
@@ -392,6 +377,41 @@ pub fn format_thousands(n: usize) -> String {
     out
 }
 
+/// One chapter's line in a listing: checkbox, link, size or "pending", date,
+/// and an EPUB link, the last two only once the chapter is downloaded.
+fn chapter_row(source_id: &str, chapter: &ChapterStat) -> Markup {
+    html! {
+        li {
+            @if chapter.downloaded {
+                input type="checkbox" class="pick" name="c" value=(chapter.id)
+                      aria-label={ "Select " (chapter.name) };
+            }
+            a href={ "/source/" (source_id) "/chapter/" (chapter.id) } {
+                (chapter.name)
+            }
+            // A pending chapter has `words: 0`, same as a genuinely empty
+            // one — `downloaded` is what tells them apart, so the TOC must
+            // not render both as "0 words".
+            @if chapter.downloaded {
+                span class="words" { (format_thousands(chapter.words)) " words" }
+            } @else {
+                span class="words pending" { "pending" }
+            }
+            @if let Some(published) = &chapter.published {
+                span class="date" { (published) }
+            }
+            // A pending chapter has no `raw_data` row, so its EPUB link
+            // would 404 (`chapter_epub` rejects it deliberately) — don't
+            // offer a link that cannot work.
+            @if chapter.downloaded {
+                a class="dl" href={
+                    "/source/" (source_id) "/chapter/" (chapter.id) "/epub"
+                } { "EPUB" }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_thousands;
@@ -456,10 +476,11 @@ mod tests {
         assert!(body.contains("Folding volumes on the table-of-contents page."), "script missing");
     }
 
-    /// A manga source lists its batches like volumes: a checkbox and a plain
-    /// EPUB link, but no colour-stripped link.
+    /// A manga source is one flat chapter list: no fold, no volume checkbox
+    /// or EPUB link, no collapse button; a pending chapter is listed without
+    /// a checkbox.
     #[tokio::test]
-    async fn a_manga_source_offers_batches_but_no_colour_links() {
+    async fn a_manga_source_lists_chapters_flat() {
         use crate::config::{SourceConfig, SourceKind};
         use axum::extract::{Path as AxumPath, State};
         use std::sync::Arc;
@@ -469,25 +490,28 @@ mod tests {
             kind: SourceKind::MangaWordpress,
             ..Default::default()
         }]));
-        let vol_id = {
+        {
             let registry = state.registry.snapshot();
             let db = registry.get("test-source").unwrap().db();
-            let vol = db.add_volume("Volume 1").unwrap();
+            let vol = db.add_volume("Example Series").unwrap();
             db.add_chapter("Chapter", "https://example.com/c1", vol).unwrap();
+            db.add_chapter("Pending one", "https://example.com/c2", vol).unwrap();
             let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
             db.add_chapter_data(id, "<p>one two</p>").unwrap();
-            vol
-        };
+        }
 
         let body = body_of(
             super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
         )
         .await;
 
-        assert!(body.contains("name=\"v\""), "volume checkbox: {}", body);
-        assert!(body.contains(&format!("/volume/{}/epub\"", vol_id)), "plain EPUB link: {}", body);
-        assert!(!body.contains("stripped=1"), "no colour link: {}", body);
-        assert!(body.contains("name=\"c\""), "chapters stay selectable: {}", body);
+        assert!(!body.contains("name=\"v\""), "no volume checkbox: {}", body);
+        assert!(!body.contains("<details class=\"volume\""), "no fold: {}", body);
+        assert!(!body.contains("/volume/"), "no volume EPUB link: {}", body);
+        assert!(!body.contains("id=\"toggle-volumes\""), "no collapse button: {}", body);
+        assert_eq!(body.matches("name=\"c\"").count(), 1, "one checkbox per downloaded chapter: {}", body);
+        assert!(body.contains("Pending one") && body.contains(">pending<"), "pending chapter listed: {}", body);
+        assert!(body.contains("Tick chapters to send them."), "{}", body);
     }
 
     #[test]

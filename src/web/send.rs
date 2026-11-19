@@ -59,7 +59,7 @@ pub async fn send_submit(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs));
+    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs), entry.config.is_manga());
     let planned = match send_plan::plan(&resolved.items, &mail, field(&pairs, "config"), &send_plan::choices(&pairs)) {
         Ok(p) => p,
         Err(refusal) => return render(&state, &headers, &source_id, &pairs, Some(refusal)),
@@ -178,7 +178,7 @@ fn render(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs));
+    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs), entry.config.is_manga());
     let csrf = session_token(headers)
         .and_then(|t| state.sessions.csrf_for(&t))
         .unwrap_or_default();
@@ -231,7 +231,10 @@ fn form_body(
     let selection = Selection::parse(pairs);
     html! {
         @if resolved.items.is_empty() {
-            p class="note" { "Nothing is selected. Tick volumes or chapters on the contents page." }
+            p class="note" {
+                @if manga { "Nothing is selected. Tick chapters on the contents page." }
+                @else { "Nothing is selected. Tick volumes or chapters on the contents page." }
+            }
         } @else {
             form id="send-form" method="post" action={ "/source/" (source_id) "/send" } {
                 h2 { "What will be sent" }
