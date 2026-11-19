@@ -949,6 +949,27 @@ mod tests {
             build_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
                 .unwrap();
         assert_eq!(built.chaps.len(), 2);
+        assert!(built.vols.is_empty() && built.vols_stripped.is_empty(), "a manga volume is never an attachment");
         assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+    }
+
+    /// The manga skip must not reach text sources: their flagged volumes
+    /// still build, in both variants.
+    #[test]
+    fn text_source_still_builds_its_volumes() {
+        let (db, _volume, _chapters) = fixture_db();
+        let source = SourceConfig { id: "test-source".into(), ..Default::default() };
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1, "fixture flags the volume");
+        let mut config = Config::default();
+        config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
+        config.mail.destinations.clear();
+        let build = tempfile::tempdir().unwrap();
+
+        build_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new()).unwrap();
+
+        let root = build.path().join(&source.id);
+        assert!(root.join("volumes/Volume 1.epub").exists());
+        assert!(root.join("volumes_stripped_colour/Volume 1.epub").exists());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
     }
 }

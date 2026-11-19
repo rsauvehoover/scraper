@@ -578,5 +578,16 @@ mod tests {
         assert!(matches!(build_chapter(&source, pending, false), Err(BuildError::NotFound(_))));
         assert!(matches!(build_chapter(&source, 999_999, false), Err(BuildError::NotFound(_))));
         assert!(matches!(build_volume(&source, 999_999, false), Err(BuildError::NotFound(_))));
+
+        // The send job builds through this function too, so the manga
+        // refusal must hold here and not only on the route.
+        let manga = SourceConfig {
+            kind: crate::config::SourceKind::MangaWordpress,
+            ..source.clone()
+        };
+        assert!(matches!(
+            build_volume(&manga, vol, false),
+            Err(BuildError::NotFound("Manga sources have no volume EPUBs"))
+        ));
     }
 }

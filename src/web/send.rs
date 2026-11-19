@@ -218,7 +218,8 @@ fn progress_link(state: &AppState) -> Markup {
     html! { " " a href={ "/send/" (job.id) } { "See its progress" } }
 }
 
-/// `manga` hides the colour choice: a manga source has no stripped variant.
+/// `manga` hides the colour choice (a manga source has no stripped variant)
+/// and words the empty-selection note for chapters only.
 fn form_body(
     source_id: &str,
     manga: bool,
