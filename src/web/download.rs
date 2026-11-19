@@ -477,9 +477,9 @@ mod tests {
             let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
             let name = z
                 .file_names()
+                .map(|n| n.unwrap().into_owned())
                 .find(|n| n.ends_with("(Chapter).xhtml"))
-                .unwrap()
-                .to_string();
+                .unwrap();
             let mut f = z.by_name(&name).unwrap();
             let mut out = String::new();
             std::io::Read::read_to_string(&mut f, &mut out).unwrap();

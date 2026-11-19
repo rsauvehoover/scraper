@@ -992,7 +992,7 @@ mod tests {
         assert!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}(C1).xhtml", c1)).is_some());
         assert!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}(C3).xhtml", c3)).is_some());
         let z = zip::ZipArchive::new(std::io::Cursor::new(epub.bytes.as_slice())).unwrap();
-        let names: Vec<&str> = z.file_names().collect();
+        let names: Vec<String> = z.file_names().map(|n| n.unwrap().into_owned()).collect();
         assert!(!names.iter().any(|n| n.contains("(C2)")), "{:?}", names);
         let first_page = format!("OEBPS/images/{}-0.png", c1);
         assert_eq!(names.iter().filter(|n| **n == first_page).count(), 1, "{:?}", names);
