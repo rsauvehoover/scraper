@@ -215,12 +215,15 @@ fn store_in_batch(
     budget: u64,
 ) -> rusqlite::Result<()> {
     let this_bytes: u64 = assembled.images.iter().map(|i| i.data.len() as u64).sum();
+    // Place and flag in one transaction, committed before storing: if the
+    // store then fails, the chapter waits in the new batch and no later run
+    // would close the old one.
+    let tx = db.connection().unchecked_transaction()?;
     let placement = place_in_batch(db, chapter_id, this_bytes, budget)?;
-    // Flag before storing: if the store then fails, the chapter waits in the
-    // new batch and no later run would close the old one.
     if let Some(closed) = placement.closed {
         db.update_generated_volume(closed, true)?;
     }
+    tx.commit()?;
     db.store_chapter_content(chapter_id, &assembled.html, &assembled.images, RegenerateFlags::ChapterOnly)
 }
 

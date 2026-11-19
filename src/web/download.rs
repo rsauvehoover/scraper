@@ -200,6 +200,9 @@ pub(crate) fn build_volume(
     if chapters.is_empty() {
         return Err(BuildError::NotFound("Volume has no chapters"));
     }
+    if !chapters.iter().any(|c| c.data_id.is_some()) {
+        return Err(BuildError::NotFound("Volume has no downloaded chapters"));
+    }
     let volume = crate::db::Volume { id: volume_id as isize, name: volume_name };
     let registry = ProcessorRegistry::new();
     let ctx = EpubContext { source, processor_registry: &registry };

@@ -358,6 +358,7 @@ pub fn build_volume_epub(
     epub.inline_toc();
 
     let last_chapter_id = chapters.last().ok_or("No chapters found")?.id;
+    let mut added = 0;
     for chapter in chapters {
         let raw_data = match db.get_chapter_data(chapter.id) {
             // A manga batch may hold a chapter not yet downloaded anywhere in
@@ -398,6 +399,11 @@ pub fn build_volume_epub(
             )
             .title(&chapter.name),
         )?;
+        added += 1;
+    }
+    // A manga batch whose chapters are all pending would be an empty book.
+    if manga && added == 0 {
+        return Err(format!("No downloaded chapters in {}", volume.name).into());
     }
 
     epub.generate(&mut output)?;
@@ -890,6 +896,20 @@ mod tests {
         let html = pages_html(source, &chapter.name, &[path]);
         db.store_chapter_content(chapter.id, &html, &[image], crate::db::RegenerateFlags::ChapterOnly)
             .unwrap();
+    }
+
+    #[test]
+    fn manga_volume_with_only_pending_chapters_is_an_error() {
+        let (db, source) = manga_db_with_two_chapters();
+        let volume = Volume { id: db.add_volume("Volume 2").unwrap(), name: "Volume 2".into() };
+        db.add_chapter("C3", "https://example.com/c3", volume.id).unwrap();
+        let chapters = db.get_chapters_by_volume(volume.id).unwrap();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+
+        let result = build_volume_epub(&db, &volume, &chapters, &ctx, false);
+
+        assert_eq!(result.err().map(|e| e.to_string()), Some("No downloaded chapters in Volume 2".to_string()));
     }
 
     #[test]
