@@ -746,7 +746,7 @@ mod tests {
             height: 1,
             data: vec![byte; 3],
         };
-        db.store_chapter_content(id, &html, &[img], true).unwrap();
+        db.store_chapter_content(id, &html, &[img], crate::db::RegenerateFlags::ChapterAndVolume).unwrap();
         path
     }
 
@@ -834,7 +834,7 @@ mod tests {
                 data: one_by_one_png(),
             };
             let html = pages_html(&source, &chapter.name, &[path]);
-            db.store_chapter_content(chapter.id, &html, &[image], true).unwrap();
+            db.store_chapter_content(chapter.id, &html, &[image], crate::db::RegenerateFlags::ChapterAndVolume).unwrap();
         }
         (db, source)
     }

@@ -494,7 +494,7 @@ impl ScraperClient {
                     continue;
                 }
                 Ok(f) => db
-                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, false)
+                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, crate::db::RegenerateFlags::Untouched)
                     .map_err(ScrapeError::from),
                 Err(e) => Err(e),
             };
@@ -598,7 +598,7 @@ impl ScraperClient {
         }
 
         let assembled = content.assembled;
-        db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, true)?;
+        db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, crate::db::RegenerateFlags::ChapterAndVolume)?;
 
         // Handle chapter discovery: if there's a next chapter URL, add it to the database
         let mut discovered = 0;
