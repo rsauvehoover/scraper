@@ -715,6 +715,7 @@ mod tests {
         let html = db.get_chapter_data(ch[0].id).unwrap();
         assert_eq!(html.matches("<img").count(), 1);
         assert!(html.contains(&imgs[0].path));
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
     }
 
     #[tokio::test]

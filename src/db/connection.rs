@@ -855,6 +855,32 @@ mod tests {
     }
 
     #[test]
+    fn flagged_store_sets_flags_on_new_and_changed_html() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        let clear = || {
+            db.update_generated_chapter(id, false).unwrap();
+            db.update_generated_volume(vol, false).unwrap();
+        };
+
+        db.store_chapter_content(id, "<a/>", &[], true).unwrap();
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1);
+        clear();
+
+        db.store_chapter_content(id, "<b/>", &[], true).unwrap();
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1);
+        clear();
+
+        db.store_chapter_content(id, "<b/>", &[], true).unwrap();
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[test]
     fn same_html_with_different_image_bytes_does_not_flag() {
         let db = test_db();
         let vol = db.add_volume("Volume 1").unwrap();
