@@ -170,6 +170,9 @@ pub struct Selectors {
     pub main_content: String,
     /// How to interpret the above selectors
     pub selector_type: SelectorType,
+    /// Regex matching a chapter number in a chapter URL (manga sources);
+    /// capture group 1 is the number
+    pub chapter_pattern: String,
 }
 
 impl Default for Selectors {
@@ -181,6 +184,7 @@ impl Default for Selectors {
             chapter_link: String::from("a"),
             main_content: String::from("main-content"),
             selector_type: SelectorType::Class,
+            chapter_pattern: String::from(r"chapter-([0-9]+(?:\.[0-9]+)?)"),
         }
     }
 }
@@ -276,6 +280,8 @@ pub struct SourceConfig {
     pub post_processors: Vec<String>,
     /// Kind of content this source serves
     pub kind: SourceKind,
+    /// First chapter number to download (manga sources); earlier chapters are skipped
+    pub start_chapter: Option<f64>,
 }
 
 impl Default for SourceConfig {
@@ -292,6 +298,7 @@ impl Default for SourceConfig {
             metadata: SourceMetadata::default(),
             post_processors: Vec::new(),
             kind: SourceKind::Text,
+            start_chapter: None,
         }
     }
 }
@@ -320,6 +327,7 @@ impl SourceConfig {
             },
             post_processors: vec![String::from("mrsha-write"), String::from("strip-links")],
             kind: SourceKind::Text,
+            start_chapter: None,
         }
     }
 
@@ -353,6 +361,7 @@ impl SourceConfig {
                 chapter_link: String::from("a"),
                 main_content: String::from("chapter-content"),
                 selector_type: SelectorType::Class,
+                ..Selectors::default()
             },
             auth: AuthConfig::None,
             metadata: SourceMetadata {
@@ -362,6 +371,7 @@ impl SourceConfig {
             },
             post_processors: vec![String::from("strip-links")],
             kind: SourceKind::Text,
+            start_chapter: None,
         }
     }
 }
@@ -619,6 +629,15 @@ fn migrate_legacy_config(mut config: Config) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manga_source_fields_parse_with_defaults() {
+        let cfg = parse_config(br#"{"Sources":[{"Id":"m","Name":"M","Kind":"manga-tcb","StartChapter":1198,"Selectors":{"ChapterPattern":"ch-(\\d+)"}},{"Id":"t","Name":"T"}]}"#).unwrap();
+        assert_eq!(cfg.sources[0].start_chapter, Some(1198.0));
+        assert_eq!(cfg.sources[0].selectors.chapter_pattern, "ch-(\\d+)");
+        assert_eq!(cfg.sources[1].start_chapter, None);
+        assert_eq!(cfg.sources[1].selectors.chapter_pattern, r"chapter-([0-9]+(?:\.[0-9]+)?)");
+    }
 
     /// config.json holds the mail password, and serde_json's own error
     /// messages quote the offending value. A load error is shown on a page

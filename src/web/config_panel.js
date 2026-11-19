@@ -22,11 +22,11 @@
   // Keys each section edits or shows. Anything else is listed read-only
   // under "Other settings".
   var MODEL = {
-    source: ['Id', 'Name', 'Enabled', 'TocUrl', 'Auth', 'Metadata', 'Selectors', 'PostProcessors'],
+    source: ['Id', 'Name', 'Enabled', 'Kind', 'StartChapter', 'TocUrl', 'Auth', 'Metadata', 'Selectors', 'PostProcessors'],
     sourceNested: {
       Auth: ['Type', 'PatreonName'],
       Metadata: ['Author', 'CoverImage', 'Description'],
-      Selectors: ['SelectorType', 'VolumeWrapper', 'VolumeTitle', 'ChapterEntry', 'ChapterLink', 'MainContent']
+      Selectors: ['SelectorType', 'VolumeWrapper', 'VolumeTitle', 'ChapterEntry', 'ChapterLink', 'MainContent', 'ChapterPattern']
     },
     destination: ['Name', 'Email', 'SendIndividualChapters', 'SendFullVolumes', 'StripColour', 'Sources'],
     mail: ['Name', 'Address', 'Password', 'PasswordSet', 'Destinations'],
@@ -68,7 +68,17 @@
       }
       o = next;
     }
-    o[path[path.length - 1]] = value;
+    var last = path[path.length - 1];
+    if (value === undefined) delete o[last];
+    else o[last] = value;
+  }
+
+  // A number field's text as a finite number, or undefined when blank or not
+  // a number (the key is then removed rather than written as a string).
+  function parseNumberField(str) {
+    if (typeof str !== 'string' || str.trim() === '') return undefined;
+    var n = parseFloat(str);
+    return isFinite(n) ? n : undefined;
   }
 
   // A document is usable if it parses to an object. Anything else leaves the
@@ -202,6 +212,7 @@
     DEFAULTS: DEFAULTS,
     getPath: getPath,
     setPath: setPath,
+    parseNumberField: parseNumberField,
     parseDocument: parseDocument,
     otherSettings: otherSettings,
     destinationSourceRows: destinationSourceRows,
@@ -291,6 +302,15 @@
       return labelled(label, input);
     }
 
+    // For keys the scraper reads as numbers: serde rejects a string there.
+    function number(label, path) {
+      var input = el('input', { type: 'number', step: 'any' });
+      var v = L.getPath(state.doc, path);
+      input.value = typeof v === 'number' ? String(v) : '';
+      input.addEventListener('input', function () { edit(path, L.parseNumberField(input.value)); });
+      return labelled(label, input);
+    }
+
     function check(label, path, fallback) {
       var wrap = el('label', { className: 'panel-check' });
       var input = el('input', { type: 'checkbox' });
@@ -371,6 +391,8 @@
         fixed('Id', P.concat(['Id']),
               'Changing the id starts a new database for this source, so it is changed in the JSON below.'),
         check('Enabled', P.concat(['Enabled']), L.DEFAULTS.source.Enabled),
+        select('Kind', P.concat(['Kind']), ['text', 'manga-tcb', 'manga-wordpress'], 'text'),
+        number('Start chapter', P.concat(['StartChapter'])),
         text('Table-of-contents URL', P.concat(['TocUrl'])),
         heading('Auth'), auth, patreonName,
         heading('Metadata'),
@@ -384,6 +406,7 @@
         text('Chapter entry', P.concat(['Selectors', 'ChapterEntry'])),
         text('Chapter link', P.concat(['Selectors', 'ChapterLink'])),
         text('Main content', P.concat(['Selectors', 'MainContent'])),
+        text('Chapter pattern', P.concat(['Selectors', 'ChapterPattern'])),
         heading('Post-processors'),
         el('p', { className: 'panel-mono' }, processors.length ? processors.join(', ') : 'none'),
         other(L.otherSettings(s, L.MODEL.source, L.MODEL.sourceNested))

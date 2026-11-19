@@ -93,7 +93,9 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 p class="summary" {
                     "A Royal Road fiction URL fills in the selectors and post-processors that "
                     "the built-in Royal Road scraper expects, and suggests an id beginning "
-                    "royal-road-, which is what selects that scraper. Everything stays editable."
+                    "royal-road-, which is what selects that scraper. Everything stays editable. "
+                    "For a manga site, set Kind to manga-tcb (TocUrl is the series' project page) "
+                    "or manga-wordpress (TocUrl is the site's home page) after adding."
                 }
                 div class="fields" {
                     div class="field" {
