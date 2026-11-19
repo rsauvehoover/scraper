@@ -145,13 +145,19 @@ pub struct AppState {
 impl AppState {
     #[cfg(test)]
     pub fn for_test() -> Self {
-        use crate::config::{Config, SourceConfig};
-        let mut config = Config::default();
-        config.sources = vec![SourceConfig {
+        use crate::config::SourceConfig;
+        Self::for_test_with_sources(vec![SourceConfig {
             id: "test-source".to_string(),
             enabled: true,
             ..SourceConfig::default()
-        }];
+        }])
+    }
+
+    /// `for_test` with the given sources in place of its single text source.
+    #[cfg(test)]
+    pub fn for_test_with_sources(sources: Vec<crate::config::SourceConfig>) -> Self {
+        let mut config = crate::config::Config::default();
+        config.sources = sources;
 
         AppState {
             registry: LiveRegistry::fixed(crate::db::SourceRegistry::from_config_for_test(&config)),

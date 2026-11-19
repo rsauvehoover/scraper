@@ -119,6 +119,11 @@ pub async fn volume_epub(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
+    // Manga sources build chapter EPUBs only, so the TOC offers no volume
+    // link; a direct request is refused before it takes a build permit.
+    if source.is_manga() {
+        return (StatusCode::NOT_FOUND, "No volume EPUBs for a manga source").into_response();
+    }
     let strip_colour = query.strip_colour();
 
     // Generation is CPU-bound and each build holds several megabytes, so a
@@ -415,6 +420,44 @@ mod tests {
             "the body must explain why, not show a raw database error: {}",
             text
         );
+    }
+
+    /// A manga source has chapter EPUBs only; its volume EPUB route refuses
+    /// before any build is attempted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn volume_epub_is_refused_for_a_manga_source() {
+        use super::{volume_epub, DownloadQuery};
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        // No database is reached on the refusal path; the temp directory
+        // keeps a regression from touching the working tree's `db/`.
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+
+        let state = Arc::new(AppState::for_test_with_sources(vec![SourceConfig {
+            id: "test-source".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        }]));
+
+        let response = volume_epub(
+            State(Arc::clone(&state)),
+            AxumPath(("test-source".to_string(), 1)),
+            Query(DownloadQuery::default()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "No volume EPUBs for a manga source");
     }
 
     /// The send job and the download link must build through the same

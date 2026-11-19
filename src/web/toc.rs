@@ -37,6 +37,9 @@ pub async fn source_toc(
             return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
         }
     };
+    // A manga source builds chapter EPUBs only (`web::download::volume_epub`
+    // refuses it), so it gets neither volume EPUB links nor a volume checkbox.
+    let manga = entry.config.is_manga();
 
     page(
         &stat.name,
@@ -73,7 +76,7 @@ pub async fn source_toc(
                     @let downloaded_chapters =
                         volume.chapters.len() - volume.pending_chapters;
                     // A volume with nothing downloaded has nothing to send.
-                    @if downloaded_chapters > 0 {
+                    @if !manga && downloaded_chapters > 0 {
                         input type="checkbox" class="pick" name="v" value=(volume.id)
                               aria-label={ "Select " (volume.name) };
                     }
@@ -84,11 +87,13 @@ pub async fn source_toc(
                         @if volume.pending_chapters > 0 {
                             ", " (volume.pending_chapters) " pending"
                         }
-                        " · "
-                        a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
-                        " · "
-                        a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
-                            "EPUB (no colour)"
+                        @if !manga {
+                            " · "
+                            a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
+                            " · "
+                            a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
+                                "EPUB (no colour)"
+                            }
                         }
                     }
                     }
@@ -449,6 +454,38 @@ mod tests {
         );
         assert!(body.contains("data-storage-key=\"toc-open:test-source\""), "{}", body);
         assert!(body.contains("Folding volumes on the table-of-contents page."), "script missing");
+    }
+
+    /// A manga source has chapter EPUBs only: no volume checkbox and no
+    /// volume EPUB links, while its chapters stay selectable.
+    #[tokio::test]
+    async fn a_manga_source_offers_no_volume_epub_or_volume_checkbox() {
+        use crate::config::{SourceConfig, SourceKind};
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+        let state = Arc::new(crate::web::app::AppState::for_test_with_sources(vec![SourceConfig {
+            id: "test-source".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        }]));
+        {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Chapter", "https://example.com/c1", vol).unwrap();
+            let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one two</p>").unwrap();
+        }
+
+        let body = body_of(
+            super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
+        )
+        .await;
+
+        assert!(!body.contains("/volume/"), "no volume EPUB link: {}", body);
+        assert!(!body.contains("name=\"v\""), "no volume checkbox: {}", body);
+        assert!(body.contains("name=\"c\""), "chapters stay selectable: {}", body);
     }
 
     #[test]
