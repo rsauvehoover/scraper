@@ -163,6 +163,14 @@ fn add_chapter_images(
     Ok(())
 }
 
+/// File extension for a stored image's MIME type.
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        _ => "jpg",
+    }
+}
+
 /// Build a single-chapter EPUB in memory. Touches no filesystem path.
 pub fn build_chapter_epub(
     db: &SourceDatabase,
@@ -185,6 +193,15 @@ pub fn build_chapter_epub(
             img_bytes.as_slice(),
             "image/png",
         )?;
+    } else if ctx.source.is_manga() {
+        // No configured cover: a manga chapter's first page stands in for it.
+        if let Some(first) = db.get_chapter_images(chapter.id)?.into_iter().next() {
+            epub.add_cover_image(
+                format!("cover.{}", ext_for_mime(&first.mime)),
+                first.data.as_slice(),
+                &first.mime,
+            )?;
+        }
     }
     epub.stylesheet(load_stylesheet().as_bytes())?;
 
@@ -229,7 +246,17 @@ fn generate_chapters(
     output_dir: &Path,
     ctx: &EpubContext,
     strip_colour: bool,
+    combined: bool,
 ) -> Result<Vec<Attachment>, Box<dyn std::error::Error>> {
+    if !combined {
+        let mut attachments = Vec::<Attachment>::new();
+        for chapter in chapters {
+            attachments.push(generate_chapter(db, chapter, output_dir, ctx, strip_colour)?);
+            db.update_generated_chapter(chapter.id, false)?;
+        }
+        return Ok(attachments);
+    }
+
     std::fs::create_dir_all(output_dir.join("combined"))?;
 
     if chapters.is_empty() {
@@ -402,7 +429,13 @@ pub async fn generate_epubs_for_source(
     let mut chaps = Vec::<Attachment>::new();
     let mut chaps_stripped = Vec::<Attachment>::new();
 
-    if config.epub_gen.volumes {
+    if config.epub_gen.volumes && source.is_manga() {
+        println!("({}) Manga source: no volume epubs", source.id);
+        // Clear the flags anyway so they do not pile up for a build that never happens.
+        for volume in db.get_volumes_to_regenerate()? {
+            db.update_generated_volume(volume.id, false)?;
+        }
+    } else if config.epub_gen.volumes {
         let volumes = db.get_volumes_to_regenerate()?;
 
         if volumes.is_empty() {
@@ -452,16 +485,26 @@ pub async fn generate_epubs_for_source(
                 source.id,
                 chapters.len()
             );
-            if config.epub_gen.strip_colour {
+            // Manga sources get plain chapter EPUBs only: no stripped variant, no combined EPUB.
+            let manga = source.is_manga();
+            if config.epub_gen.strip_colour && !manga {
                 chaps_stripped = generate_chapters(
                     db,
                     &chapters,
                     &source_dir.join("chapters_stripped_colour"),
                     &ctx,
                     true,
+                    true,
                 )?;
             }
-            chaps = generate_chapters(db, &chapters, &source_dir.join("chapters"), &ctx, false)?;
+            chaps = generate_chapters(
+                db,
+                &chapters,
+                &source_dir.join("chapters"),
+                &ctx,
+                false,
+                !manga,
+            )?;
         }
     } else {
         println!("({}) Skipping chapter generation", source.id);
@@ -475,7 +518,9 @@ pub async fn generate_epubs_for_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EpubGenConfig, SourceKind};
     use crate::db::{ChapterImage, SourceDatabase};
+    use crate::sources::manga::pages_html;
     use serial_test::serial;
 
     fn fixture_db() -> (SourceDatabase, Volume, Vec<Chapter>) {
@@ -714,5 +759,90 @@ mod tests {
 
         assert_eq!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}", p0)), Some(vec![1; 3]));
         assert_eq!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}", p1)), Some(vec![2; 3]));
+    }
+
+    fn one_by_one_png() -> Vec<u8> {
+        use image::ImageEncoder;
+        let img = image::RgbImage::new(1, 1);
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), 1, 1, image::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    fn manga_db_with_two_chapters() -> (SourceDatabase, SourceConfig) {
+        let source = SourceConfig {
+            id: "manga-test".into(),
+            name: "Example Series".into(),
+            kind: SourceKind::MangaTcb,
+            ..Default::default()
+        };
+        let db = SourceDatabase::open_in_memory(&source.id).unwrap();
+        let vol = db.add_volume("Example Series").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        db.add_chapter("C2", "https://example.com/c2", vol).unwrap();
+        for chapter in db.get_chapters_by_volume(vol).unwrap() {
+            let path = format!("images/{}-0.png", chapter.id);
+            let image = ChapterImage {
+                chapter_id: chapter.id,
+                seq: 0,
+                path: path.clone(),
+                source_url: format!("https://example.com/{}.png", chapter.id),
+                mime: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: one_by_one_png(),
+            };
+            let html = pages_html(&source, &chapter.name, &[path]);
+            db.store_chapter_content(chapter.id, &html, &[image], true).unwrap();
+        }
+        (db, source)
+    }
+
+    #[test]
+    fn manga_chapter_uses_its_first_page_as_cover_when_none_is_configured() {
+        let (db, source) = manga_db_with_two_chapters();
+        let chapters = db.get_chapters_by_volume(db.add_volume("Example Series").unwrap()).unwrap();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+        let epub = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        // epub-builder writes EPUB 2 by default: the cover is an item plus
+        // <meta name="cover">, under OEBPS/ at the path given to add_cover_image.
+        assert_eq!(read_zip_entry(&epub.bytes, "OEBPS/cover.png"), Some(one_by_one_png()));
+        let opf =
+            String::from_utf8(read_zip_entry(&epub.bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains("cover"), "{}", opf);
+    }
+
+    #[tokio::test]
+    async fn manga_source_builds_only_plain_chapter_epubs_whatever_the_flags_say() {
+        let (db, source) = manga_db_with_two_chapters();
+        let mut config = Config::default();
+        config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
+        config.mail.destinations.clear();
+        let build = tempfile::tempdir().unwrap();
+        generate_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
+            .await
+            .unwrap();
+        let root = build.path().join(&source.id);
+        assert_eq!(std::fs::read_dir(root.join("chapters/individual")).unwrap().count(), 2);
+        assert!(!root.join("chapters/combined").exists());
+        assert!(!root.join("chapters_stripped_colour").exists());
+        assert!(!root.join("volumes").exists() && !root.join("volumes_stripped_colour").exists());
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_generation_clears_flags_so_a_destination_added_later_gets_no_backlog() {
+        let (db, source) = manga_db_with_two_chapters();
+        let mut config = Config::default();
+        config.mail.destinations.clear();
+        let build = tempfile::tempdir().unwrap();
+        generate_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
+            .await
+            .unwrap();
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
     }
 }
