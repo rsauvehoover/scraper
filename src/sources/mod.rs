@@ -1,5 +1,6 @@
 mod client;
 pub mod content_images;
+pub mod manga;
 mod generic;
 mod registry;
 mod royal_road;
