@@ -5,7 +5,7 @@ use soup::prelude::*;
 use crate::config::{SourceConfig, SourceKind};
 use crate::error::{ScrapeError, ScrapeResult};
 
-use super::manga::{chapter_number, decode_entities, manga_content, order_chapters, resolve_against_origin, NumberedChapter};
+use super::manga::{chapter_number, compile_chapter_pattern, decode_entities, manga_content, order_chapters, resolve_against_origin, NumberedChapter};
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
 
 /// Scraper for TCB-style scan sites: a project page listing `/chapters/...` links,
@@ -18,9 +18,7 @@ pub struct TcbScraper {
 
 impl TcbScraper {
     pub fn new(config: SourceConfig) -> Self {
-        let pattern = Regex::new(&config.selectors.chapter_pattern).map_err(|e| {
-            format!("invalid chapter pattern '{}': {}", config.selectors.chapter_pattern, e)
-        });
+        let pattern = compile_chapter_pattern(&config.selectors.chapter_pattern);
         TcbScraper { config, pattern }
     }
 }
@@ -148,5 +146,13 @@ mod tests {
     async fn a_chapter_page_without_pages_is_not_yet_available() {
         let err = TcbScraper::new(cfg(None)).parse_chapter("<html><body><h1>Soon</h1></body></html>", "X").await.unwrap_err();
         assert!(matches!(err, ScrapeError::NotYetAvailable(_)));
+    }
+
+    #[tokio::test]
+    async fn a_chapter_pattern_without_a_capture_group_is_a_config_error() {
+        let mut c = cfg(None);
+        c.selectors.chapter_pattern = r"chapter-\d+".into();
+        let err = TcbScraper::new(c).parse_toc(include_str!("../../tests/fixtures/manga/tcb-project.html")).await.unwrap_err();
+        assert!(matches!(err, ScrapeError::Config(_)), "{:?}", err);
     }
 }

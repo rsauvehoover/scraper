@@ -5,7 +5,7 @@ use soup::prelude::*;
 use crate::config::{Selectors, SourceConfig, SourceKind};
 use crate::error::{ScrapeError, ScrapeResult};
 
-use super::manga::{chapter_number, decode_entities, manga_content, order_chapters, resolve_against_origin, NumberedChapter};
+use super::manga::{chapter_number, compile_chapter_pattern, decode_entities, manga_content, order_chapters, resolve_against_origin, NumberedChapter};
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
 
 /// Scraper for WordPress comic sites: a chapter-list widget on the home page, and
@@ -26,9 +26,7 @@ impl WordPressComicScraper {
         if config.selectors.main_content == generic.main_content {
             config.selectors.main_content = "entry-content".into();
         }
-        let pattern = Regex::new(&config.selectors.chapter_pattern).map_err(|e| {
-            format!("invalid chapter pattern '{}': {}", config.selectors.chapter_pattern, e)
-        });
+        let pattern = compile_chapter_pattern(&config.selectors.chapter_pattern);
         WordPressComicScraper { config, pattern }
     }
 }
@@ -174,5 +172,13 @@ mod tests {
         let mut c = cfg(None);
         c.selectors.main_content = "post-body".into();
         assert_eq!(WordPressComicScraper::new(c).config.selectors.main_content, "post-body");
+    }
+
+    #[tokio::test]
+    async fn a_chapter_pattern_without_a_capture_group_is_a_config_error() {
+        let mut c = cfg(None);
+        c.selectors.chapter_pattern = r"chapter-\d+".into();
+        let err = WordPressComicScraper::new(c).parse_toc(HOME).await.unwrap_err();
+        assert!(matches!(err, ScrapeError::Config(_)), "{:?}", err);
     }
 }

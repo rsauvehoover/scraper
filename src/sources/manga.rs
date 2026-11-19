@@ -13,6 +13,22 @@ pub struct NumberedChapter {
     pub number: f64,
 }
 
+/// Compile `Selectors.ChapterPattern`. The error is kept for `parse_toc` to
+/// surface as `ScrapeError::Config`. A pattern without a capture group is an
+/// error too: `chapter_number` reads group 1, so such a pattern would match
+/// every chapter link and still index nothing.
+pub fn compile_chapter_pattern(pattern: &str) -> Result<Regex, String> {
+    let regex =
+        Regex::new(pattern).map_err(|e| format!("invalid chapter pattern '{}': {}", pattern, e))?;
+    if regex.captures_len() < 2 {
+        return Err(format!(
+            "ChapterPattern must have one capture group for the chapter number: {}",
+            pattern
+        ));
+    }
+    Ok(regex)
+}
+
 /// Extract the chapter number from the first capture group of `pattern`.
 pub fn chapter_number(url: &str, pattern: &Regex) -> Option<f64> {
     pattern
@@ -130,6 +146,14 @@ mod tests {
     fn re() -> Regex { Regex::new(r"chapter-([0-9]+(?:\.[0-9]+)?)").unwrap() }
     fn nc(uri: &str, n: f64) -> NumberedChapter {
         NumberedChapter { chapter: ScrapedChapter { title: format!("Ch {}", n), uri: uri.into(), volume_name: "S".into() }, number: n }
+    }
+
+    #[test]
+    fn compile_chapter_pattern_requires_a_capture_group() {
+        let err = compile_chapter_pattern(r"chapter-\d+").unwrap_err();
+        assert!(err.contains("one capture group") && err.contains(r"chapter-\d+"), "{}", err);
+        assert!(compile_chapter_pattern(r"chapter-(\d+").unwrap_err().contains("invalid chapter pattern"));
+        assert!(compile_chapter_pattern(r"chapter-(\d+)").is_ok());
     }
 
     #[test]
