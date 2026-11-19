@@ -52,13 +52,13 @@ opt-level = 2
 
 [dependencies]
 color-name = "1.1.0"
-epub-builder = "0.8.3"
+epub-builder = { path = "vendor/epub-builder", default-features = false, features = ["zip-library"] }
 hex = "0.4.3"
 reqwest = { version = "0.13", features = ["cookies"] }
 image = "0.24.7"
 imageproc = "0.23.0"
-mail-builder = "0.5.0"
-mail-send = "0.6.2"
+mail-builder = "2.0.1"
+mail-send = "0.7.0"
 regex = "1.9.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusttype = "0.9.3"
@@ -84,5 +84,5 @@ form_urlencoded = "1.2.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serial_test = "4.0.1"
 tempfile = "3"
-zip = "6"
+zip = "9.0.5"
 tower = { version = "0.5.3", features = ["util"] }

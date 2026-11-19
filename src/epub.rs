@@ -548,6 +548,29 @@ mod tests {
         assert_eq!(attachment.mime, "application/epub+zip");
     }
 
+    /// The EPUB container spec requires `mimetype` as the first archive
+    /// entry, uncompressed. The vendored epub-builder's zip wrapper is what
+    /// guarantees it, so pin it here.
+    #[test]
+    fn chapter_epub_starts_with_a_stored_mimetype_entry() {
+        let (db, _volume, chapters) = fixture_db();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        let attachment = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(attachment.bytes)).unwrap();
+        let mut first = z.by_index(0).unwrap();
+        assert_eq!(first.name().unwrap(), "mimetype");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut first, &mut body).unwrap();
+        assert_eq!(body, "application/epub+zip");
+    }
+
     /// The web process opens databases query-only and never runs the schema
     /// migration, so a database last written by a binary that predates the
     /// `images` table must still build: no table means no images.

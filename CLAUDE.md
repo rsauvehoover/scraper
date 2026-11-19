@@ -24,6 +24,8 @@ cargo run -- --help            # Show CLI options
 
 This is a multi-source web serial scraper with plugin-like extensibility via traits.
 
+`epub-builder` is vendored at `vendor/epub-builder` (the crates.io release pins a vulnerable `zip`); `vendor/README.md` lists the changes from upstream.
+
 ### Core Traits
 
 **`SourceScraper`** (`src/sources/traits.rs`): Defines how to scrape a source

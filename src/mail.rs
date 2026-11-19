@@ -61,7 +61,7 @@ async fn send_epub(config: &MailConfig, dest: &UserConfig, attachment: &Attachme
         .await;
 
     match res {
-        Ok(()) => println!(
+        Ok(_) => println!(
             "Sent Chapter {} to {}",
             attachment.filename.clone(),
             dest.email,
@@ -190,7 +190,7 @@ trait Connection: Send + Sync {
 #[async_trait]
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for mail_send::SmtpClient<T> {
     async fn send_message(&mut self, message: MessageBuilder<'static>) -> mail_send::Result<()> {
-        self.send(message).await
+        self.send(message).await.map(|_| ())
     }
 }
 
