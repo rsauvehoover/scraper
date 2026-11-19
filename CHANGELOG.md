@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.1](https://github.com/rsauvehoover/scraper/compare/v2.8.0...v2.8.1) - 2026-11-19
+
+### Fixed
+
+- flatten manga page alpha, keep a smaller png ([#43](https://github.com/rsauvehoover/scraper/pull/43))
+
 ## [2.8.0](https://github.com/rsauvehoover/scraper/compare/v2.7.0...v2.8.0) - 2026-11-19
 
 ### Added
