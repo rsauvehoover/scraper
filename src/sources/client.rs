@@ -408,6 +408,13 @@ impl ScraperClient {
                         batch_count += 1;
                         batch_discovered += discovered;
                     }
+                    Err(ScrapeError::NotYetAvailable(title)) => {
+                        println!(
+                            "({}) Not yet available, will retry: {}",
+                            scraper.source_id(),
+                            title
+                        );
+                    }
                     Err(e) => {
                         println!(
                             "({}) Error downloading '{}': {}",
@@ -493,6 +500,11 @@ impl ScraperClient {
             };
             match result {
                 Ok(()) => stored += 1,
+                Err(ScrapeError::NotYetAvailable(title)) => println!(
+                    "({}) Not yet available, will retry: {}",
+                    scraper.source_id(),
+                    title
+                ),
                 Err(e) => println!(
                     "({}) Error re-downloading '{}': {}",
                     scraper.source_id(),
@@ -637,6 +649,7 @@ mod tests {
     use super::*;
     use crate::config::SourceConfig;
     use crate::sources::generic::GenericScraper;
+    use crate::sources::wordpress_comic::WordPressComicScraper;
     use crate::test_support::{serve_fixtures, FixtureRoute};
 
     fn fetched(url: &str, ok: bool) -> FetchedImage {
@@ -805,6 +818,99 @@ mod tests {
         assert_eq!(chapters.len(), 1);
         assert_eq!(chapters[0].id, id);
         assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+    }
+
+    const MANGA_CHAPTER_PATH: &str = "/manga/example-chapter-42/";
+
+    /// A WordPress comic scraper rooted at `base`, and a db with one pending chapter
+    /// at `{base}/manga/example-chapter-42/`
+    fn manga_setup(base: &str) -> (Arc<dyn SourceScraper>, SourceDatabase) {
+        let cfg = SourceConfig {
+            id: "example-manga".into(),
+            kind: SourceKind::MangaWordpress,
+            toc_url: base.into(),
+            ..SourceConfig::default()
+        };
+        let scraper: Arc<dyn SourceScraper> = Arc::new(WordPressComicScraper::new(cfg));
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("V").unwrap();
+        db.add_chapter("Ch 42", &format!("{}{}", base, MANGA_CHAPTER_PATH), vol).unwrap();
+        (scraper, db)
+    }
+
+    /// The wp-chapter fixture with its three page URLs pointed at `{base}/p1.png` .. `p3.png`
+    fn wp_chapter_on(base: &str) -> Vec<u8> {
+        let html = include_str!("../../tests/fixtures/manga/wp-chapter.html")
+            .replace("https://img.example.net/s1600/002.jpg", &format!("{}/p1.png", base))
+            .replace("https://img.example.net/s1600/003.jpg", &format!("{}/p2.png", base))
+            .replace("https://img.example.net/s1335/004.webp", &format!("{}/p3.png", base));
+        assert!(!html.contains("img.example.net"), "fixture page URLs changed; update the rewrite");
+        html.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_manga_chapter_stores_nothing_and_stays_pending() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: MANGA_CHAPTER_PATH, status: 200, content_type: "text/html", body: include_bytes!("../../tests/fixtures/manga/wp-placeholder.html").to_vec() },
+        ]).await;
+        let (scraper, db) = manga_setup(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        let result = ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await;
+
+        assert!(result.is_ok());
+        assert_eq!(db.get_empty_chapters().unwrap().len(), 1);
+        assert!(db.get_downloaded_chapters().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manga_chapter_with_a_failed_page_stores_nothing() {
+        let png = png_2x2();
+        let base = serve_fixtures(|b| vec![
+            FixtureRoute { path: MANGA_CHAPTER_PATH, status: 200, content_type: "text/html", body: wp_chapter_on(b) },
+            FixtureRoute { path: "/p1.png", status: 200, content_type: "image/png", body: png.clone() },
+            FixtureRoute { path: "/p3.png", status: 200, content_type: "image/png", body: png.clone() },
+        ]).await;
+        let (scraper, db) = manga_setup(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+
+        let pending = db.get_empty_chapters().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(db.get_downloaded_chapters().unwrap().is_empty());
+        assert!(db.get_chapter_images(pending[0].id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manga_chapter_with_all_pages_stores_pages_in_order() {
+        let png = png_2x2();
+        let base = serve_fixtures(|b| vec![
+            FixtureRoute { path: MANGA_CHAPTER_PATH, status: 200, content_type: "text/html", body: wp_chapter_on(b) },
+            FixtureRoute { path: "/p1.png", status: 200, content_type: "image/png", body: png.clone() },
+            FixtureRoute { path: "/p2.png", status: 200, content_type: "image/png", body: png.clone() },
+            FixtureRoute { path: "/p3.png", status: 200, content_type: "image/png", body: png.clone() },
+        ]).await;
+        let (scraper, db) = manga_setup(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+
+        let ch = db.get_downloaded_chapters().unwrap();
+        assert_eq!(ch.len(), 1);
+        let id = ch[0].id;
+        let imgs = db.get_chapter_images(id).unwrap();
+        assert_eq!(imgs.iter().map(|i| i.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        let paths: Vec<String> = (0..3).map(|n| format!("images/{}-{}.png", id, n)).collect();
+        assert_eq!(imgs.iter().map(|i| i.path.clone()).collect::<Vec<_>>(), paths);
+        assert_eq!(
+            imgs.iter().map(|i| i.source_url.clone()).collect::<Vec<_>>(),
+            ["p1.png", "p2.png", "p3.png"].map(|p| format!("{}/{}", base, p))
+        );
+        let html = db.get_chapter_data(id).unwrap();
+        for p in &paths {
+            assert!(html.contains(p.as_str()), "html missing {}", p);
+        }
     }
 
     #[test]
