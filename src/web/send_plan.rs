@@ -282,6 +282,7 @@ mod tests {
             password: "synthetic-pw-918273".into(),
             smtp_hostname: "smtp.example.com".into(),
             smtp_port: 587,
+            max_attachment_mb: 17,
             destinations: vec![
                 dest("Test Reader", "reader@example.com", true),
                 dest("Second Reader", "second@example.org", false),

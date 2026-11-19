@@ -169,6 +169,7 @@ pub(crate) async fn run_job(
     mut mailer: Box<dyn Mailer>,
     build: BuildFn,
     permits: Arc<Semaphore>,
+    max_attachment_bytes: usize,
 ) {
     let _finish = FinishOnDrop { jobs: Arc::clone(&jobs), id: id.clone() };
     let source = Arc::new(source);
@@ -197,7 +198,7 @@ pub(crate) async fn run_job(
             }
         };
 
-        if crate::mail::attachment_too_large(&attachment) {
+        if crate::mail::attachment_too_large(&attachment, max_attachment_bytes) {
             jobs.set(&id, index, EmailState::Failed(TOO_LARGE));
             log(&id, &source.id, email, TOO_LARGE);
             continue;
@@ -268,7 +269,7 @@ mod tests {
         let jobs = Arc::new(SendJobs::new());
         let id = jobs.try_start("test-source", "Test Serial", &emails).unwrap();
         run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), fake_build,
-                Arc::new(Semaphore::new(1))).await;
+                Arc::new(Semaphore::new(1)), 17 * 1024 * 1024).await;
         jobs.get(&id).unwrap()
     }
 
@@ -307,7 +308,7 @@ mod tests {
             Ok(Attachment {
                 filename: "big.epub".into(),
                 mime: "application/epub+zip".into(),
-                bytes: vec![0; crate::mail::MAX_ATTACHMENT_BYTES + 1],
+                bytes: vec![0; 1025],
             })
         }
         let (mailer, sent) = RecordingMailer::new();
@@ -315,7 +316,7 @@ mod tests {
         let jobs = Arc::new(SendJobs::new());
         let id = jobs.try_start("test-source", "Test Serial", &emails).unwrap();
         run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), huge_build,
-                Arc::new(Semaphore::new(1))).await;
+                Arc::new(Semaphore::new(1)), 1024).await;
         let job = jobs.get(&id).unwrap();
         assert_eq!(job.emails[0].state, EmailState::Failed("too large to send"));
         assert!(sent.lock().unwrap().is_empty());

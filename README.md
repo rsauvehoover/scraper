@@ -344,6 +344,7 @@ Create a `config.json` file with the following structure:
     "Password": "app-password",           // Gmail app password, not your regular password
     "SmtpHostname": "smtp.gmail.com",
     "SmtpPort": 587,
+    "MaxAttachmentMb": 17,   // Gmail rejects messages over 25 MB; 17 MiB of attachment fits after base64
     "Destinations": [
       {
         "Name": "Recipient",

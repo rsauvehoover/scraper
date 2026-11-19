@@ -10,6 +10,9 @@ pub struct MailConfig {
     pub password: String,
     pub smtp_hostname: String,
     pub smtp_port: u16,
+    /// Largest attachment sent. Gmail rejects messages over 25 MB, which is
+    /// about 17 MiB of attachment once base64-encoded.
+    pub max_attachment_mb: u32,
     pub destinations: Vec<UserConfig>,
 }
 
@@ -29,6 +32,7 @@ impl std::fmt::Debug for MailConfig {
             password: _,
             smtp_hostname,
             smtp_port,
+            max_attachment_mb,
             destinations,
         } = self;
         f.debug_struct("MailConfig")
@@ -37,6 +41,7 @@ impl std::fmt::Debug for MailConfig {
             .field("password", &"<redacted>")
             .field("smtp_hostname", smtp_hostname)
             .field("smtp_port", smtp_port)
+            .field("max_attachment_mb", max_attachment_mb)
             .field("destinations", destinations)
             .finish()
     }
@@ -50,8 +55,15 @@ impl Default for MailConfig {
             password: String::default(),
             smtp_hostname: String::from("smtp.gmail.com"),
             smtp_port: 587,
+            max_attachment_mb: 17,
             destinations: Vec::<UserConfig>::default(),
         }
+    }
+}
+
+impl MailConfig {
+    pub fn max_attachment_bytes(&self) -> usize {
+        self.max_attachment_mb as usize * 1024 * 1024
     }
 }
 
@@ -778,6 +790,15 @@ mod tests {
         let rendered = format!("{:?}", mail);
         assert!(!rendered.contains("abcdefghijklmnop"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn max_attachment_mb_defaults_to_17_and_parses() {
+        let cfg = parse_config(br#"{}"#).unwrap();
+        assert_eq!(cfg.mail.max_attachment_mb, 17);
+        assert_eq!(cfg.mail.max_attachment_bytes(), 17 * 1024 * 1024);
+        let cfg = parse_config(br#"{"Mail":{"MaxAttachmentMb":40}}"#).unwrap();
+        assert_eq!(cfg.mail.max_attachment_bytes(), 40 * 1024 * 1024);
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub async fn send_submit(
 
     // Nothing between `try_start` and the spawn may fail or return early: an
     // unspawned job never finishes and blocks every later send until restart.
+    let max_attachment_bytes = mail.max_attachment_bytes();
     let mailer = (state.mailer)(mail);
     tokio::spawn(run_job(
         Arc::clone(&state.sends),
@@ -80,6 +81,7 @@ pub async fn send_submit(
         mailer,
         build_item,
         Arc::clone(&state.epub_permits),
+        max_attachment_bytes,
     ));
     (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/send/{}", id))]).into_response()
 }
