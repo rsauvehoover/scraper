@@ -5,6 +5,7 @@ mod generic;
 mod registry;
 mod royal_road;
 pub mod tcb;
+pub mod wordpress_comic;
 mod traits;
 mod wandering_inn;
 

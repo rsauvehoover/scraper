@@ -1,6 +1,3 @@
-// The manga scrapers use these helpers.
-#![allow(dead_code)]
-
 use regex::Regex;
 
 use crate::config::SourceConfig;
@@ -88,6 +85,21 @@ pub fn manga_content(
     })
 }
 
+/// Resolve `href` against the scheme and host of `toc_url`; absolute hrefs pass through.
+pub fn resolve_against_origin(toc_url: &str, href: &str) -> String {
+    if href.contains("://") {
+        return href.to_string();
+    }
+    let origin = match toc_url.find("://") {
+        Some(i) => match toc_url[i + 3..].find('/') {
+            Some(j) => &toc_url[..i + 3 + j],
+            None => toc_url,
+        },
+        None => toc_url,
+    };
+    format!("{}{}", origin, href)
+}
+
 /// Decode HTML entities in a title, then collapse whitespace and trim.
 pub fn decode_entities(s: &str) -> String {
     let numeric = Regex::new(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));").unwrap();
@@ -159,6 +171,13 @@ mod tests {
         let ok = manga_content(&SourceConfig::default(), "Ch 41", vec!["https://example.com/1.png".into()]).unwrap();
         assert_eq!(ok.images, vec!["https://example.com/1.png"]);
         assert!(!ok.is_patreon_only && ok.next_chapter_url.is_none());
+    }
+
+    #[test]
+    fn relative_hrefs_resolve_against_the_toc_origin() {
+        assert_eq!(resolve_against_origin("https://example.com/a/b", "/chapters/1"), "https://example.com/chapters/1");
+        assert_eq!(resolve_against_origin("https://example.com", "/chapters/1"), "https://example.com/chapters/1");
+        assert_eq!(resolve_against_origin("https://example.com/a", "https://example.net/x"), "https://example.net/x");
     }
 
     #[test]

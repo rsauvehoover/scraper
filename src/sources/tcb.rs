@@ -5,7 +5,7 @@ use soup::prelude::*;
 use crate::config::{SourceConfig, SourceKind};
 use crate::error::{ScrapeError, ScrapeResult};
 
-use super::manga::{chapter_number, decode_entities, manga_content, order_chapters, NumberedChapter};
+use super::manga::{chapter_number, decode_entities, manga_content, order_chapters, resolve_against_origin, NumberedChapter};
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
 
 /// Scraper for TCB-style scan sites: a project page listing `/chapters/...` links,
@@ -22,22 +22,6 @@ impl TcbScraper {
             format!("invalid chapter pattern '{}': {}", config.selectors.chapter_pattern, e)
         });
         TcbScraper { config, pattern }
-    }
-
-    /// Resolve `href` against the scheme and host of the TOC URL.
-    fn resolve(&self, href: &str) -> String {
-        if href.contains("://") {
-            return href.to_string();
-        }
-        let toc = &self.config.toc_url;
-        let origin = match toc.find("://") {
-            Some(i) => match toc[i + 3..].find('/') {
-                Some(j) => &toc[..i + 3 + j],
-                None => toc.as_str(),
-            },
-            None => toc.as_str(),
-        };
-        format!("{}{}", origin, href)
     }
 }
 
@@ -70,7 +54,7 @@ impl SourceScraper for TcbScraper {
                 Some(NumberedChapter {
                     chapter: ScrapedChapter {
                         title: decode_entities(&link.text()),
-                        uri: self.resolve(&href),
+                        uri: resolve_against_origin(&self.config.toc_url, &href),
                         volume_name: self.config.name.clone(),
                     },
                     number,
