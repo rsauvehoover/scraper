@@ -450,10 +450,15 @@ impl ScraperClient {
             if i > 0 {
                 sleep(Duration::from_millis(delay_ms)).await;
             }
-            let result = match self
-                .fetch_chapter(scraper, chapter, auth_headers.as_ref(), images)
-                .await
-            {
+            // Checked fetch: an error status must not overwrite stored content
+            let fetched = match self.get_html_checked(&chapter.uri, auth_headers.as_ref()).await {
+                Ok(html) => {
+                    self.fetch_chapter(scraper, chapter, &html, auth_headers.as_ref(), images)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            let result = match fetched {
                 Ok(f) if f.is_patreon_only && auth_headers.is_none() => {
                     println!(
                         "({}) Skipping Patreon-only chapter: {}",
@@ -487,18 +492,20 @@ impl ScraperClient {
         Ok(())
     }
 
-    /// Fetch, parse, strip links, fetch images and assemble one chapter.
+    /// Parse an already-fetched chapter page, strip links, fetch images and
+    /// assemble. The caller fetches the page so it can choose whether an
+    /// error status counts as a failure.
     /// A Patreon-only page without auth is returned unassembled: images are
     /// not fetched and `assembled` is empty.
     async fn fetch_chapter(
         &self,
         scraper: &Arc<dyn SourceScraper>,
         chapter: &crate::db::Chapter,
+        html: &str,
         auth_headers: Option<&Vec<(String, String)>>,
         images: &ImagesConfig,
     ) -> ScrapeResult<FetchedChapter> {
-        let html = self.get_html(&chapter.uri, auth_headers).await?;
-        let content = scraper.parse_chapter(&html, &chapter.name).await?;
+        let content = scraper.parse_chapter(html, &chapter.name).await?;
 
         if content.is_patreon_only && auth_headers.is_none() {
             return Ok(FetchedChapter {
@@ -544,8 +551,9 @@ impl ScraperClient {
         auth_headers: Option<&Vec<(String, String)>>,
         images: &ImagesConfig,
     ) -> ScrapeResult<usize> {
+        let html = self.get_html(&chapter.uri, auth_headers).await?;
         let content = self
-            .fetch_chapter(scraper, chapter, auth_headers, images)
+            .fetch_chapter(scraper, chapter, &html, auth_headers, images)
             .await?;
 
         if content.is_patreon_only && auth_headers.is_none() {
@@ -736,6 +744,20 @@ mod tests {
         ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
 
         assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+    }
+
+    #[tokio::test]
+    async fn redownload_keeps_old_content_on_an_error_status_with_a_content_body() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/c1", status: 500, content_type: "text/html", body: br#"<html><head><title>E</title></head><body><div id="content"><p>oops</p></div></body></html>"#.to_vec() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+        assert!(db.get_chapter_images(id).unwrap().is_empty());
     }
 
     #[tokio::test]
