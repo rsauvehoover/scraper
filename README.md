@@ -319,9 +319,9 @@ cargo bump {major|minor|patch} --git-tag
 
 ## Configuration
 
-Create a `config.json` file with the following structure:
-
 Chapter images are downloaded, scaled to `Images`, and embedded; a text chapter whose image cannot be fetched is stored without it.
+
+Create a `config.json` file with the following structure:
 
 ```jsonc
 {
