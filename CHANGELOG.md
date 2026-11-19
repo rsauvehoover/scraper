@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0](https://github.com/rsauvehoover/scraper/compare/v2.8.1...v2.9.0) - 2026-11-19
+
+### Added
+
+- download every epub of a source as one zip ([#47](https://github.com/rsauvehoover/scraper/pull/47))
+- show stored images in the web reader ([#45](https://github.com/rsauvehoover/scraper/pull/45))
+
 ## [2.8.1](https://github.com/rsauvehoover/scraper/compare/v2.8.0...v2.8.1) - 2026-11-19
 
 ### Fixed
