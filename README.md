@@ -43,6 +43,7 @@ Run with no flags to process every enabled source (index update, chapter downloa
 | `--pull-chapter <URL>` | Seed a chapter that isn't on the TOC yet (requires `--source`) |
 | `--volume <NAME>` | Volume for `--pull-chapter` (default: latest volume in the DB) |
 | `--title <NAME>` | Title for `--pull-chapter` (default: parsed from the chapter page) |
+| `--redownload` | Re-fetch every stored chapter of `--source`, recovering images; stores results without flagging anything for EPUB generation or sending. Requires `--source` |
 
 ### Pulling a chapter early
 

@@ -18,6 +18,7 @@ cargo run -- --help            # Show CLI options
 - `--pull-chapter <URL>` - Seed a chapter not yet on the TOC (requires `--source`). The URL must match how the TOC will list the chapter (same scheme/host/path; a trailing-slash difference is tolerated).
 - `--volume <NAME>` - Volume for `--pull-chapter` (default: latest volume in DB)
 - `--title <NAME>` - Title for `--pull-chapter` (default: parsed from the page)
+- `--redownload` - Re-fetch every stored chapter of `--source`, recovering images; stores results without flagging anything for EPUB generation or sending. Requires `--source`.
 
 ## Architecture
 

@@ -92,6 +92,14 @@ pub struct Assembled {
     pub images: Vec<ChapterImage>,
 }
 
+/// A fetched and assembled chapter, ready to store
+struct FetchedChapter {
+    assembled: Assembled,
+    is_patreon_only: bool,
+    next_chapter_url: Option<String>,
+    next_chapter_title: Option<String>,
+}
+
 /// Number the fetched images, point the HTML at their local paths, and
 /// apply `policy` to the images that failed.
 pub fn assemble_chapter(
@@ -418,25 +426,87 @@ impl ScraperClient {
         Ok(())
     }
 
-    async fn download_chapter(
+    /// Re-fetch every stored chapter and replace its HTML and images without
+    /// flagging anything for EPUB generation, so nothing is re-sent.
+    /// A failed chapter keeps its old content; a Patreon-only page without
+    /// auth is skipped, never removed.
+    pub async fn redownload_all(
         &self,
         scraper: &Arc<dyn SourceScraper>,
         db: &SourceDatabase,
+        delay_ms: u64,
+        images: &ImagesConfig,
+    ) -> ScrapeResult<()> {
+        let auth_headers = scraper.build_auth_headers();
+        let chapters = db.get_downloaded_chapters()?;
+        println!(
+            "({}) Re-downloading {} stored chapters",
+            scraper.source_id(),
+            chapters.len()
+        );
+
+        let mut stored = 0;
+        for (i, chapter) in chapters.iter().enumerate() {
+            if i > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let result = match self
+                .fetch_chapter(scraper, chapter, auth_headers.as_ref(), images)
+                .await
+            {
+                Ok(f) if f.is_patreon_only && auth_headers.is_none() => {
+                    println!(
+                        "({}) Skipping Patreon-only chapter: {}",
+                        scraper.source_id(),
+                        chapter.name
+                    );
+                    continue;
+                }
+                Ok(f) => db
+                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, false)
+                    .map_err(ScrapeError::from),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => stored += 1,
+                Err(e) => println!(
+                    "({}) Error re-downloading '{}': {}",
+                    scraper.source_id(),
+                    chapter.name,
+                    e
+                ),
+            }
+        }
+
+        println!(
+            "({}) Re-downloaded {} of {} chapters",
+            scraper.source_id(),
+            stored,
+            chapters.len()
+        );
+        Ok(())
+    }
+
+    /// Fetch, parse, strip links, fetch images and assemble one chapter.
+    /// A Patreon-only page without auth is returned unassembled: images are
+    /// not fetched and `assembled` is empty.
+    async fn fetch_chapter(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
         chapter: &crate::db::Chapter,
         auth_headers: Option<&Vec<(String, String)>>,
         images: &ImagesConfig,
-    ) -> ScrapeResult<usize> {
+    ) -> ScrapeResult<FetchedChapter> {
         let html = self.get_html(&chapter.uri, auth_headers).await?;
         let content = scraper.parse_chapter(&html, &chapter.name).await?;
 
         if content.is_patreon_only && auth_headers.is_none() {
-            println!(
-                "({}) Removing Patreon-only chapter: {}",
-                scraper.source_id(),
-                chapter.name
-            );
-            db.remove_chapter(chapter.id)?;
-            return Ok(0);
+            return Ok(FetchedChapter {
+                assembled: Assembled { html: String::new(), images: Vec::new() },
+                is_patreon_only: true,
+                next_chapter_url: content.next_chapter_url,
+                next_chapter_title: content.next_chapter_title,
+            });
         }
 
         // Apply strip-links post-processor during download
@@ -457,6 +527,38 @@ impl ScraperClient {
             &fetched,
             ImagePolicy::for_kind(scraper.kind()),
         )?;
+
+        Ok(FetchedChapter {
+            assembled,
+            is_patreon_only: content.is_patreon_only,
+            next_chapter_url: content.next_chapter_url,
+            next_chapter_title: content.next_chapter_title,
+        })
+    }
+
+    async fn download_chapter(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
+        db: &SourceDatabase,
+        chapter: &crate::db::Chapter,
+        auth_headers: Option<&Vec<(String, String)>>,
+        images: &ImagesConfig,
+    ) -> ScrapeResult<usize> {
+        let content = self
+            .fetch_chapter(scraper, chapter, auth_headers, images)
+            .await?;
+
+        if content.is_patreon_only && auth_headers.is_none() {
+            println!(
+                "({}) Removing Patreon-only chapter: {}",
+                scraper.source_id(),
+                chapter.name
+            );
+            db.remove_chapter(chapter.id)?;
+            return Ok(0);
+        }
+
+        let assembled = content.assembled;
         db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, true)?;
 
         // Handle chapter discovery: if there's a next chapter URL, add it to the database
@@ -586,6 +688,70 @@ mod tests {
         let html = db.get_chapter_data(ch[0].id).unwrap();
         assert_eq!(html.matches("<img").count(), 1);
         assert!(html.contains(&imgs[0].path));
+    }
+
+    /// A text-source scraper reading `<div id="content">`, with no auth
+    fn content_scraper() -> Arc<dyn SourceScraper> {
+        let mut cfg = SourceConfig::default();
+        cfg.selectors.main_content = "content".into();
+        Arc::new(GenericScraper::new(cfg))
+    }
+
+    /// One chapter at `{base}/c1` stored with "<old/>" and both regenerate flags cleared
+    fn db_with_stored_chapter(base: &str) -> (SourceDatabase, isize) {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("V").unwrap();
+        db.add_chapter("C1", &format!("{}/c1", base), vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.add_chapter_data(id, "<old/>").unwrap();
+        db.update_generated_chapter(id, false).unwrap();
+        db.update_generated_volume(vol, false).unwrap();
+        (db, id)
+    }
+
+    #[tokio::test]
+    async fn redownload_replaces_content_and_images_without_flagging() {
+        let png = png_2x2();
+        let base = serve_fixtures(|b| vec![
+            FixtureRoute { path: "/c1", status: 200, content_type: "text/html", body: format!(r#"<html><head><title>T</title></head><body><div id="content"><p>x</p><img src="{b}/good.png"/></div></body></html>"#, b = b).into_bytes() },
+            FixtureRoute { path: "/good.png", status: 200, content_type: "image/png", body: png.clone() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.png", id)));
+        assert_eq!(db.get_chapter_images(id).unwrap().len(), 1);
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redownload_keeps_old_content_when_the_page_fails() {
+        let base = serve_fixtures(|_| vec![]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+    }
+
+    #[tokio::test]
+    async fn redownload_skips_a_patreon_only_chapter_instead_of_deleting_it() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/c1", status: 200, content_type: "text/html", body: "<html><head><title>Patron Early Access \u{2013} X</title></head><body><div id=\"content\"><p>locked</p></div></body></html>".as_bytes().to_vec() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        let chapters = db.get_downloaded_chapters().unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].id, id);
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
     }
 
     #[test]
