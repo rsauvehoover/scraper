@@ -119,6 +119,11 @@ pub async fn volume_epub(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
+    // Manga sources build chapter EPUBs only, so the TOC offers no volume
+    // link; a direct request is refused before it takes a build permit.
+    if source.is_manga() {
+        return (StatusCode::NOT_FOUND, "No volume EPUBs for a manga source").into_response();
+    }
     let strip_colour = query.strip_colour();
 
     // Generation is CPU-bound and each build holds several megabytes, so a
@@ -147,7 +152,8 @@ pub async fn chapter_epub(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
-    let strip_colour = query.strip_colour();
+    // A manga source has no stripped variant; the output would be the same.
+    let strip_colour = query.strip_colour() && !source.is_manga();
 
     let permit = Arc::clone(&state.epub_permits).acquire_owned().await;
     let Ok(_permit) = permit else {
@@ -415,6 +421,109 @@ mod tests {
             "the body must explain why, not show a raw database error: {}",
             text
         );
+    }
+
+    /// A manga source has chapter EPUBs only; its volume EPUB route refuses
+    /// before any build is attempted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn volume_epub_is_refused_for_a_manga_source() {
+        use super::{volume_epub, DownloadQuery};
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        // No database is reached on the refusal path; the temp directory
+        // keeps a regression from touching the working tree's `db/`.
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+
+        let state = Arc::new(AppState::for_test_with_sources(vec![SourceConfig {
+            id: "test-source".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        }]));
+
+        let response = volume_epub(
+            State(Arc::clone(&state)),
+            AxumPath(("test-source".to_string(), 1)),
+            Query(DownloadQuery::default()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "No volume EPUBs for a manga source");
+    }
+
+    /// A manga source has no stripped variant: `?stripped=1` serves the same
+    /// EPUB as the plain link, even for content the strip would change.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chapter_epub_ignores_stripped_for_a_manga_source() {
+        use super::{chapter_epub, DownloadQuery};
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+
+        let chapter_id = {
+            // File-backed: `open_query_only` in the handler opens this file.
+            let db = crate::db::SourceDatabase::open("test-source").unwrap();
+            let vol = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Chapter", "https://example.com/c1", vol).unwrap();
+            let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
+            db.add_chapter_data(id, r#"<p><span style="color:#ff0000">red</span></p>"#)
+                .unwrap();
+            id
+        };
+
+        let state = Arc::new(AppState::for_test_with_sources(vec![SourceConfig {
+            id: "test-source".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        }]));
+
+        let mut bodies = Vec::new();
+        for stripped in [None, Some("1".to_string())] {
+            let response = chapter_epub(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), chapter_id as i64)),
+                Query(DownloadQuery { stripped }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            bodies.push(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap());
+        }
+        // epub-builder stamps a fresh UUID and date into every build, so the
+        // archives never match byte for byte; the chapter page must.
+        let page = |bytes: &[u8]| {
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+            let mut f = z.by_name(&format!("OEBPS/{}(Chapter).xhtml", chapter_id)).unwrap();
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut f, &mut out).unwrap();
+            out
+        };
+        let (plain, stripped) = (page(&bodies[0]), page(&bodies[1]));
+        assert!(plain.contains("color:#ff0000"), "{}", plain);
+        assert_eq!(plain, stripped, "?stripped=1 must serve the plain EPUB");
+
+        // The send job builds through `build_item`, which ignores the choice too.
+        let source = state.registry.snapshot().get("test-source").unwrap().config.clone();
+        let item = crate::web::send_plan::Item::Chapter { id: chapter_id as i64, name: "Chapter".into() };
+        let sent = crate::web::send_jobs::build_item(&source, &item, true).unwrap();
+        assert_eq!(page(&sent.bytes), plain, "a send must not strip a manga chapter");
     }
 
     /// The send job and the download link must build through the same

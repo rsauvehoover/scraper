@@ -180,3 +180,27 @@ test('a selection that no longer exists falls back to the first entry', () => {
   assert.deepEqual(P.clampSelection(doc, { kind: 'destination', index: 5 }), { kind: 'source', index: 0 });
   assert.deepEqual(P.clampSelection({}, { kind: 'source', index: 0 }), { kind: 'epubGen', index: 0 });
 });
+
+test('manga keys are modelled so they are editable, not read-only', () => {
+  assert.ok(P.MODEL.source.includes('Kind') && P.MODEL.source.includes('StartChapter'));
+  assert.ok(P.MODEL.sourceNested.Selectors.includes('ChapterPattern'));
+  const other = P.otherSettings({ Kind: 'manga-tcb', StartChapter: 5, Selectors: { ChapterPattern: 'x' } }, P.MODEL.source, P.MODEL.sourceNested);
+  assert.deepEqual(other, []);
+});
+
+test('parseNumberField yields finite numbers and undefined otherwise', () => {
+  assert.equal(P.parseNumberField('1198'), 1198);
+  assert.equal(P.parseNumberField(' 12.5 '), 12.5);
+  assert.equal(P.parseNumberField(''), undefined);
+  assert.equal(P.parseNumberField('abc'), undefined);
+  assert.equal(P.parseNumberField('Infinity'), undefined);
+});
+
+test('StartChapter is written as a number and removed when blank', () => {
+  const doc = { Sources: [{ Id: 'm' }] };
+  const path = ['Sources', 0, 'StartChapter'];
+  P.setPath(doc, path, P.parseNumberField('7'));
+  assert.deepEqual(JSON.parse(JSON.stringify(doc)), { Sources: [{ Id: 'm', StartChapter: 7 }] });
+  P.setPath(doc, path, P.parseNumberField(''));
+  assert.ok(!('StartChapter' in doc.Sources[0]));
+});

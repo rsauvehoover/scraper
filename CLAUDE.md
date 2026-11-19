@@ -59,10 +59,12 @@ Config → ScraperRegistry → per source:
 ### Configuration
 
 Sources are configured in `config.json` with:
+- Kind: optional scraper kind (`manga-tcb`, `manga-wordpress`); see Manga Sources
 - Selectors: `volume_wrapper`, `chapter_entry`, `main_content`, etc.
 - SelectorType: `class`, `id`, or `tag`
 - Auth: `None` or `Patreon { patreon_name }`
 - PostProcessors: ordered list like `["mrsha-write", "strip-links"]`
+- StartChapter: manga kinds only; drops chapters numbered below it
 
 Backward compatible: legacy single-source configs auto-migrate to multi-source format.
 
@@ -123,6 +125,21 @@ Example config:
   ]
 }
 ```
+
+### Manga Sources
+
+Two kinds, chosen with `Kind` on the source:
+
+- `manga-tcb`: `TocUrl` is the series' project page on a TCB-style site. Chapters are the `/chapters/{id}/{slug}` links; pages are `img.fixed-ratio-content`.
+- `manga-wordpress`: `TocUrl` is the site home page. Chapters come from the `ceo_latest_comics_widget` list (override with `Selectors.ChapterEntry`); pages are the `<img>` tags under `Selectors.MainContent` (default `entry-content`), excluding theme and upload graphics.
+
+Shared behaviour:
+- `ScraperRegistry` picks the scraper by `Kind` before the `royal-road-` id-prefix rule
+- Chapter number is the first capture group of `Selectors.ChapterPattern` (default `chapter-([0-9]+(?:\.[0-9]+)?)`) applied to the link URL; non-matching links are not chapters
+- `StartChapter` drops lower-numbered chapters before they are indexed
+- One EPUB per chapter; never volumes, combined files or colour-stripped variants
+- A chapter page with zero images is "not yet available" and retried next run
+- Rollout for a finished series: add the source with no destination listing it, run the scraper, then send by hand from the web frontend. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape; wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
 
 ## Adding Post-Processors
 

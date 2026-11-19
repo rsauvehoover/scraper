@@ -30,6 +30,9 @@ pub enum ScrapeError {
 
     #[error("Image processing failed: {0}")]
     Image(String),
+
+    #[error("chapter not yet available: {0}")]
+    NotYetAvailable(String),
 }
 
 /// Errors that can occur during EPUB generation

@@ -140,6 +140,8 @@ pub(crate) type BuildFn = fn(&SourceConfig, &Item, bool) -> Result<Attachment, B
 
 /// The same builds the download links serve.
 pub(crate) fn build_item(source: &SourceConfig, item: &Item, strip_colour: bool) -> Result<Attachment, BuildError> {
+    // A manga source has no stripped variant, as on the download route.
+    let strip_colour = strip_colour && !source.is_manga();
     match item {
         Item::Volume { id, .. } => build_volume(source, *id, strip_colour),
         Item::Chapter { id, .. } => build_chapter(source, *id, strip_colour),

@@ -59,7 +59,7 @@ pub async fn send_submit(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs));
+    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs), !entry.config.is_manga());
     let planned = match send_plan::plan(&resolved.items, &mail, field(&pairs, "config"), &send_plan::choices(&pairs)) {
         Ok(p) => p,
         Err(refusal) => return render(&state, &headers, &source_id, &pairs, Some(refusal)),
@@ -176,7 +176,7 @@ fn render(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs));
+    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs), !entry.config.is_manga());
     let csrf = session_token(headers)
         .and_then(|t| state.sessions.csrf_for(&t))
         .unwrap_or_default();
@@ -202,7 +202,7 @@ fn render(
                 @if snapshot.load_error.is_some() { p class="error" { (Refusal::ConfigNotLoaded.message()) } }
                 @if busy { p class="error" { (Refusal::Busy.message()) (progress_link(state)) } }
             }
-            (form_body(source_id, &resolved, &mail, &chosen, &csrf, pairs))
+            (form_body(source_id, entry.config.is_manga(), &resolved, &mail, &chosen, &csrf, pairs))
             script { (PreEscaped(SEND_SCRIPT)) }
         },
     );
@@ -216,8 +216,10 @@ fn progress_link(state: &AppState) -> Markup {
     html! { " " a href={ "/send/" (job.id) } { "See its progress" } }
 }
 
+/// `manga` hides the colour choice: a manga source has no stripped variant.
 fn form_body(
     source_id: &str,
+    manga: bool,
     resolved: &Resolved,
     mail: &MailConfig,
     chosen: &[send_plan::DestChoice],
@@ -264,9 +266,11 @@ fn form_body(
                                         div class="dest-unusual" { "Does not normally receive this series" }
                                     }
                                 }
-                                td {
-                                    label class="variant" { input type="radio" name={ "colour-" (i) } value="colour" checked[!strip]; " Colour" }
-                                    label class="variant" { input type="radio" name={ "colour-" (i) } value="stripped" checked[strip]; " Stripped" }
+                                @if !manga {
+                                    td {
+                                        label class="variant" { input type="radio" name={ "colour-" (i) } value="colour" checked[!strip]; " Colour" }
+                                        label class="variant" { input type="radio" name={ "colour-" (i) } value="stripped" checked[strip]; " Stripped" }
+                                    }
                                 }
                             }
                         }
