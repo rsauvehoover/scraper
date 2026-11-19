@@ -137,13 +137,12 @@ Shared behaviour:
 - `ScraperRegistry` picks the scraper by `Kind` before the `royal-road-` id-prefix rule
 - Chapter number is the first capture group of `Selectors.ChapterPattern` (default `chapter-([0-9]+(?:\.[0-9]+)?)`) applied to the link URL; non-matching links are not chapters
 - `StartChapter` drops lower-numbered chapters before they are indexed
-- Chapters are placed into batches named `Volume N` when they download, always into the open batch. A batch closes when the next chapter's stored image bytes would exceed `Mail.MaxAttachmentMb` minus 1 MiB
-- Batch size depends on page size and the limit (one series measured 9 to 14 MB per 39-page chapter at quality 85, so most batches hold one chapter at 17 MiB). Pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`; a chapter that alone exceeds the limit is refused by the send guard and logged
-- Batches build like serial volumes (one plain EPUB, no colour-stripped variant, no combined file) and go only to destinations with `SendFullVolumes`
-- Only a closed batch is flagged for automatic sending; the open batch is sent by hand from the web frontend's send page. `--redownload` never moves a chapter or re-splits a batch; the send guard refuses an over-limit batch
+- Every chapter of a manga source sits in one volume named after the source. That volume is never flagged, built or sent; the web TOC lists the source as a flat chapter list and only chapters can be ticked
+- Chapters go to destinations with `SendIndividualChapters`. A chapter EPUB over `Mail.MaxAttachmentMb` is refused by the send guard and logged; pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`
 - Stored images are JPEG at `Images.JpegQuality` unless translucent; a JPEG that already fits the limits is stored untouched
 - A chapter page with zero images is "not yet available" and retried next run
-- Rollout for a finished series: add the source with no destination listing it, run the scraper, then tick batches on the web frontend's send page. A database scraped before batches keeps its source-named volume as the open batch until it fills. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape, and set `"SendFullVolumes": false` in that source's entry under the destination's `Sources` map unless batch emails are wanted (the default is true, and a closed batch repeats chapters the destination already received); wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
+- A database from the batch design (volumes named `Volume N`) is collapsed into the series volume by the next run's index step; the collapse sets no flag
+- Rollout for a finished series: add the source with no destination listing it, run the scraper, then tick chapters on the web frontend's send page. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape; wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
 
 ## Adding Post-Processors
 

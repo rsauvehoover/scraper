@@ -496,20 +496,18 @@ A source with `"Kind": "manga-tcb"` or `"Kind": "manga-wordpress"` is a manga so
 Behaviour:
 
 - Colour is kept; pages are scaled and re-encoded as JPEG according to the `Images` block (a JPEG that already fits is stored untouched).
-- Chapters are grouped into batches named `Volume 1`, `Volume 2`, and so on. A chapter is placed when it downloads, always into the batch open at that moment. A batch takes consecutive chapters until the next chapter's stored image bytes would push it past `Mail.MaxAttachmentMb` minus 1 MiB; that chapter then opens the next batch.
-- Batch size depends on page size and the limit. Pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`; one series measured 230 to 816 KB per page and 9 to 14 MB per 39-page chapter at quality 85, so at the 17 MiB default most batches hold one chapter. A chapter that alone exceeds the limit is refused by the send guard and logged.
-- Each batch is built like a serial volume: one plain EPUB, no colour-stripped variant, no combined file. Batches are sent only to destinations with `SendFullVolumes`.
-- Only a closed batch is flagged for automatic sending, so a weekly chapter never triggers a batch send. The open batch is sent by hand from the web frontend's send page, where batches are listed with an EPUB link and a send checkbox.
-- `--redownload` never moves a chapter or re-splits a batch. If a batch ends up over the limit, the send guard refuses it and logs.
-- A batch's cover is the first page of its first downloaded chapter, unless `CoverImage` is set.
+- Every chapter sits in one volume named after the source. That volume is never built or sent: manga chapters go out one at a time, to destinations with `SendIndividualChapters`.
+- A chapter EPUB larger than `Mail.MaxAttachmentMb` is refused by the send guard and logged. Pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`; a full-colour series measured 15 to 41 MB per chapter with its pages stored untouched.
+- The web frontend lists a manga source as a flat chapter list with a send checkbox and an EPUB link per downloaded chapter. There is no volume EPUB.
+- `--redownload` re-fetches pages and flags nothing.
 - A chapter page with no images counts as not yet available and is retried on the next run.
 
 Rollout:
 
-1. For a finished series, add the source with no destination listing it and run the scraper. Everything downloads and nothing is sent. Then tick batches on the web frontend's send page.
-2. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape, so only chapters released later are sent. `SendFullVolumes` defaults to true, so also set `"SendFullVolumes": false` in that source's entry under the destination's `Sources` map unless batch emails are wanted: a closed batch repeats chapters the destination already received.
-3. A manga database scraped before batches existed keeps its source-named volume as the open batch until it fills; later batches are `Volume 2` onward.
-4. A chapter that failed during the backfill and succeeds on a later run counts as new and is mailed. Wait for a clean run before adding the source to a destination.
+1. For a finished series, add the source with no destination listing it and run the scraper. Everything downloads and nothing is sent. Then tick chapters on the web frontend's send page.
+2. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape, so only chapters released later are sent.
+3. A chapter that failed during the backfill and succeeds on a later run counts as new and is mailed. Wait for a clean run before adding the source to a destination.
+4. A database from the batch design, with volumes named `Volume 1`, `Volume 2` and so on, is collapsed into the series volume by the next run. The collapse moves rows only and flags nothing.
 
 ### Minimal Configuration
 
