@@ -216,6 +216,40 @@ impl Default for SourceMetadata {
     }
 }
 
+/// What kind of content a source serves
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum SourceKind {
+    #[default]
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "manga-tcb")]
+    MangaTcb,
+    #[serde(rename = "manga-wordpress")]
+    MangaWordpress,
+}
+
+/// Settings for downloading and resizing chapter images
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ImagesConfig {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub jpeg_quality: u8,
+    /// Delay between image requests in milliseconds
+    pub request_delay: u64,
+}
+
+impl Default for ImagesConfig {
+    fn default() -> Self {
+        ImagesConfig {
+            max_width: 2528,
+            max_height: 1680,
+            jpeg_quality: 85,
+            request_delay: 250,
+        }
+    }
+}
+
 /// Configuration for a single source
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
@@ -240,6 +274,8 @@ pub struct SourceConfig {
     pub metadata: SourceMetadata,
     /// Post-processors to apply (in order)
     pub post_processors: Vec<String>,
+    /// Kind of content this source serves
+    pub kind: SourceKind,
 }
 
 impl Default for SourceConfig {
@@ -255,11 +291,17 @@ impl Default for SourceConfig {
             auth: AuthConfig::None,
             metadata: SourceMetadata::default(),
             post_processors: Vec::new(),
+            kind: SourceKind::Text,
         }
     }
 }
 
 impl SourceConfig {
+    /// Whether this source serves manga (image-only chapters)
+    pub fn is_manga(&self) -> bool {
+        self.kind != SourceKind::Text
+    }
+
     /// Create a default Wandering Inn source configuration
     pub fn wandering_inn() -> Self {
         SourceConfig {
@@ -277,6 +319,7 @@ impl SourceConfig {
                 cover_image: None,
             },
             post_processors: vec![String::from("mrsha-write"), String::from("strip-links")],
+            kind: SourceKind::Text,
         }
     }
 
@@ -318,6 +361,7 @@ impl SourceConfig {
                 cover_image: None,
             },
             post_processors: vec![String::from("strip-links")],
+            kind: SourceKind::Text,
         }
     }
 }
@@ -344,6 +388,8 @@ pub struct Config {
     pub request_delay: u64,
     /// List of sources to scrape
     pub sources: Vec<SourceConfig>,
+    /// Chapter image download settings
+    pub images: ImagesConfig,
 
     // Legacy fields for backward compatibility
     #[serde(default)]
@@ -359,6 +405,7 @@ impl Default for Config {
             mail: MailConfig::default(),
             epub_gen: EpubGenConfig::default(),
             sources: vec![SourceConfig::wandering_inn()],
+            images: ImagesConfig::default(),
             toc_url: None,
             patreon_name: None,
         }
@@ -712,5 +759,18 @@ mod tests {
         let rendered = format!("{:?}", mail);
         assert!(!rendered.contains("abcdefghijklmnop"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn kind_and_images_default_and_parse() {
+        let cfg = parse_config(br#"{"Sources":[{"Id":"a","Name":"A"},{"Id":"b","Name":"B","Kind":"manga-wordpress"}]}"#).unwrap();
+        assert_eq!(cfg.sources[0].kind, SourceKind::Text);
+        assert!(!cfg.sources[0].is_manga());
+        assert_eq!(cfg.sources[1].kind, SourceKind::MangaWordpress);
+        assert!(cfg.sources[1].is_manga());
+        assert_eq!((cfg.images.max_width, cfg.images.max_height, cfg.images.jpeg_quality, cfg.images.request_delay), (2528, 1680, 85, 250));
+
+        let cfg = parse_config(br#"{"Images":{"MaxHeight":1000}}"#).unwrap();
+        assert_eq!((cfg.images.max_width, cfg.images.max_height), (2528, 1000));
     }
 }
