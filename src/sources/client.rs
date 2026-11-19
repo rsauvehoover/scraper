@@ -5,7 +5,7 @@ use tokio::time::sleep;
 use soup::prelude::*;
 
 use crate::config::{ImagesConfig, SourceKind};
-use crate::db::{ChapterImage, SourceDatabase};
+use crate::db::{ChapterImage, RegenerateFlags, SourceDatabase, Volume};
 use crate::error::{ScrapeError, ScrapeResult};
 use crate::images::{process_image, ProcessedImage};
 
@@ -143,6 +143,68 @@ pub fn assemble_chapter(
         html: assign_image_paths(&html, &assigned),
         images,
     })
+}
+
+/// Bytes of page images one manga batch may hold: the mail attachment limit
+/// less 1 MiB for the EPUB's text, styles and cover.
+pub fn batch_budget_bytes(max_attachment_bytes: usize) -> u64 {
+    (max_attachment_bytes as u64).saturating_sub(1024 * 1024)
+}
+
+/// Where `place_in_batch` put a chapter, and the batch it closed to do so
+#[derive(Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub volume_id: isize,
+    pub closed: Option<isize>,
+}
+
+/// The batch new manga chapters join: the latest volume, or "Volume 1" when
+/// there is none.
+fn open_batch(db: &SourceDatabase) -> rusqlite::Result<Volume> {
+    match db.get_latest_volume()? {
+        Some(volume) => Ok(volume),
+        None => Ok(Volume { id: db.add_volume("Volume 1")?, name: "Volume 1".to_string() }),
+    }
+}
+
+/// Move a manga chapter about to be stored into the open batch, or into a new
+/// batch when its `this_bytes` of pages would push the open one over `budget`.
+/// A batch's first chapter always stays, so an oversized chapter is a batch of one.
+pub fn place_in_batch(
+    db: &SourceDatabase,
+    chapter_id: isize,
+    this_bytes: u64,
+    budget: u64,
+) -> rusqlite::Result<Placement> {
+    let open = open_batch(db)?.id;
+    let full = db.volume_has_downloaded_chapter(open)?
+        && db.volume_image_bytes(open)? + this_bytes > budget;
+    let placement = if full {
+        let name = format!("Volume {}", db.count_volumes()? + 1);
+        Placement { volume_id: db.add_volume(&name)?, closed: Some(open) }
+    } else {
+        Placement { volume_id: open, closed: None }
+    };
+    db.set_chapter_volume(chapter_id, placement.volume_id)?;
+    Ok(placement)
+}
+
+/// Place a downloaded manga chapter in its batch and store it. Only the batch
+/// it closed, if any, is flagged for EPUB generation; the open batch never is.
+fn store_in_batch(
+    db: &SourceDatabase,
+    chapter_id: isize,
+    assembled: &Assembled,
+    budget: u64,
+) -> rusqlite::Result<()> {
+    let this_bytes: u64 = assembled.images.iter().map(|i| i.data.len() as u64).sum();
+    let placement = place_in_batch(db, chapter_id, this_bytes, budget)?;
+    // Flag before storing: if the store then fails, the chapter waits in the
+    // new batch and no later run would close the old one.
+    if let Some(closed) = placement.closed {
+        db.update_generated_volume(closed, true)?;
+    }
+    db.store_chapter_content(chapter_id, &assembled.html, &assembled.images, RegenerateFlags::ChapterOnly)
 }
 
 /// HTTP client wrapper for scraping operations
@@ -283,15 +345,29 @@ impl ScraperClient {
         let mut volume_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
+        // Manga volumes are size-bounded batches, placed at download time:
+        // a new chapter waits in the open batch and a known one keeps its volume.
+        let open_manga_batch = match scraper.kind() {
+            SourceKind::Text => None,
+            SourceKind::MangaTcb | SourceKind::MangaWordpress => Some(open_batch(db)?),
+        };
+
         for chapter in chapters {
             if ignored_volumes.contains(&chapter.volume_name) || ignored_chapters.contains(&chapter.title) {
                 continue
             }
-            let volume_id = db.add_volume(&chapter.volume_name)?;
-            db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
-            *volume_counts
-                .entry(chapter.volume_name.clone())
-                .or_insert(0) += 1;
+            let volume_name = match &open_manga_batch {
+                Some(open) => {
+                    db.upsert_chapter_keep_volume(&chapter.title, &chapter.uri, open.id)?;
+                    open.name.clone()
+                }
+                None => {
+                    let volume_id = db.add_volume(&chapter.volume_name)?;
+                    db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
+                    chapter.volume_name
+                }
+            };
+            *volume_counts.entry(volume_name).or_insert(0) += 1;
         }
 
         for (volume_name, count) in &volume_counts {
@@ -363,8 +439,10 @@ impl ScraperClient {
         db: &SourceDatabase,
         delay_ms: u64,
         images: &ImagesConfig,
+        max_attachment_bytes: usize,
     ) -> ScrapeResult<()> {
         let auth_headers = scraper.build_auth_headers();
+        let budget = batch_budget_bytes(max_attachment_bytes);
         let mut total_downloaded = 0;
         let mut total_discovered = 0;
 
@@ -401,7 +479,7 @@ impl ScraperClient {
                 }
 
                 match self
-                    .download_chapter(scraper, db, &chapter, auth_headers.as_ref(), images)
+                    .download_chapter(scraper, db, &chapter, auth_headers.as_ref(), images, budget)
                     .await
                 {
                     Ok(discovered) => {
@@ -494,7 +572,7 @@ impl ScraperClient {
                     continue;
                 }
                 Ok(f) => db
-                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, crate::db::RegenerateFlags::Untouched)
+                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, RegenerateFlags::Untouched)
                     .map_err(ScrapeError::from),
                 Err(e) => Err(e),
             };
@@ -581,6 +659,7 @@ impl ScraperClient {
         chapter: &crate::db::Chapter,
         auth_headers: Option<&Vec<(String, String)>>,
         images: &ImagesConfig,
+        batch_budget: u64,
     ) -> ScrapeResult<usize> {
         let html = self.get_html(&chapter.uri, auth_headers).await?;
         let content = self
@@ -598,7 +677,12 @@ impl ScraperClient {
         }
 
         let assembled = content.assembled;
-        db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, crate::db::RegenerateFlags::ChapterAndVolume)?;
+        match scraper.kind() {
+            SourceKind::Text => db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, RegenerateFlags::ChapterAndVolume)?,
+            SourceKind::MangaTcb | SourceKind::MangaWordpress => {
+                store_in_batch(db, chapter.id, &assembled, batch_budget)?
+            }
+        }
 
         // Handle chapter discovery: if there's a next chapter URL, add it to the database
         let mut discovered = 0;
@@ -651,6 +735,9 @@ mod tests {
     use crate::sources::generic::GenericScraper;
     use crate::sources::wordpress_comic::WordPressComicScraper;
     use crate::test_support::{serve_fixtures, FixtureRoute};
+
+    /// The default attachment limit, for tests that do not exercise batching
+    const LIMIT: usize = 17 * 1024 * 1024;
 
     fn fetched(url: &str, ok: bool) -> FetchedImage {
         FetchedImage { url: url.into(), image: ok.then(|| ProcessedImage { bytes: vec![1, 2], mime: "image/jpeg", ext: "jpg", width: 1, height: 1 }) }
@@ -718,7 +805,7 @@ mod tests {
         let scraper: Arc<dyn SourceScraper> = Arc::new(GenericScraper::new(cfg));
         let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
 
-        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images, LIMIT).await.unwrap();
 
         let ch = db.get_downloaded_chapters().unwrap();
         assert_eq!(ch.len(), 1);
@@ -825,17 +912,22 @@ mod tests {
     /// A WordPress comic scraper rooted at `base`, and a db with one pending chapter
     /// at `{base}/manga/example-chapter-42/`
     fn manga_setup(base: &str) -> (Arc<dyn SourceScraper>, SourceDatabase) {
-        let cfg = SourceConfig {
-            id: "example-manga".into(),
-            kind: SourceKind::MangaWordpress,
-            toc_url: base.into(),
-            ..SourceConfig::default()
-        };
-        let scraper: Arc<dyn SourceScraper> = Arc::new(WordPressComicScraper::new(cfg));
+        let scraper = manga_scraper(base);
         let db = SourceDatabase::open_in_memory("t").unwrap();
         let vol = db.add_volume("V").unwrap();
         db.add_chapter("Ch 42", &format!("{}{}", base, MANGA_CHAPTER_PATH), vol).unwrap();
         (scraper, db)
+    }
+
+    /// A WordPress comic scraper whose TOC is `toc_url`
+    fn manga_scraper(toc_url: &str) -> Arc<dyn SourceScraper> {
+        let cfg = SourceConfig {
+            id: "example-manga".into(),
+            kind: SourceKind::MangaWordpress,
+            toc_url: toc_url.into(),
+            ..SourceConfig::default()
+        };
+        Arc::new(WordPressComicScraper::new(cfg))
     }
 
     /// The wp-chapter fixture with its three page URLs pointed at `{base}/p1.png` .. `p3.png`
@@ -856,7 +948,7 @@ mod tests {
         let (scraper, db) = manga_setup(&base);
         let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
 
-        let result = ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await;
+        let result = ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images, LIMIT).await;
 
         assert!(result.is_ok());
         assert_eq!(db.get_empty_chapters().unwrap().len(), 1);
@@ -874,7 +966,7 @@ mod tests {
         let (scraper, db) = manga_setup(&base);
         let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
 
-        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images, LIMIT).await.unwrap();
 
         let pending = db.get_empty_chapters().unwrap();
         assert_eq!(pending.len(), 1);
@@ -894,7 +986,7 @@ mod tests {
         let (scraper, db) = manga_setup(&base);
         let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
 
-        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images, LIMIT).await.unwrap();
 
         let ch = db.get_downloaded_chapters().unwrap();
         assert_eq!(ch.len(), 1);
@@ -911,6 +1003,191 @@ mod tests {
         for p in &paths {
             assert!(html.contains(p.as_str()), "html missing {}", p);
         }
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty(), "the open batch is never flagged");
+    }
+
+    #[test]
+    fn budget_is_the_limit_less_one_mib_saturating() {
+        assert_eq!(batch_budget_bytes(17 * 1024 * 1024), 16 * 1024 * 1024);
+        assert_eq!(batch_budget_bytes(0), 0);
+        assert_eq!(batch_budget_bytes(1024), 0);
+    }
+
+    /// Chapters in id order, each with the name of its volume
+    fn volume_of_each(db: &SourceDatabase) -> Vec<(String, String)> {
+        let mut chapters = db.get_empty_chapters().unwrap();
+        chapters.extend(db.get_downloaded_chapters().unwrap());
+        chapters.sort_by_key(|c| c.id);
+        chapters.into_iter().map(|c| (c.name, db.get_volume_name(c.volume_id).unwrap())).collect()
+    }
+
+    fn flagged_volumes(db: &SourceDatabase) -> Vec<String> {
+        let mut names: Vec<String> = db.get_volumes_to_regenerate().unwrap().into_iter().map(|v| v.name).collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn manga_index_parks_new_chapters_in_the_open_batch_and_keeps_existing_ones() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/", status: 200, content_type: "text/html", body: include_bytes!("../../tests/fixtures/manga/wp-home.html").to_vec() },
+        ]).await;
+        let scraper = manga_scraper(&format!("{}/", base));
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        db.add_volume("Volume 2").unwrap();
+        db.add_chapter("Old name", "https://manga.example.com/manga/example-part-chapter-1/", v1).unwrap();
+
+        ScraperClient::new().unwrap().update_index(&scraper, &db, &vec![], &vec![]).await.unwrap();
+
+        let in_vol = |n: u32, v: &str| (format!("Example\u{2019}s Adventure \u{2013} Part, Chapter {}", n), v.to_string());
+        assert_eq!(volume_of_each(&db), [in_vol(1, "Volume 1"), in_vol(2, "Volume 2"), in_vol(94, "Volume 2"), in_vol(95, "Volume 2")]);
+        assert_eq!(db.count_volumes().unwrap(), 2, "the index creates no source-named volume");
+    }
+
+    #[tokio::test]
+    async fn text_index_still_follows_the_toc_volume() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/toc", status: 200, content_type: "text/html", body: br#"<html><body>
+                <div class="volume-wrapper"><h2>Volume 1</h2><div class="chapter-entry"><a href="https://example.com/c0">C0</a></div></div>
+                <div class="volume-wrapper"><h2>Volume 2</h2><div class="chapter-entry"><a href="https://example.com/c1">C1</a></div></div>
+                </body></html>"#.to_vec() },
+        ]).await;
+        let mut cfg = SourceConfig::default();
+        cfg.toc_url = format!("{}/toc", base);
+        let scraper: Arc<dyn SourceScraper> = Arc::new(GenericScraper::new(cfg));
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+
+        ScraperClient::new().unwrap().update_index(&scraper, &db, &vec![], &vec![]).await.unwrap();
+
+        let in_vol = |c: &str, v: &str| (c.to_string(), v.to_string());
+        assert_eq!(volume_of_each(&db), [in_vol("C1", "Volume 2"), in_vol("C0", "Volume 1")]);
+    }
+
+    const BATCH_CHAPTER_PATHS: [&str; 5] = [
+        "/manga/example-chapter-1/",
+        "/manga/example-chapter-2/",
+        "/manga/example-chapter-3/",
+        "/manga/example-chapter-4/",
+        "/manga/example-chapter-5/",
+    ];
+
+    /// Pages per chapter: the wp-chapter fixture's p1..p3
+    const PAGES_PER_CHAPTER: u64 = 3;
+
+    /// A 64x64 PNG of deterministic noise, so its stored JPEG is a few KB
+    fn png_noisy_64() -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut state: u32 = 12345;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        };
+        let img = image::RgbImage::from_fn(64, 64, |_, _| image::Rgb([next(), next(), next()]));
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), 64, 64, image::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    /// Stored bytes of one chapter of noisy pages
+    fn chapter_bytes() -> u64 {
+        let page = process_image(&png_noisy_64(), &ImagesConfig::default()).unwrap().bytes.len() as u64;
+        PAGES_PER_CHAPTER * page
+    }
+
+    /// Serve the first `n` batch chapters, all with the same three noisy pages,
+    /// and return a manga scraper and a db holding them pending in `volume`
+    async fn batch_setup(n: usize, volume: &str) -> (Arc<dyn SourceScraper>, SourceDatabase) {
+        let png = png_noisy_64();
+        let base = serve_fixtures(|b| {
+            let mut routes: Vec<FixtureRoute> = BATCH_CHAPTER_PATHS[..n].iter()
+                .map(|p| FixtureRoute { path: p, status: 200, content_type: "text/html", body: wp_chapter_on(b) })
+                .collect();
+            for p in ["/p1.png", "/p2.png", "/p3.png"] {
+                routes.push(FixtureRoute { path: p, status: 200, content_type: "image/png", body: png.clone() });
+            }
+            routes
+        }).await;
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume(volume).unwrap();
+        for (i, p) in BATCH_CHAPTER_PATHS[..n].iter().enumerate() {
+            db.add_chapter(&format!("Ch {}", i + 1), &format!("{}{}", base, p), vol).unwrap();
+        }
+        (manga_scraper(&base), db)
+    }
+
+    /// Download every pending chapter with an attachment limit whose batch budget is `budget`
+    async fn download_with_budget(scraper: &Arc<dyn SourceScraper>, db: &SourceDatabase, budget: u64) {
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+        let limit = (budget + 1024 * 1024) as usize;
+        ScraperClient::new().unwrap().download_all_chapters(scraper, db, 0, &images, limit).await.unwrap();
+    }
+
+    /// Five chapters downloaded with room for two per batch
+    async fn five_chapters_two_per_batch() -> (Arc<dyn SourceScraper>, SourceDatabase) {
+        let (scraper, db) = batch_setup(5, "Volume 1").await;
+        download_with_budget(&scraper, &db, 2 * chapter_bytes() + 1).await;
+        (scraper, db)
+    }
+
+    fn ch_in(n: u32, v: &str) -> (String, String) {
+        (format!("Ch {}", n), v.to_string())
+    }
+
+    #[tokio::test]
+    async fn chapters_fill_batches_by_budget_and_only_closing_flags_a_batch() {
+        let (_scraper, db) = five_chapters_two_per_batch().await;
+
+        assert_eq!(volume_of_each(&db), [
+            ch_in(1, "Volume 1"), ch_in(2, "Volume 1"),
+            ch_in(3, "Volume 2"), ch_in(4, "Volume 2"),
+            ch_in(5, "Volume 3"),
+        ]);
+        assert_eq!(flagged_volumes(&db), ["Volume 1", "Volume 2"]);
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_first_chapter_is_a_batch_of_one() {
+        let (scraper, db) = batch_setup(2, "Volume 1").await;
+
+        download_with_budget(&scraper, &db, chapter_bytes() / 2).await;
+
+        assert_eq!(volume_of_each(&db), [ch_in(1, "Volume 1"), ch_in(2, "Volume 2")]);
+        assert_eq!(flagged_volumes(&db), ["Volume 1"]);
+    }
+
+    #[tokio::test]
+    async fn a_source_named_volume_from_an_older_scrape_is_the_open_batch() {
+        let (scraper, db) = batch_setup(2, "The JOJOLands").await;
+
+        download_with_budget(&scraper, &db, chapter_bytes() + 1).await;
+
+        assert_eq!(volume_of_each(&db), [ch_in(1, "The JOJOLands"), ch_in(2, "Volume 2")]);
+        assert_eq!(flagged_volumes(&db), ["The JOJOLands"]);
+    }
+
+    #[tokio::test]
+    async fn redownload_keeps_a_manga_chapter_in_its_batch_and_flags_nothing() {
+        let (scraper, db) = five_chapters_two_per_batch().await;
+        for c in db.get_downloaded_chapters().unwrap() {
+            db.update_generated_chapter(c.id, false).unwrap();
+            db.update_generated_volume(c.volume_id, false).unwrap();
+        }
+        let before = volume_of_each(&db);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&scraper, &db, 0, &images).await.unwrap();
+
+        assert_eq!(volume_of_each(&db), before);
+        assert_eq!(db.count_volumes().unwrap(), 3);
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
     }
 
     #[test]
