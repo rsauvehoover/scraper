@@ -43,6 +43,7 @@ Run with no flags to process every enabled source (index update, chapter downloa
 | `--pull-chapter <URL>` | Seed a chapter that isn't on the TOC yet (requires `--source`) |
 | `--volume <NAME>` | Volume for `--pull-chapter` (default: latest volume in the DB) |
 | `--title <NAME>` | Title for `--pull-chapter` (default: parsed from the chapter page) |
+| `--redownload` | Re-fetch every stored chapter of `--source`, recovering images; stores results without flagging anything for EPUB generation or sending. Requires `--source` |
 
 ### Pulling a chapter early
 
@@ -318,12 +319,23 @@ cargo bump {major|minor|patch} --git-tag
 
 ## Configuration
 
+Chapter images are downloaded, scaled to `Images`, and embedded; a text chapter whose image cannot be fetched is stored without it.
+
 Create a `config.json` file with the following structure:
 
 ```jsonc
 {
   // Delay between HTTP requests in milliseconds (default: 1000)
   "RequestDelay": 1000,
+
+  // Image handling for every source (defaults shown). Pages and chapter
+  // images are scaled down to fit these bounds, never up.
+  "Images": {
+    "MaxWidth": 2528,      // Two Kindle screen widths, so a double-page spread keeps detail
+    "MaxHeight": 1680,     // Kindle Colorsoft / Paperwhite screen height
+    "JpegQuality": 85,
+    "RequestDelay": 250    // Milliseconds between image downloads
+  },
 
   // Email configuration for sending EPUBs (optional)
   "Mail": {

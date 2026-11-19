@@ -41,6 +41,11 @@ struct Args {
     #[arg(long, requires = "pull_chapter", value_name = "NAME")]
     title: Option<String>,
 
+    /// Re-fetch every stored chapter of --source, recovering images, without
+    /// flagging anything for EPUB generation or sending
+    #[arg(long, requires = "source", conflicts_with_all = ["pull_chapter", "skip_download"])]
+    redownload: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -128,6 +133,17 @@ async fn main() {
             }
         };
 
+        // Re-download only: no index update, download, EPUB generation or send
+        if args.redownload {
+            if let Err(e) = client
+                .redownload_all(&scraper, &db, config.request_delay, &config.images)
+                .await
+            {
+                println!("Error re-downloading chapters for {}: {}", source.id, e);
+            }
+            continue;
+        }
+
         // Update index
         if !args.skip_index {
             if let Err(e) = client.update_index(&scraper, &db, &source.ignored_volumes, &source.ignored_chapters).await {
@@ -159,7 +175,7 @@ async fn main() {
         // Download chapters
         if !args.skip_download {
             if let Err(e) = client
-                .download_all_chapters(&scraper, &db, config.request_delay)
+                .download_all_chapters(&scraper, &db, config.request_delay, &config.images)
                 .await
             {
                 println!("Error downloading chapters for {}: {}", source.id, e);

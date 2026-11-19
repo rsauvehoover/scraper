@@ -27,6 +27,9 @@ pub enum ScrapeError {
 
     #[error("Invalid configuration: {0}")]
     Config(String),
+
+    #[error("Image processing failed: {0}")]
+    Image(String),
 }
 
 /// Errors that can occur during EPUB generation

@@ -1,4 +1,5 @@
 mod client;
+pub mod content_images;
 mod generic;
 mod registry;
 mod royal_road;

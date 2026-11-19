@@ -5,6 +5,7 @@ use soup::prelude::*;
 use crate::config::{AuthConfig, SelectorType, SourceConfig};
 use crate::error::{ScrapeError, ScrapeResult};
 
+use super::content_images::{extract_images, unwrap_image_links};
 use super::traits::{ChapterContent, ScrapedChapter, SourceScraper};
 
 /// Generic scraper that uses configurable selectors
@@ -146,7 +147,7 @@ impl SourceScraper for GenericScraper {
         );
 
         let chapter_title = format!("<h1>{}</h1>", title);
-        let body = content.display();
+        let (body, images) = extract_images(&unwrap_image_links(&content.display()));
         let footer = "</body></html>";
 
         let full_html = format!("{}\n{}\n{}\n{}\n", header, chapter_title, body, footer);
@@ -157,6 +158,7 @@ impl SourceScraper for GenericScraper {
             is_patreon_only,
             next_chapter_url: None,
             next_chapter_title: None,
+            images,
         })
     }
 
@@ -193,5 +195,22 @@ impl SourceScraper for GenericScraper {
 
     fn post_processors(&self) -> &[String] {
         &self.config.post_processors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_chapter_lists_images_and_normalises_their_tags() {
+        let mut cfg = SourceConfig::default();
+        cfg.selectors.main_content = "content".into();
+        let scraper = GenericScraper::new(cfg);
+        let html = r#"<html><head><title>T</title></head><body><div id="content"><p>x</p><a href="/f"><img src="https://example.com/a.png?w=1" alt="art"></a></div></body></html>"#;
+        let c = scraper.parse_chapter(html, "Ch").await.unwrap();
+        assert_eq!(c.images, vec!["https://example.com/a.png"]);
+        assert!(c.html.contains(r#"<img src="https://example.com/a.png" alt="art" style="max-width:100%;height:auto"/>"#));
+        assert!(!c.html.contains("<a href=\"/f\""));
     }
 }

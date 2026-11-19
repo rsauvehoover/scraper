@@ -150,6 +150,19 @@ fn process_chapter_data(raw_data: &str, ctx: &EpubContext, strip_colour: bool) -
     processed
 }
 
+/// Add a chapter's stored images as EPUB resources at the relative paths
+/// its HTML references.
+fn add_chapter_images(
+    epub: &mut EpubBuilder<ZipLibrary>,
+    db: &SourceDatabase,
+    chapter_id: isize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for img in db.get_chapter_images(chapter_id)? {
+        epub.add_resource(&img.path, img.data.as_slice(), &img.mime)?;
+    }
+    Ok(())
+}
+
 /// Build a single-chapter EPUB in memory. Touches no filesystem path.
 pub fn build_chapter_epub(
     db: &SourceDatabase,
@@ -178,6 +191,7 @@ pub fn build_chapter_epub(
     let raw_data = db.get_chapter_data(chapter.id)?;
     let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
+    add_chapter_images(&mut epub, db, chapter.id)?;
     epub.add_content(
         EpubContent::new(
             format!("{}({}).xhtml", &chapter.id, &safe_name),
@@ -260,6 +274,7 @@ fn generate_chapters(
         let raw_data = db.get_chapter_data(chapter.id)?;
         let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
+        add_chapter_images(&mut combined_epub, db, chapter.id)?;
         combined_epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, sanitize_filename(&chapter.name)),
@@ -331,6 +346,7 @@ pub fn build_volume_epub(
 
         let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
+        add_chapter_images(&mut epub, db, chapter.id)?;
         epub.add_content(
             EpubContent::new(
                 format!("{}({}).xhtml", chapter.id, sanitize_filename(&chapter.name)),
@@ -459,7 +475,7 @@ pub async fn generate_epubs_for_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SourceDatabase;
+    use crate::db::{ChapterImage, SourceDatabase};
     use serial_test::serial;
 
     fn fixture_db() -> (SourceDatabase, Volume, Vec<Chapter>) {
@@ -532,6 +548,67 @@ mod tests {
         assert_eq!(attachment.mime, "application/epub+zip");
     }
 
+    /// The web process opens databases query-only and never runs the schema
+    /// migration, so a database last written by a binary that predates the
+    /// `images` table must still build: no table means no images.
+    #[serial]
+    #[test]
+    fn build_chapter_epub_works_on_database_without_images_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::CwdGuard::change_to(dir.path());
+        std::fs::create_dir("db").unwrap();
+        {
+            let conn = rusqlite::Connection::open(SourceDatabase::path_for("test-source")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE volumes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    regenerate_epub INTEGER DEFAULT 0 CHECK(regenerate_epub IN (0, 1)),
+                    UNIQUE(name)
+                );
+                CREATE TABLE chapters(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    uri TEXT NOT NULL,
+                    volumeid INTEGER,
+                    data_id INTEGER,
+                    regenerate_epub INTEGER DEFAULT 0 CHECK(regenerate_epub IN (0, 1)),
+                    FOREIGN KEY(data_id) REFERENCES raw_data(id),
+                    FOREIGN KEY(volumeid) REFERENCES volumes(id),
+                    UNIQUE(name, uri, volumeid)
+                );
+                CREATE TABLE raw_data(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chapter_id INTEGER,
+                    data TEXT,
+                    FOREIGN KEY(chapter_id) REFERENCES chapters(id),
+                    UNIQUE(chapter_id)
+                );
+                INSERT INTO volumes(id, name) VALUES(1, 'Volume 1');
+                INSERT INTO chapters(id, name, uri, volumeid)
+                    VALUES(1, 'Chapter One', 'https://example.com/c1', 1);
+                INSERT INTO raw_data(id, chapter_id, data) VALUES(1, 1, '<p>body</p>');
+                UPDATE chapters SET data_id = 1 WHERE id = 1;",
+            )
+            .unwrap();
+        }
+
+        let db = SourceDatabase::open_query_only("test-source").unwrap();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        assert!(db.get_chapter_images(1).unwrap().is_empty());
+        let chapters = db.get_chapters_by_volume(1).unwrap();
+        let attachment = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+        let volume = Volume { id: 1, name: "Volume 1".to_string() };
+        build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+    }
+
     #[test]
     fn sanitize_filename_replaces_path_separators() {
         assert_eq!(
@@ -559,5 +636,83 @@ mod tests {
 
         assert!(!css.is_empty(), "stylesheet must be embedded");
         assert!(font.is_some(), "font must be embedded");
+    }
+
+    fn read_zip_entry(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut f = z.by_name(name).ok()?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut out).unwrap();
+        Some(out)
+    }
+
+    fn store_with_image(db: &SourceDatabase, id: isize, byte: u8) -> String {
+        let path = format!("images/{}-0.jpg", id);
+        let html = format!(
+            r#"<html><body><p>t</p><img src="{}" alt="" style="s"/></body></html>"#,
+            path
+        );
+        let img = ChapterImage {
+            chapter_id: id,
+            seq: 0,
+            path: path.clone(),
+            source_url: "https://example.com/a.jpg".into(),
+            mime: "image/jpeg".into(),
+            width: 1,
+            height: 1,
+            data: vec![byte; 3],
+        };
+        db.store_chapter_content(id, &html, &[img], true).unwrap();
+        path
+    }
+
+    #[test]
+    fn chapter_epub_contains_its_images_at_the_referenced_path() {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        let path = store_with_image(&db, id, 9);
+        let chapters = db.get_chapters_by_volume(vol).unwrap();
+        let source = SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+
+        let epub = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+
+        assert_eq!(
+            read_zip_entry(&epub.bytes, &format!("OEBPS/{}", path)),
+            Some(vec![9, 9, 9])
+        );
+        let opf =
+            String::from_utf8(read_zip_entry(&epub.bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains(&path) && opf.contains("image/jpeg"), "{}", opf);
+        let xhtml = String::from_utf8(
+            read_zip_entry(&epub.bytes, &format!("OEBPS/{}(C1).xhtml", id)).unwrap(),
+        )
+        .unwrap();
+        assert!(xhtml.contains(&format!("src=\"{}\"", path)));
+    }
+
+    #[test]
+    fn volume_epub_contains_images_of_every_chapter() {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        db.add_chapter("C2", "https://example.com/c2", vol).unwrap();
+        let ids: Vec<isize> = db.get_empty_chapters().unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 2);
+        let p0 = store_with_image(&db, ids[0], 1);
+        let p1 = store_with_image(&db, ids[1], 2);
+        let chapters = db.get_chapters_by_volume(vol).unwrap();
+        let volume = Volume { id: vol, name: "Volume 1".to_string() };
+        let source = SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext { source: &source, processor_registry: &registry };
+
+        let epub = build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+
+        assert_eq!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}", p0)), Some(vec![1; 3]));
+        assert_eq!(read_zip_entry(&epub.bytes, &format!("OEBPS/{}", p1)), Some(vec![2; 3]));
     }
 }

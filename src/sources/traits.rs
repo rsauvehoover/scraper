@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::config::SourceKind;
 use crate::error::ScrapeResult;
 
 /// Parsed chapter data from TOC
@@ -21,6 +22,8 @@ pub struct ChapterContent {
     pub next_chapter_url: Option<String>,
     /// Title of next chapter (if available)
     pub next_chapter_title: Option<String>,
+    /// Image fetch URLs found in `html`, in document order, each unique
+    pub images: Vec<String>,
 }
 
 /// Trait for source scrapers
@@ -61,4 +64,9 @@ pub trait SourceScraper: Send + Sync {
 
     /// Get the list of post-processor names to apply
     fn post_processors(&self) -> &[String];
+
+    /// What kind of content this source serves; decides how failed images are handled
+    fn kind(&self) -> SourceKind {
+        SourceKind::Text
+    }
 }

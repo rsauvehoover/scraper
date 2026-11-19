@@ -16,6 +16,7 @@ use crate::web::send_plan::{Item, PlannedEmail, Refusal};
 pub const HISTORY: usize = 20;
 
 const BUILD_FAILED: &str = "could not build the EPUB";
+const TOO_LARGE: &str = "too large to send";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmailState {
@@ -194,6 +195,12 @@ pub(crate) async fn run_job(
             }
         };
 
+        if crate::mail::attachment_too_large(&attachment) {
+            jobs.set(&id, index, EmailState::Failed(TOO_LARGE));
+            log(&id, &source.id, email, TOO_LARGE);
+            continue;
+        }
+
         jobs.set(&id, index, EmailState::Sending);
         match mailer.send(&email.to, &attachment).await {
             Ok(()) => {
@@ -290,6 +297,26 @@ mod tests {
             EmailState::Sent,
         ]);
         assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_too_large_build_fails_that_email_without_calling_the_mailer() {
+        fn huge_build(_: &SourceConfig, _: &Item, _: bool) -> Result<Attachment, BuildError> {
+            Ok(Attachment {
+                filename: "big.epub".into(),
+                mime: "application/epub+zip".into(),
+                bytes: vec![0; crate::mail::MAX_ATTACHMENT_BYTES + 1],
+            })
+        }
+        let (mailer, sent) = RecordingMailer::new();
+        let emails = vec![email("a", "Reader", false)];
+        let jobs = Arc::new(SendJobs::new());
+        let id = jobs.try_start("test-source", "Test Serial", &emails).unwrap();
+        run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), huge_build,
+                Arc::new(Semaphore::new(1))).await;
+        let job = jobs.get(&id).unwrap();
+        assert_eq!(job.emails[0].state, EmailState::Failed("too large to send"));
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

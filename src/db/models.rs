@@ -15,3 +15,16 @@ pub struct Volume {
     pub id: isize,
     pub name: String,
 }
+
+/// An image downloaded for a chapter, stored in the source database
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterImage {
+    pub chapter_id: isize,
+    pub seq: u32,
+    pub path: String,
+    pub source_url: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}

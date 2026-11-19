@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, Params, Result};
 use std::path::{Path, PathBuf};
 
-use super::models::{Chapter, Volume};
+use super::models::{Chapter, ChapterImage, Volume};
 
 /// Return both trailing-slash variants of a URI for slash-insensitive matching
 fn uri_variants(uri: &str) -> (String, String) {
@@ -227,6 +227,24 @@ impl SourceDatabase {
             (),
         )?;
 
+        // Images embedded in chapters
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS images(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chapter_id INTEGER NOT NULL REFERENCES chapters(id),
+                seq INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                UNIQUE(chapter_id, seq),
+                UNIQUE(path)
+            )",
+            (),
+        )?;
+
         Ok(())
     }
 
@@ -276,10 +294,17 @@ impl SourceDatabase {
 
     /// Remove a chapter from the database
     pub fn remove_chapter(&self, chapter_id: isize) -> Result<()> {
-        self.conn
-            .prepare("DELETE FROM chapters WHERE id = ?1")?
-            .execute([chapter_id])?;
-        Ok(())
+        // chapters.data_id and raw_data.chapter_id reference each other, so
+        // break the cycle before deleting either side.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM images WHERE chapter_id = ?1", [chapter_id])?;
+        tx.execute(
+            "UPDATE chapters SET data_id = NULL WHERE id = ?1",
+            [chapter_id],
+        )?;
+        tx.execute("DELETE FROM raw_data WHERE chapter_id = ?1", [chapter_id])?;
+        tx.execute("DELETE FROM chapters WHERE id = ?1", [chapter_id])?;
+        tx.commit()
     }
 
     /// Check if a chapter exists by URI (trailing-slash insensitive)
@@ -346,6 +371,22 @@ impl SourceDatabase {
 
     /// Add or update chapter data
     pub fn add_chapter_data(&self, chapter_id: isize, data: &str) -> Result<()> {
+        self.store_chapter_content(chapter_id, data, &[], true)
+    }
+
+    /// Replace a chapter's HTML and images in one transaction.
+    ///
+    /// With `flag_regeneration`, the chapter and volume EPUB flags are set to
+    /// whether the HTML changed. Without it, neither flag is touched.
+    pub fn store_chapter_content(
+        &self,
+        chapter_id: isize,
+        data: &str,
+        images: &[ChapterImage],
+        flag_regeneration: bool,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
         let existing_data: String = self
             .conn
             .query_row(
@@ -357,31 +398,94 @@ impl SourceDatabase {
             .unwrap_or_default();
 
         self.conn
-            .prepare("INSERT OR REPLACE INTO raw_data(data, chapter_id) VALUES(?1, ?2)")?
+            .execute("DELETE FROM images WHERE chapter_id = ?1", [chapter_id])?;
+        for image in images {
+            self.conn.execute(
+                "INSERT INTO images(chapter_id, seq, path, source_url, mime, width, height, data)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    chapter_id,
+                    image.seq,
+                    image.path,
+                    image.source_url,
+                    image.mime,
+                    image.width,
+                    image.height,
+                    image.data
+                ],
+            )?;
+        }
+
+        // Upsert rather than INSERT OR REPLACE: REPLACE deletes the old row,
+        // which chapters.data_id still references, and foreign keys are enforced.
+        self.conn
+            .prepare(
+                "INSERT INTO raw_data(data, chapter_id) VALUES(?1, ?2)
+                 ON CONFLICT(chapter_id) DO UPDATE SET data = excluded.data",
+            )?
             .execute((data, chapter_id))?;
 
-        let regenerate = !existing_data.eq(data);
-        let data_id: isize =
-            self.conn
-                .query_row("SELECT id FROM raw_data WHERE data = ?1", [data], |row| {
-                    row.get(0)
-                })?;
-
-        self.conn
-            .prepare("UPDATE chapters SET data_id = ?1, regenerate_epub = ?2 WHERE id = ?3")?
-            .execute([data_id, regenerate as isize, chapter_id])?;
-
-        let volume_id: isize = self.conn.query_row(
-            "SELECT volumeid FROM chapters WHERE id = ?1",
+        let data_id: isize = self.conn.query_row(
+            "SELECT id FROM raw_data WHERE chapter_id = ?1",
             [chapter_id],
             |row| row.get(0),
         )?;
 
-        self.conn
-            .prepare("UPDATE volumes SET regenerate_epub = ?1 WHERE id = ?2")?
-            .execute([regenerate as isize, volume_id])?;
+        if flag_regeneration {
+            let regenerate = !existing_data.eq(data);
+            self.conn
+                .prepare("UPDATE chapters SET data_id = ?1, regenerate_epub = ?2 WHERE id = ?3")?
+                .execute([data_id, regenerate as isize, chapter_id])?;
 
-        Ok(())
+            let volume_id: isize = self.conn.query_row(
+                "SELECT volumeid FROM chapters WHERE id = ?1",
+                [chapter_id],
+                |row| row.get(0),
+            )?;
+
+            self.conn
+                .prepare("UPDATE volumes SET regenerate_epub = ?1 WHERE id = ?2")?
+                .execute([regenerate as isize, volume_id])?;
+        } else {
+            self.conn
+                .prepare("UPDATE chapters SET data_id = ?1 WHERE id = ?2")?
+                .execute([data_id, chapter_id])?;
+        }
+
+        tx.commit()
+    }
+
+    /// Get a chapter's images ordered by sequence.
+    ///
+    /// A database last written by a binary that predates the `images` table
+    /// has none, and a query-only handle cannot create it, so a missing table
+    /// means the chapter has no images.
+    pub fn get_chapter_images(&self, chapter_id: isize) -> Result<Vec<ChapterImage>> {
+        let has_images_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'images')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_images_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT chapter_id, seq, path, source_url, mime, width, height, data
+             FROM images WHERE chapter_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([chapter_id], |row| {
+            Ok(ChapterImage {
+                chapter_id: row.get(0)?,
+                seq: row.get(1)?,
+                path: row.get(2)?,
+                source_url: row.get(3)?,
+                mime: row.get(4)?,
+                width: row.get(5)?,
+                height: row.get(6)?,
+                data: row.get(7)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Get chapter data by chapter ID
@@ -405,6 +509,14 @@ impl SourceDatabase {
     pub fn get_empty_chapters(&self) -> Result<Vec<Chapter>> {
         self.chapter_query(
             "SELECT id, name, uri, volumeid, data_id FROM chapters WHERE data_id IS NULL",
+            [],
+        )
+    }
+
+    /// Get chapters that have data, in id order
+    pub fn get_downloaded_chapters(&self) -> Result<Vec<Chapter>> {
+        self.chapter_query(
+            "SELECT id, name, uri, volumeid, data_id FROM chapters WHERE data_id IS NOT NULL ORDER BY id",
             [],
         )
     }
@@ -671,5 +783,124 @@ mod tests {
             assert!(row.3.is_none(), "no data should be attached");
             assert_eq!(row.4, 0, "regenerate flag must not be set");
         }
+    }
+
+    fn image(chapter_id: isize, seq: u32, bytes: &[u8]) -> ChapterImage {
+        ChapterImage {
+            chapter_id, seq,
+            path: format!("images/{}-{}.jpg", chapter_id, seq),
+            source_url: format!("https://example.com/img/{}.jpg", seq),
+            mime: "image/jpeg".into(), width: 10, height: 20, data: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn store_chapter_content_inserts_images_in_seq_order() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.store_chapter_content(id, "<html/>", &[image(id, 1, b"b"), image(id, 0, b"a")], true).unwrap();
+        let got = db.get_chapter_images(id).unwrap();
+        assert_eq!(got.iter().map(|i| i.seq).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(got[0].data, b"a");
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<html/>");
+    }
+
+    #[test]
+    fn storing_again_replaces_the_old_images() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.store_chapter_content(id, "<html>a</html>", &[image(id, 0, b"a"), image(id, 1, b"b")], true).unwrap();
+        db.store_chapter_content(id, "<html>b</html>", &[image(id, 0, b"c")], true).unwrap();
+        let got = db.get_chapter_images(id).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].data, b"c");
+    }
+
+    #[test]
+    fn removing_a_chapter_removes_its_images() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.store_chapter_content(id, "<html/>", &[image(id, 0, b"a")], true).unwrap();
+        db.remove_chapter(id).unwrap();
+        let n: i64 = db.connection().query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn unflagged_store_touches_neither_flag() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.add_chapter_data(id, "<html>old</html>").unwrap();
+        db.update_generated_chapter(id, false).unwrap();
+        db.update_generated_volume(vol, false).unwrap();
+
+        db.store_chapter_content(id, "<html>new</html>", &[image(id, 0, b"a")], false).unwrap();
+
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<html>new</html>");
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+
+        // And the other way: a flag that was set stays set.
+        db.update_generated_chapter(id, true).unwrap();
+        db.store_chapter_content(id, "<html>new</html>", &[], false).unwrap();
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flagged_store_sets_flags_on_new_and_changed_html() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        let clear = || {
+            db.update_generated_chapter(id, false).unwrap();
+            db.update_generated_volume(vol, false).unwrap();
+        };
+
+        db.store_chapter_content(id, "<a/>", &[], true).unwrap();
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1);
+        clear();
+
+        db.store_chapter_content(id, "<b/>", &[], true).unwrap();
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1);
+        clear();
+
+        db.store_chapter_content(id, "<b/>", &[], true).unwrap();
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_html_with_different_image_bytes_does_not_flag() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.store_chapter_content(id, "<html/>", &[image(id, 0, b"a")], true).unwrap();
+        db.update_generated_chapter(id, false).unwrap();
+        db.store_chapter_content(id, "<html/>", &[image(id, 0, b"zz")], true).unwrap();
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn downloaded_chapters_are_those_with_data_in_id_order() {
+        let db = test_db();
+        let vol = db.add_volume("Volume 1").unwrap();
+        for n in 1..=3 { db.add_chapter(&format!("C{}", n), &format!("https://example.com/c{}", n), vol).unwrap(); }
+        let ids: Vec<isize> = db.get_empty_chapters().unwrap().iter().map(|c| c.id).collect();
+        db.add_chapter_data(ids[2], "<c/>").unwrap();
+        db.add_chapter_data(ids[0], "<a/>").unwrap();
+        let got: Vec<isize> = db.get_downloaded_chapters().unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(got, vec![ids[0], ids[2]]);
     }
 }

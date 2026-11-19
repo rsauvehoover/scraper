@@ -4,10 +4,16 @@ use std::time::Duration;
 use tokio::time::sleep;
 use soup::prelude::*;
 
-use crate::db::SourceDatabase;
+use crate::config::{ImagesConfig, SourceKind};
+use crate::db::{ChapterImage, SourceDatabase};
 use crate::error::{ScrapeError, ScrapeResult};
+use crate::images::{process_image, ProcessedImage};
 
+use super::content_images::{assign_image_paths, drop_image};
 use super::traits::SourceScraper;
+
+/// Largest image body `get_bytes` will accept, in bytes.
+pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Extract a chapter title from a chapter page, best effort.
 /// The TOC upsert corrects the name later, so this only needs to be
@@ -53,6 +59,90 @@ fn title_from_slug(url: &str) -> String {
         .next()
         .unwrap_or(url)
         .replace('-', " ")
+}
+
+/// What to do with a chapter when one of its images cannot be fetched or processed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImagePolicy {
+    /// Remove the image from the chapter and keep the rest
+    DropFailed,
+    /// Fail the whole chapter so it is retried on the next run
+    FailChapter,
+}
+
+impl ImagePolicy {
+    /// Text chapters survive a missing illustration; a manga chapter without
+    /// one of its pages is not worth storing.
+    pub fn for_kind(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Text => ImagePolicy::DropFailed,
+            SourceKind::MangaTcb | SourceKind::MangaWordpress => ImagePolicy::FailChapter,
+        }
+    }
+}
+
+/// An image URL from a chapter and, if fetching and processing worked, the result
+#[derive(Debug)]
+pub struct FetchedImage {
+    pub url: String,
+    pub image: Option<ProcessedImage>,
+}
+
+/// Chapter HTML pointing at local image paths, with the image rows to store
+#[derive(Debug)]
+pub struct Assembled {
+    pub html: String,
+    pub images: Vec<ChapterImage>,
+}
+
+/// A fetched and assembled chapter, ready to store
+struct FetchedChapter {
+    assembled: Assembled,
+    is_patreon_only: bool,
+    next_chapter_url: Option<String>,
+    next_chapter_title: Option<String>,
+}
+
+/// Number the fetched images, point the HTML at their local paths, and
+/// apply `policy` to the images that failed.
+pub fn assemble_chapter(
+    chapter_id: isize,
+    html: &str,
+    fetched: &[FetchedImage],
+    policy: ImagePolicy,
+) -> ScrapeResult<Assembled> {
+    let mut html = html.to_string();
+    let mut images = Vec::new();
+    let mut assigned = Vec::new();
+
+    for f in fetched {
+        match &f.image {
+            Some(img) => {
+                let seq = images.len() as u32;
+                let path = format!("images/{}-{}.{}", chapter_id, seq, img.ext);
+                assigned.push((f.url.clone(), path.clone()));
+                images.push(ChapterImage {
+                    chapter_id,
+                    seq,
+                    path,
+                    source_url: f.url.clone(),
+                    mime: img.mime.to_string(),
+                    width: img.width,
+                    height: img.height,
+                    data: img.bytes.clone(),
+                });
+            }
+            None => match policy {
+                ImagePolicy::DropFailed => html = drop_image(&html, &f.url),
+                ImagePolicy::FailChapter => return Err(ScrapeError::Image(f.url.clone())),
+            },
+        }
+    }
+
+    Ok(Assembled {
+        html: assign_image_paths(&html, &assigned),
+        images,
+    })
 }
 
 /// HTTP client wrapper for scraping operations
@@ -112,6 +202,65 @@ impl ScraperClient {
         let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
         let body = resp.text().await.map_err(ScrapeError::Http)?;
         Ok(body)
+    }
+
+    /// Fetch raw image bytes from a URL, failing on non-success HTTP status.
+    ///
+    /// Images come from third-party hosts during unattended runs, so the
+    /// request has a timeout and a body over `MAX_IMAGE_BYTES` is refused.
+    pub async fn get_bytes(&self, url: &str) -> ScrapeResult<Vec<u8>> {
+        let resp = self
+            .client
+            .get(url)
+            .header(USER_AGENT, "reqwest")
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(ScrapeError::Http)?;
+        let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
+        let too_big = || {
+            ScrapeError::Image(format!(
+                "{} exceeds the {} byte image limit",
+                url, MAX_IMAGE_BYTES
+            ))
+        };
+        if resp.content_length().is_some_and(|len| len > MAX_IMAGE_BYTES as u64) {
+            return Err(too_big());
+        }
+        let bytes = resp.bytes().await.map_err(ScrapeError::Http)?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(too_big());
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Fetch and process one image
+    async fn fetch_image(&self, url: &str, images: &ImagesConfig) -> ScrapeResult<ProcessedImage> {
+        let bytes = self.get_bytes(url).await?;
+        let config = images.clone();
+        tokio::task::spawn_blocking(move || process_image(&bytes, &config))
+            .await
+            .map_err(|e| ScrapeError::Image(e.to_string()))?
+    }
+
+    /// Fetch and process every image URL, in order. A failure is reported
+    /// and recorded as `image: None`; the caller decides what it means.
+    pub async fn fetch_images(&self, urls: &[String], images: &ImagesConfig) -> Vec<FetchedImage> {
+        let mut fetched = Vec::with_capacity(urls.len());
+        for (i, url) in urls.iter().enumerate() {
+            if i > 0 {
+                sleep(Duration::from_millis(images.request_delay)).await;
+            }
+            let image = match self.fetch_image(url, images).await {
+                Ok(image) => Some(image),
+                Err(e) => {
+                    println!("  Warning: could not fetch image {}: {}", url, e);
+                    None
+                }
+            };
+            fetched.push(FetchedImage { url: url.clone(), image });
+        }
+        fetched
     }
 
     /// Update the index (table of contents) for a source
@@ -213,6 +362,7 @@ impl ScraperClient {
         scraper: &Arc<dyn SourceScraper>,
         db: &SourceDatabase,
         delay_ms: u64,
+        images: &ImagesConfig,
     ) -> ScrapeResult<()> {
         let auth_headers = scraper.build_auth_headers();
         let mut total_downloaded = 0;
@@ -251,7 +401,7 @@ impl ScraperClient {
                 }
 
                 match self
-                    .download_chapter(scraper, db, &chapter, auth_headers.as_ref())
+                    .download_chapter(scraper, db, &chapter, auth_headers.as_ref(), images)
                     .await
                 {
                     Ok(discovered) => {
@@ -295,15 +445,135 @@ impl ScraperClient {
         Ok(())
     }
 
+    /// Re-fetch every stored chapter and replace its HTML and images without
+    /// flagging anything for EPUB generation, so nothing is re-sent.
+    /// A failed chapter keeps its old content; a Patreon-only page without
+    /// auth is skipped, never removed.
+    pub async fn redownload_all(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
+        db: &SourceDatabase,
+        delay_ms: u64,
+        images: &ImagesConfig,
+    ) -> ScrapeResult<()> {
+        let auth_headers = scraper.build_auth_headers();
+        let chapters = db.get_downloaded_chapters()?;
+        println!(
+            "({}) Re-downloading {} stored chapters",
+            scraper.source_id(),
+            chapters.len()
+        );
+
+        let mut stored = 0;
+        for (i, chapter) in chapters.iter().enumerate() {
+            if i > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            // Checked fetch: an error status must not overwrite stored content
+            let fetched = match self.get_html_checked(&chapter.uri, auth_headers.as_ref()).await {
+                Ok(html) => {
+                    self.fetch_chapter(scraper, chapter, &html, auth_headers.as_ref(), images)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            let result = match fetched {
+                Ok(f) if f.is_patreon_only && auth_headers.is_none() => {
+                    println!(
+                        "({}) Skipping Patreon-only chapter: {}",
+                        scraper.source_id(),
+                        chapter.name
+                    );
+                    continue;
+                }
+                Ok(f) => db
+                    .store_chapter_content(chapter.id, &f.assembled.html, &f.assembled.images, false)
+                    .map_err(ScrapeError::from),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => stored += 1,
+                Err(e) => println!(
+                    "({}) Error re-downloading '{}': {}",
+                    scraper.source_id(),
+                    chapter.name,
+                    e
+                ),
+            }
+        }
+
+        println!(
+            "({}) Re-downloaded {} of {} chapters",
+            scraper.source_id(),
+            stored,
+            chapters.len()
+        );
+        Ok(())
+    }
+
+    /// Parse an already-fetched chapter page, strip links, fetch images and
+    /// assemble. The caller fetches the page so it can choose whether an
+    /// error status counts as a failure.
+    /// A Patreon-only page without auth is returned unassembled: images are
+    /// not fetched and `assembled` is empty.
+    async fn fetch_chapter(
+        &self,
+        scraper: &Arc<dyn SourceScraper>,
+        chapter: &crate::db::Chapter,
+        html: &str,
+        auth_headers: Option<&Vec<(String, String)>>,
+        images: &ImagesConfig,
+    ) -> ScrapeResult<FetchedChapter> {
+        let content = scraper.parse_chapter(html, &chapter.name).await?;
+
+        if content.is_patreon_only && auth_headers.is_none() {
+            return Ok(FetchedChapter {
+                assembled: Assembled { html: String::new(), images: Vec::new() },
+                is_patreon_only: true,
+                next_chapter_url: content.next_chapter_url,
+                next_chapter_title: content.next_chapter_title,
+            });
+        }
+
+        // Apply strip-links post-processor during download
+        let processed_html = if scraper
+            .post_processors()
+            .contains(&"strip-links".to_string())
+        {
+            let re = regex::Regex::new(r"<a\b.*?</a>").unwrap();
+            re.replace_all(&content.html, "").to_string()
+        } else {
+            content.html
+        };
+
+        let fetched = self.fetch_images(&content.images, images).await;
+        let assembled = assemble_chapter(
+            chapter.id,
+            &processed_html,
+            &fetched,
+            ImagePolicy::for_kind(scraper.kind()),
+        )?;
+
+        Ok(FetchedChapter {
+            assembled,
+            is_patreon_only: content.is_patreon_only,
+            next_chapter_url: content.next_chapter_url,
+            next_chapter_title: content.next_chapter_title,
+        })
+    }
+
     async fn download_chapter(
         &self,
         scraper: &Arc<dyn SourceScraper>,
         db: &SourceDatabase,
         chapter: &crate::db::Chapter,
         auth_headers: Option<&Vec<(String, String)>>,
+        images: &ImagesConfig,
     ) -> ScrapeResult<usize> {
         let html = self.get_html(&chapter.uri, auth_headers).await?;
-        let content = scraper.parse_chapter(&html, &chapter.name).await?;
+        let content = self
+            .fetch_chapter(scraper, chapter, &html, auth_headers, images)
+            .await?;
 
         if content.is_patreon_only && auth_headers.is_none() {
             println!(
@@ -315,18 +585,8 @@ impl ScraperClient {
             return Ok(0);
         }
 
-        // Apply strip-links post-processor during download
-        let processed_html = if scraper
-            .post_processors()
-            .contains(&"strip-links".to_string())
-        {
-            let re = regex::Regex::new(r"<a.*?</a>").unwrap();
-            re.replace_all(&content.html, "").to_string()
-        } else {
-            content.html
-        };
-
-        db.add_chapter_data(chapter.id, &processed_html)?;
+        let assembled = content.assembled;
+        db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, true)?;
 
         // Handle chapter discovery: if there's a next chapter URL, add it to the database
         let mut discovered = 0;
@@ -375,6 +635,177 @@ impl Default for ScraperClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SourceConfig;
+    use crate::sources::generic::GenericScraper;
+    use crate::test_support::{serve_fixtures, FixtureRoute};
+
+    fn fetched(url: &str, ok: bool) -> FetchedImage {
+        FetchedImage { url: url.into(), image: ok.then(|| ProcessedImage { bytes: vec![1, 2], mime: "image/jpeg", ext: "jpg", width: 1, height: 1 }) }
+    }
+
+    fn png_2x2() -> Vec<u8> {
+        use image::ImageEncoder;
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([200, 10, 10]));
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), 2, 2, image::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn assemble_assigns_sequential_paths_and_rewrites_html() {
+        let html = r#"<img src="https://example.com/a.png" alt="" style="s"/><img src="https://example.com/b.png" alt="" style="s"/>"#;
+        let out = assemble_chapter(7, html, &[fetched("https://example.com/a.png", true), fetched("https://example.com/b.png", true)], ImagePolicy::DropFailed).unwrap();
+        assert_eq!(out.images.iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["images/7-0.jpg", "images/7-1.jpg"]);
+        assert_eq!(out.images[1].source_url, "https://example.com/b.png");
+        assert!(out.html.contains("src=\"images/7-0.jpg\"") && out.html.contains("src=\"images/7-1.jpg\""));
+        assert!(!out.html.contains("example.com"));
+    }
+
+    #[test]
+    fn text_policy_drops_a_failed_image_and_keeps_the_chapter() {
+        let html = r#"<p>t</p><img src="https://example.com/a.png" alt="" style="s"/><img src="https://example.com/b.png" alt="" style="s"/>"#;
+        let out = assemble_chapter(7, html, &[fetched("https://example.com/a.png", false), fetched("https://example.com/b.png", true)], ImagePolicy::DropFailed).unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].path, "images/7-0.jpg");
+        assert_eq!(out.html.matches("<img").count(), 1);
+    }
+
+    #[test]
+    fn manga_policy_fails_the_chapter_on_a_failed_image() {
+        let html = r#"<img src="https://example.com/a.png" alt="" style="s"/>"#;
+        let err = assemble_chapter(7, html, &[fetched("https://example.com/a.png", false)], ImagePolicy::FailChapter).unwrap_err();
+        assert!(matches!(err, ScrapeError::Image(_)));
+    }
+
+    #[test]
+    fn policy_follows_kind() {
+        assert_eq!(ImagePolicy::for_kind(SourceKind::Text), ImagePolicy::DropFailed);
+        assert_eq!(ImagePolicy::for_kind(SourceKind::MangaTcb), ImagePolicy::FailChapter);
+        assert_eq!(ImagePolicy::for_kind(SourceKind::MangaWordpress), ImagePolicy::FailChapter);
+    }
+
+    /// End to end against a local server: a text chapter with one good image,
+    /// one that 404s, and one whose body is HTML.
+    #[tokio::test]
+    async fn download_stores_chapter_with_fetched_images_and_drops_bad_ones() {
+        let png = png_2x2();
+        let base = serve_fixtures(|b| vec![
+            FixtureRoute { path: "/c1", status: 200, content_type: "text/html", body: format!(r#"<html><head><title>T</title></head><body><div id="content"><p>x</p><img src="{b}/good.png"/><img src="{b}/missing.png"/><img src="{b}/page.html"/></div></body></html>"#, b = b).into_bytes() },
+            FixtureRoute { path: "/good.png", status: 200, content_type: "image/png", body: png.clone() },
+            FixtureRoute { path: "/page.html", status: 200, content_type: "text/html", body: b"<html/>".to_vec() },
+        ]).await;
+
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("V").unwrap();
+        db.add_chapter("C1", &format!("{}/c1", base), vol).unwrap();
+        let mut cfg = SourceConfig::default();
+        cfg.selectors.main_content = "content".into();
+        let scraper: Arc<dyn SourceScraper> = Arc::new(GenericScraper::new(cfg));
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().download_all_chapters(&scraper, &db, 0, &images).await.unwrap();
+
+        let ch = db.get_downloaded_chapters().unwrap();
+        assert_eq!(ch.len(), 1);
+        let imgs = db.get_chapter_images(ch[0].id).unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].path, format!("images/{}-0.png", ch[0].id));
+        let html = db.get_chapter_data(ch[0].id).unwrap();
+        assert_eq!(html.matches("<img").count(), 1);
+        assert!(html.contains(&imgs[0].path));
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_refuses_a_body_over_the_cap() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/big.png", status: 200, content_type: "image/png", body: vec![0u8; MAX_IMAGE_BYTES + 1] },
+        ]).await;
+
+        let result = ScraperClient::new().unwrap().get_bytes(&format!("{}/big.png", base)).await;
+
+        assert!(matches!(result, Err(ScrapeError::Image(_))), "got {:?}", result.map(|b| b.len()));
+    }
+
+    /// A text-source scraper reading `<div id="content">`, with no auth
+    fn content_scraper() -> Arc<dyn SourceScraper> {
+        let mut cfg = SourceConfig::default();
+        cfg.selectors.main_content = "content".into();
+        Arc::new(GenericScraper::new(cfg))
+    }
+
+    /// One chapter at `{base}/c1` stored with "<old/>" and both regenerate flags cleared
+    fn db_with_stored_chapter(base: &str) -> (SourceDatabase, isize) {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let vol = db.add_volume("V").unwrap();
+        db.add_chapter("C1", &format!("{}/c1", base), vol).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.add_chapter_data(id, "<old/>").unwrap();
+        db.update_generated_chapter(id, false).unwrap();
+        db.update_generated_volume(vol, false).unwrap();
+        (db, id)
+    }
+
+    #[tokio::test]
+    async fn redownload_replaces_content_and_images_without_flagging() {
+        let png = png_2x2();
+        let base = serve_fixtures(|b| vec![
+            FixtureRoute { path: "/c1", status: 200, content_type: "text/html", body: format!(r#"<html><head><title>T</title></head><body><div id="content"><p>x</p><img src="{b}/good.png"/></div></body></html>"#, b = b).into_bytes() },
+            FixtureRoute { path: "/good.png", status: 200, content_type: "image/png", body: png.clone() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.png", id)));
+        assert_eq!(db.get_chapter_images(id).unwrap().len(), 1);
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redownload_keeps_old_content_when_the_page_fails() {
+        let base = serve_fixtures(|_| vec![]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+    }
+
+    #[tokio::test]
+    async fn redownload_keeps_old_content_on_an_error_status_with_a_content_body() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/c1", status: 500, content_type: "text/html", body: br#"<html><head><title>E</title></head><body><div id="content"><p>oops</p></div></body></html>"#.to_vec() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+        assert!(db.get_chapter_images(id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redownload_skips_a_patreon_only_chapter_instead_of_deleting_it() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/c1", status: 200, content_type: "text/html", body: "<html><head><title>Patron Early Access \u{2013} X</title></head><body><div id=\"content\"><p>locked</p></div></body></html>".as_bytes().to_vec() },
+        ]).await;
+        let (db, id) = db_with_stored_chapter(&base);
+        let images = ImagesConfig { request_delay: 0, ..ImagesConfig::default() };
+
+        ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
+
+        let chapters = db.get_downloaded_chapters().unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].id, id);
+        assert_eq!(db.get_chapter_data(id).unwrap(), "<old/>");
+    }
 
     #[test]
     fn extracts_wordpress_entry_title() {
