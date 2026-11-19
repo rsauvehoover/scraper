@@ -12,6 +12,9 @@ use crate::images::{process_image, ProcessedImage};
 use super::content_images::{assign_image_paths, drop_image};
 use super::traits::SourceScraper;
 
+/// Largest image body `get_bytes` will accept, in bytes.
+pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
 /// Extract a chapter title from a chapter page, best effort.
 /// The TOC upsert corrects the name later, so this only needs to be
 /// good enough for the immediately generated epub.
@@ -201,17 +204,33 @@ impl ScraperClient {
         Ok(body)
     }
 
-    /// Fetch raw bytes from a URL, failing on non-success HTTP status
+    /// Fetch raw image bytes from a URL, failing on non-success HTTP status.
+    ///
+    /// Images come from third-party hosts during unattended runs, so the
+    /// request has a timeout and a body over `MAX_IMAGE_BYTES` is refused.
     pub async fn get_bytes(&self, url: &str) -> ScrapeResult<Vec<u8>> {
         let resp = self
             .client
             .get(url)
             .header(USER_AGENT, "reqwest")
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .map_err(ScrapeError::Http)?;
         let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
+        let too_big = || {
+            ScrapeError::Image(format!(
+                "{} exceeds the {} byte image limit",
+                url, MAX_IMAGE_BYTES
+            ))
+        };
+        if resp.content_length().is_some_and(|len| len > MAX_IMAGE_BYTES as u64) {
+            return Err(too_big());
+        }
         let bytes = resp.bytes().await.map_err(ScrapeError::Http)?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(too_big());
+        }
         Ok(bytes.to_vec())
     }
 
@@ -696,6 +715,17 @@ mod tests {
         let html = db.get_chapter_data(ch[0].id).unwrap();
         assert_eq!(html.matches("<img").count(), 1);
         assert!(html.contains(&imgs[0].path));
+    }
+
+    #[tokio::test]
+    async fn get_bytes_refuses_a_body_over_the_cap() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/big.png", status: 200, content_type: "image/png", body: vec![0u8; MAX_IMAGE_BYTES + 1] },
+        ]).await;
+
+        let result = ScraperClient::new().unwrap().get_bytes(&format!("{}/big.png", base)).await;
+
+        assert!(matches!(result, Err(ScrapeError::Image(_))), "got {:?}", result.map(|b| b.len()));
     }
 
     /// A text-source scraper reading `<div id="content">`, with no auth
