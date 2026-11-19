@@ -247,11 +247,15 @@ fn generate_chapters(
     ctx: &EpubContext,
     strip_colour: bool,
     combined: bool,
+    keep_attachments: bool,
 ) -> Result<Vec<Attachment>, Box<dyn std::error::Error>> {
     if !combined {
         let mut attachments = Vec::<Attachment>::new();
         for chapter in chapters {
-            attachments.push(generate_chapter(db, chapter, output_dir, ctx, strip_colour)?);
+            let attachment = generate_chapter(db, chapter, output_dir, ctx, strip_colour)?;
+            if keep_attachments {
+                attachments.push(attachment);
+            }
             db.update_generated_chapter(chapter.id, false)?;
         }
         return Ok(attachments);
@@ -309,13 +313,10 @@ fn generate_chapters(
             )
             .title(&chapter.name),
         )?;
-        attachments.push(generate_chapter(
-            db,
-            chapter,
-            output_dir,
-            ctx,
-            strip_colour,
-        )?);
+        let attachment = generate_chapter(db, chapter, output_dir, ctx, strip_colour)?;
+        if keep_attachments {
+            attachments.push(attachment);
+        }
         db.update_generated_chapter(chapter.id, false)?;
     }
 
@@ -408,7 +409,7 @@ fn generate_volume(
     Ok(attachment)
 }
 
-/// Generate EPUBs for a specific source
+/// Generate EPUBs for a specific source, then mail them.
 pub async fn generate_epubs_for_source(
     db: &SourceDatabase,
     build_dir: &Path,
@@ -416,6 +417,39 @@ pub async fn generate_epubs_for_source(
     source: &SourceConfig,
     processor_registry: &ProcessorRegistry,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let built = build_epubs_for_source(db, build_dir, config, source, processor_registry)?;
+    send_epubs(
+        &config.mail,
+        &source.id,
+        &built.vols,
+        &built.vols_stripped,
+        &built.chaps,
+        &built.chaps_stripped,
+    )
+    .await;
+    Ok(())
+}
+
+/// The EPUBs one generation run built and kept for mailing.
+pub(crate) struct GeneratedEpubs {
+    pub vols: Vec<Attachment>,
+    pub vols_stripped: Vec<Attachment>,
+    pub chaps: Vec<Attachment>,
+    pub chaps_stripped: Vec<Attachment>,
+}
+
+/// Write a source's pending EPUBs to disk and clear their flags. Sends
+/// nothing. The bytes are kept only when some destination receives the
+/// source; otherwise every list comes back empty, so a first scrape of a
+/// long series does not hold every EPUB in memory for no recipient.
+pub(crate) fn build_epubs_for_source(
+    db: &SourceDatabase,
+    build_dir: &Path,
+    config: &Config,
+    source: &SourceConfig,
+    processor_registry: &ProcessorRegistry,
+) -> Result<GeneratedEpubs, Box<dyn std::error::Error>> {
+    let wanted = config.mail.destinations.iter().any(|d| d.receives_source(&source.id));
     let ctx = EpubContext {
         source,
         processor_registry,
@@ -452,23 +486,29 @@ pub async fn generate_epubs_for_source(
             println!("({}) Generating epub for {}", source.id, volume.name);
             let chapters = db.get_chapters_by_volume(volume.id)?;
             if config.epub_gen.strip_colour {
-                vols_stripped.push(generate_volume(
+                let stripped = generate_volume(
                     db,
                     &volume,
                     &chapters,
                     &source_dir.join("volumes_stripped_colour"),
                     &ctx,
                     true,
-                )?);
+                )?;
+                if wanted {
+                    vols_stripped.push(stripped);
+                }
             }
-            vols.push(generate_volume(
+            let plain = generate_volume(
                 db,
                 &volume,
                 &chapters,
                 &source_dir.join("volumes"),
                 &ctx,
                 false,
-            )?);
+            )?;
+            if wanted {
+                vols.push(plain);
+            }
             db.update_generated_volume(volume.id, false)?;
         }
     } else {
@@ -495,6 +535,7 @@ pub async fn generate_epubs_for_source(
                     &ctx,
                     true,
                     true,
+                    wanted,
                 )?;
             }
             chaps = generate_chapters(
@@ -504,15 +545,19 @@ pub async fn generate_epubs_for_source(
                 &ctx,
                 false,
                 !manga,
+                wanted,
             )?;
         }
     } else {
         println!("({}) Skipping chapter generation", source.id);
     }
 
-    send_epubs(&config.mail, &source.id, &vols, &vols_stripped, &chaps, &chaps_stripped).await;
-
-    Ok(())
+    Ok(GeneratedEpubs {
+        vols,
+        vols_stripped,
+        chaps,
+        chaps_stripped,
+    })
 }
 
 #[cfg(test)]
@@ -844,5 +889,39 @@ mod tests {
             .unwrap();
         assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
         assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_attachments_are_kept_when_no_destination_receives_the_source() {
+        let (db, source) = manga_db_with_two_chapters();
+        let mut config = Config::default();
+        config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
+        config.mail.destinations.clear();
+        let build = tempfile::tempdir().unwrap();
+        let built =
+            build_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
+                .unwrap();
+        let root = build.path().join(&source.id);
+        assert_eq!(std::fs::read_dir(root.join("chapters/individual")).unwrap().count(), 2);
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(built.vols.is_empty() && built.vols_stripped.is_empty());
+        assert!(built.chaps.is_empty() && built.chaps_stripped.is_empty());
+    }
+
+    #[test]
+    fn attachments_are_kept_when_a_destination_receives_the_source() {
+        let (db, source) = manga_db_with_two_chapters();
+        let mut config = Config::default();
+        config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
+        let mut dest = crate::config::UserConfig::default();
+        dest.sources.insert(source.id.clone(), Default::default());
+        config.mail.destinations = vec![dest];
+        let build = tempfile::tempdir().unwrap();
+        // The returning variant only: it never sends.
+        let built =
+            build_epubs_for_source(&db, build.path(), &config, &source, &ProcessorRegistry::new())
+                .unwrap();
+        assert_eq!(built.chaps.len(), 2);
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
     }
 }
