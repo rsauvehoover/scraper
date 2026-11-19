@@ -135,9 +135,12 @@ Shared behaviour:
 - `ScraperRegistry` picks the scraper by `Kind` before the `royal-road-` id-prefix rule
 - Chapter number is the first capture group of `Selectors.ChapterPattern` (default `chapter-([0-9]+(?:\.[0-9]+)?)`) applied to the link URL; non-matching links are not chapters
 - `StartChapter` drops lower-numbered chapters before they are indexed
-- One EPUB per chapter; never volumes, combined files or colour-stripped variants
+- Chapters are placed into batches named `Volume N` when they download, always into the open batch. A batch closes when the next chapter's stored image bytes would exceed `Mail.MaxAttachmentMb` minus 1 MiB
+- Batches build like serial volumes (one plain EPUB, no colour-stripped variant, no combined file) and go only to destinations with `SendFullVolumes`
+- Only a closed batch is flagged for automatic sending; the open batch is sent by hand from the web page. `--redownload` never moves a chapter or re-splits a batch; the send guard refuses an over-limit batch
+- Stored images are JPEG at `Images.JpegQuality` unless translucent; a JPEG that already fits the limits is stored untouched
 - A chapter page with zero images is "not yet available" and retried next run
-- Rollout for a finished series: add the source with no destination listing it, run the scraper, then send by hand from the web frontend. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape; wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
+- Rollout for a finished series: add the source with no destination listing it, run the scraper, then send by hand from the web frontend (tick batches, about 25 for 95 chapters). A database scraped before batches keeps its source-named volume as the open batch until it fills. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape; wait for a clean run first, since a chapter that failed during the backfill is mailed when it later succeeds
 
 ## Adding Post-Processors
 
