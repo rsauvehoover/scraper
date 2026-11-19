@@ -455,8 +455,20 @@ impl SourceDatabase {
         tx.commit()
     }
 
-    /// Get a chapter's images ordered by sequence
+    /// Get a chapter's images ordered by sequence.
+    ///
+    /// A database last written by a binary that predates the `images` table
+    /// has none, and a query-only handle cannot create it, so a missing table
+    /// means the chapter has no images.
     pub fn get_chapter_images(&self, chapter_id: isize) -> Result<Vec<ChapterImage>> {
+        let has_images_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'images')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_images_table {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT chapter_id, seq, path, source_url, mime, width, height, data
              FROM images WHERE chapter_id = ?1 ORDER BY seq",

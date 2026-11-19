@@ -548,6 +548,67 @@ mod tests {
         assert_eq!(attachment.mime, "application/epub+zip");
     }
 
+    /// The web process opens databases query-only and never runs the schema
+    /// migration, so a database last written by a binary that predates the
+    /// `images` table must still build: no table means no images.
+    #[serial]
+    #[test]
+    fn build_chapter_epub_works_on_database_without_images_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::CwdGuard::change_to(dir.path());
+        std::fs::create_dir("db").unwrap();
+        {
+            let conn = rusqlite::Connection::open(SourceDatabase::path_for("test-source")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE volumes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    regenerate_epub INTEGER DEFAULT 0 CHECK(regenerate_epub IN (0, 1)),
+                    UNIQUE(name)
+                );
+                CREATE TABLE chapters(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    uri TEXT NOT NULL,
+                    volumeid INTEGER,
+                    data_id INTEGER,
+                    regenerate_epub INTEGER DEFAULT 0 CHECK(regenerate_epub IN (0, 1)),
+                    FOREIGN KEY(data_id) REFERENCES raw_data(id),
+                    FOREIGN KEY(volumeid) REFERENCES volumes(id),
+                    UNIQUE(name, uri, volumeid)
+                );
+                CREATE TABLE raw_data(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chapter_id INTEGER,
+                    data TEXT,
+                    FOREIGN KEY(chapter_id) REFERENCES chapters(id),
+                    UNIQUE(chapter_id)
+                );
+                INSERT INTO volumes(id, name) VALUES(1, 'Volume 1');
+                INSERT INTO chapters(id, name, uri, volumeid)
+                    VALUES(1, 'Chapter One', 'https://example.com/c1', 1);
+                INSERT INTO raw_data(id, chapter_id, data) VALUES(1, 1, '<p>body</p>');
+                UPDATE chapters SET data_id = 1 WHERE id = 1;",
+            )
+            .unwrap();
+        }
+
+        let db = SourceDatabase::open_query_only("test-source").unwrap();
+        let source = crate::config::SourceConfig::default();
+        let registry = ProcessorRegistry::new();
+        let ctx = EpubContext {
+            source: &source,
+            processor_registry: &registry,
+        };
+
+        assert!(db.get_chapter_images(1).unwrap().is_empty());
+        let chapters = db.get_chapters_by_volume(1).unwrap();
+        let attachment = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
+        assert_eq!(&attachment.bytes[0..2], b"PK");
+        let volume = Volume { id: 1, name: "Volume 1".to_string() };
+        build_volume_epub(&db, &volume, &chapters, &ctx, false).unwrap();
+    }
+
     #[test]
     fn sanitize_filename_replaces_path_separators() {
         assert_eq!(
