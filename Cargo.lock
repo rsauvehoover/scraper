@@ -4065,6 +4065,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "color-name",
