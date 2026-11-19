@@ -504,9 +504,16 @@ mod tests {
     /// State with two destinations and a recording mailer. The first lists
     /// the source; the second does not.
     fn send_state() -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<crate::test_support::Sent>>>) {
+        send_state_of_kind(crate::config::SourceKind::default())
+    }
+
+    /// `send_state` with the source of the given kind.
+    fn send_state_of_kind(
+        kind: crate::config::SourceKind,
+    ) -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<crate::test_support::Sent>>>) {
         use crate::config::{Config, SourceConfig, UserConfig};
         let mut config = Config::default();
-        config.sources = vec![SourceConfig { id: "test-source".into(), name: "Test Serial".into(), enabled: true, ..SourceConfig::default() }];
+        config.sources = vec![SourceConfig { id: "test-source".into(), name: "Test Serial".into(), enabled: true, kind, ..SourceConfig::default() }];
         config.mail.password = "synthetic-pw-918273".into();
         let mut listed = UserConfig { name: "Test Reader".into(), email: "reader@example.com".into(), strip_colour: true, ..Default::default() };
         listed.sources.insert("test-source".into(), Default::default());
@@ -625,6 +632,24 @@ mod tests {
                     "no destination is ticked for you: {}", text);
         }
         assert!(text.contains(r#"value="stripped" checked"#), "Test Reader starts on Stripped: {}", text);
+    }
+
+    /// A manga source has no stripped variant, so the form offers no
+    /// colour choice for it.
+    #[tokio::test]
+    async fn the_form_offers_no_colour_choice_for_a_manga_source() {
+        let (state, _) = send_state_of_kind(crate::config::SourceKind::MangaWordpress);
+        let chapter: i64 = {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            db.connection().query_row("SELECT id FROM chapters", [], |r| r.get(0)).unwrap()
+        };
+        let uri = format!("/source/test-source/send?c={}", chapter);
+        let res = router(Arc::clone(&state)).oneshot(authed(&state, "GET", &uri, String::new())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = body_text(res).await;
+        assert!(text.contains("Test Reader"), "{}", text);
+        assert!(!text.contains("name=\"colour-"), "no colour choice: {}", text);
     }
 
     #[tokio::test]
