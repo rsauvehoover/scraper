@@ -69,14 +69,11 @@ pub struct Resolved {
     /// Ticked chapters left out because their ticked volume contains them.
     pub inside_volume: Vec<String>,
     /// Ticked ids that do not exist, are not downloaded, or are a volume
-    /// with nothing downloaded or not allowed.
+    /// with nothing downloaded.
     pub unavailable: usize,
 }
 
-/// `allow_volumes` is false for a source with no volume EPUBs (a manga
-/// source): every ticked volume then counts as unavailable and absorbs no
-/// chapters.
-pub fn resolve(stat: &SourceStat, selection: &Selection, allow_volumes: bool) -> Resolved {
+pub fn resolve(stat: &SourceStat, selection: &Selection) -> Resolved {
     let mut items = Vec::new();
     let mut inside_volume = Vec::new();
     let mut found = 0;
@@ -84,7 +81,7 @@ pub fn resolve(stat: &SourceStat, selection: &Selection, allow_volumes: bool) ->
     for volume in &stat.volumes {
         let id = volume.id as i64;
         let downloaded = volume.chapters.len() - volume.pending_chapters;
-        if allow_volumes && selection.volumes.contains(&id) && downloaded > 0 {
+        if selection.volumes.contains(&id) && downloaded > 0 {
             found += 1;
             items.push(ItemLine {
                 item: Item::Volume { id, name: volume.name.clone() },
@@ -302,7 +299,7 @@ mod tests {
 
     #[test]
     fn items_come_in_contents_order_and_a_ticked_volume_absorbs_its_chapters() {
-        let r = resolve(&stat(), &Selection::parse(&pairs("c=20&v=1&c=11&c=21&c=999&v=3")), true);
+        let r = resolve(&stat(), &Selection::parse(&pairs("c=20&v=1&c=11&c=21&c=999&v=3")));
         let labels: Vec<_> = r.items.iter().map(|l| l.item.label().to_string()).collect();
         assert_eq!(labels, ["Volume 1", "2.01 Later"]);
         assert_eq!(r.inside_volume, ["1.02 Next"]);
@@ -313,19 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn volumes_are_unavailable_when_not_allowed() {
-        let stat = stat();
-        let sel = Selection { volumes: vec![1], chapters: vec![11] };
-        let r = resolve(&stat, &sel, false);
-        let labels: Vec<&str> = r.items.iter().map(|l| l.item.label()).collect();
-        assert_eq!(labels, ["1.02 Next"]); // the chapter with id 11 in the fixture
-        assert_eq!(r.unavailable, 1);
-        assert!(r.inside_volume.is_empty());
-    }
-
-    #[test]
     fn a_plan_is_each_destination_times_each_item_with_its_variant() {
-        let r = resolve(&stat(), &Selection::parse(&pairs("v=1&c=20")), true);
+        let r = resolve(&stat(), &Selection::parse(&pairs("v=1&c=20")));
         let m = mail();
         let got = plan(&r.items, &m, &fingerprint(&m), &choices(&pairs("d=1&d=0&colour-0=stripped&colour-1=colour"))).unwrap();
         let summary: Vec<_> = got.iter().map(|e| (e.dest_name.as_str(), e.item.label(), e.strip_colour)).collect();
@@ -342,7 +328,7 @@ mod tests {
     fn refusals() {
         let m = mail();
         let fp = fingerprint(&m);
-        let r = resolve(&stat(), &Selection::parse(&pairs("v=1")), true);
+        let r = resolve(&stat(), &Selection::parse(&pairs("v=1")));
         assert_eq!(plan(&[], &m, &fp, &choices(&pairs("d=0"))).unwrap_err(), Refusal::NothingSelected);
         assert_eq!(plan(&r.items, &m, &fp, &[]).unwrap_err(), Refusal::NoDestination);
         assert_eq!(plan(&r.items, &m, "stale", &choices(&pairs("d=0"))).unwrap_err(), Refusal::ConfigChanged);

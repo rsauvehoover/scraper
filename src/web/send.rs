@@ -59,7 +59,7 @@ pub async fn send_submit(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs), !entry.config.is_manga());
+    let resolved = send_plan::resolve(&stat, &Selection::parse(&pairs));
     let planned = match send_plan::plan(&resolved.items, &mail, field(&pairs, "config"), &send_plan::choices(&pairs)) {
         Ok(p) => p,
         Err(refusal) => return render(&state, &headers, &source_id, &pairs, Some(refusal)),
@@ -178,7 +178,7 @@ fn render(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs), !entry.config.is_manga());
+    let resolved = send_plan::resolve(&stat, &Selection::parse(pairs));
     let csrf = session_token(headers)
         .and_then(|t| state.sessions.csrf_for(&t))
         .unwrap_or_default();
