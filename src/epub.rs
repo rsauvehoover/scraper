@@ -163,14 +163,6 @@ fn add_chapter_images(
     Ok(())
 }
 
-/// File extension for a stored image's MIME type.
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => "png",
-        _ => "jpg",
-    }
-}
-
 /// Build a single-chapter EPUB in memory. Touches no filesystem path.
 pub fn build_chapter_epub(
     db: &SourceDatabase,
@@ -187,6 +179,8 @@ pub fn build_chapter_epub(
     epub.metadata("title", &chapter.name)?;
     epub.metadata("generator", "rsauvehoover/wandering-inn-scraper")?;
 
+    let images = db.get_chapter_images(chapter.id)?;
+    let mut pages = images.as_slice();
     if let Some(img_bytes) = generate_cover_with_text(ctx.source, &ctx.source.name, &chapter.name) {
         epub.add_cover_image(
             format!("{}({}).png", chapter.id, safe_name),
@@ -194,13 +188,11 @@ pub fn build_chapter_epub(
             "image/png",
         )?;
     } else if ctx.source.is_manga() {
-        // No configured cover: a manga chapter's first page stands in for it.
-        if let Some(first) = db.get_chapter_images(chapter.id)?.into_iter().next() {
-            epub.add_cover_image(
-                format!("cover.{}", ext_for_mime(&first.mime)),
-                first.data.as_slice(),
-                &first.mime,
-            )?;
+        // No configured cover: a manga chapter's first page stands in for it,
+        // added once, at the path its page references.
+        if let Some((first, rest)) = images.split_first() {
+            epub.add_cover_image(&first.path, first.data.as_slice(), &first.mime)?;
+            pages = rest;
         }
     }
     epub.stylesheet(load_stylesheet().as_bytes())?;
@@ -208,7 +200,9 @@ pub fn build_chapter_epub(
     let raw_data = db.get_chapter_data(chapter.id)?;
     let processed_data = process_chapter_data(&raw_data, ctx, strip_colour);
 
-    add_chapter_images(&mut epub, db, chapter.id)?;
+    for img in pages {
+        epub.add_resource(&img.path, img.data.as_slice(), &img.mime)?;
+    }
     epub.add_content(
         EpubContent::new(
             format!("{}({}).xhtml", &chapter.id, &safe_name),
@@ -854,10 +848,13 @@ mod tests {
         let epub = build_chapter_epub(&db, &chapters[0], &ctx, false).unwrap();
         // epub-builder writes EPUB 2 by default: the cover is an item plus
         // <meta name="cover">, under OEBPS/ at the path given to add_cover_image.
-        assert_eq!(read_zip_entry(&epub.bytes, "OEBPS/cover.png"), Some(one_by_one_png()));
+        // The first page is the cover at its own path, stored once.
+        let page = format!("OEBPS/images/{}-0.png", chapters[0].id);
+        assert_eq!(read_zip_entry(&epub.bytes, &page), Some(one_by_one_png()));
+        assert_eq!(read_zip_entry(&epub.bytes, "OEBPS/cover.png"), None);
         let opf =
             String::from_utf8(read_zip_entry(&epub.bytes, "OEBPS/content.opf").unwrap()).unwrap();
-        assert!(opf.contains("cover"), "{}", opf);
+        assert!(opf.contains("<meta name=\"cover\""), "{}", opf);
     }
 
     #[tokio::test]
