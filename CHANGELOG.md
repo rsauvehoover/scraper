@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/rsauvehoover/scraper/compare/v2.7.0...v3.0.0) - 2026-11-19
+
+### Added
+
+- flat chapter list for manga, no batches ([#38](https://github.com/rsauvehoover/scraper/pull/38))
+
 ## [2.7.0](https://github.com/rsauvehoover/scraper/releases/tag/v2.7.0) - 2026-11-19
 
 ### Added
