@@ -117,3 +117,62 @@ impl SourceScraper for WordPressComicScraper {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{SourceConfig, SourceKind};
+    use crate::error::ScrapeError;
+
+    fn cfg(start: Option<f64>) -> SourceConfig {
+        SourceConfig { id: "example-part".into(), name: "Example Part".into(), kind: SourceKind::MangaWordpress,
+            toc_url: "https://manga.example.com/".into(), start_chapter: start, ..SourceConfig::default() }
+    }
+    const HOME: &str = include_str!("../../tests/fixtures/manga/wp-home.html");
+
+    #[tokio::test]
+    async fn toc_takes_only_pattern_matching_links_from_the_widget_oldest_first() {
+        let toc = WordPressComicScraper::new(cfg(None)).parse_toc(HOME).await.unwrap();
+        let uris: Vec<&str> = toc.iter().map(|c| c.uri.as_str()).collect();
+        assert_eq!(uris, [
+            "https://manga.example.com/manga/example-part-chapter-1/",
+            "https://manga.example.com/manga/example-part-chapter-2/",
+            "https://manga.example.com/manga/example-part-chapter-94/",
+            "https://manga.example.com/manga/example-part-chapter-95/",
+        ]);
+        assert_eq!(toc[3].title, "Example’s Adventure – Part, Chapter 95");
+        assert_eq!(toc[3].volume_name, "Example Part");
+    }
+
+    #[tokio::test]
+    async fn sidebar_links_outside_the_widget_are_ignored_and_start_chapter_applies() {
+        let toc = WordPressComicScraper::new(cfg(Some(94.0))).parse_toc(HOME).await.unwrap();
+        assert_eq!(toc.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chapter_pages_exclude_theme_and_upload_images() {
+        let c = WordPressComicScraper::new(cfg(None)).parse_chapter(include_str!("../../tests/fixtures/manga/wp-chapter.html"), "Ch 95").await.unwrap();
+        assert_eq!(c.images, ["https://img.example.net/s1600/002.jpg", "https://img.example.net/s1600/003.jpg", "https://img.example.net/s1335/004.webp"]);
+    }
+
+    #[tokio::test]
+    async fn lazy_loaded_pages_use_data_src() {
+        let c = WordPressComicScraper::new(cfg(None)).parse_chapter(include_str!("../../tests/fixtures/manga/wp-lazy.html"), "Ch 1").await.unwrap();
+        assert_eq!(c.images, ["https://img.example.net/s1600/001.jpg", "https://img.example.net/s1600/002.jpg"]);
+    }
+
+    #[tokio::test]
+    async fn placeholder_page_is_not_yet_available() {
+        let err = WordPressComicScraper::new(cfg(None)).parse_chapter(include_str!("../../tests/fixtures/manga/wp-placeholder.html"), "Ch 42").await.unwrap_err();
+        assert!(matches!(err, ScrapeError::NotYetAvailable(_)));
+    }
+
+    #[test]
+    fn generic_selector_defaults_are_replaced_but_explicit_values_are_kept() {
+        let s = WordPressComicScraper::new(cfg(None));
+        assert_eq!((s.config.selectors.chapter_entry.as_str(), s.config.selectors.main_content.as_str()), ("ceo_latest_comics_widget", "entry-content"));
+        let mut c = cfg(None);
+        c.selectors.main_content = "post-body".into();
+        assert_eq!(WordPressComicScraper::new(c).config.selectors.main_content, "post-body");
+    }
+}
