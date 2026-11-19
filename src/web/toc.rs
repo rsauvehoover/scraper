@@ -256,13 +256,23 @@ pub async fn chapter_raw(
         }
     };
 
-    let body = sanitize_chapter(&raw);
+    // Stored images are inlined after sanitising: the sandboxed frame has an
+    // opaque origin, so an image route behind the session cookie would get
+    // no cookie, and the sanitiser drops data: URLs it does not know.
+    let images = match entry.db().get_chapter_images(chapter_id as isize) {
+        Ok(images) => images,
+        Err(e) => {
+            eprintln!("chapter image lookup failed for {}/{}: {}", source_id, chapter_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
+        }
+    };
+    let body = inline_images(&sanitize_chapter(&raw), &images);
     let document = html! {
         (PreEscaped("<!DOCTYPE html>"))
         html {
             head {
                 meta charset="utf-8";
-                style { (PreEscaped(reader_css(query.theme()))) }
+                style { (PreEscaped(reader_css(query.theme(), entry.config.is_manga()))) }
             }
             body { (PreEscaped(body)) }
         }
@@ -333,13 +343,14 @@ enum ReaderTheme {
 /// parent's `PALETTE`. `Auto` adds the `prefers-color-scheme` block; `Dark`
 /// adds the same values unconditionally, because an explicit choice must beat
 /// the system preference in both directions.
-fn reader_css(theme: ReaderTheme) -> String {
+fn reader_css(theme: ReaderTheme, manga: bool) -> String {
     let palette = match theme {
         ReaderTheme::Auto => READER_AUTO_DARK,
         ReaderTheme::Light => "",
         ReaderTheme::Dark => READER_DARK,
     };
-    format!("{}{}{}", READER_LIGHT, palette, READER_BASE)
+    let layout = if manga { READER_MANGA } else { "" };
+    format!("{}{}{}{}", READER_LIGHT, palette, READER_BASE, layout)
 }
 
 const READER_LIGHT: &str = r#"
@@ -363,6 +374,29 @@ body { font-family: Georgia, 'Times New Roman', serif; line-height: 1.7;
 img { max-width: 100%; height: auto; }
 a { color: var(--reader-accent); }
 "#;
+
+/// Manga pages want the frame's full width and no prose column.
+const READER_MANGA: &str = r#"
+body { max-width: none; padding: 0; }
+img { display: block; margin: 0 auto; }
+"#;
+
+/// Replace each stored image's `src` in sanitised chapter HTML with a data:
+/// URL of its bytes. Only the exact paths the scraper assigned are touched;
+/// any other `src` stays as it is and is blocked by the reader's CSP.
+fn inline_images(html: &str, images: &[crate::db::ChapterImage]) -> String {
+    use base64::Engine;
+    let mut out = html.to_string();
+    for image in images {
+        let needle = format!("src=\"{}\"", image.path);
+        if !out.contains(&needle) {
+            continue;
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+        out = out.replace(&needle, &format!("src=\"data:{};base64,{}\"", image.mime, data));
+    }
+    out
+}
 
 /// 1234567 -> "1,234,567".
 pub fn format_thousands(n: usize) -> String {
@@ -431,6 +465,63 @@ mod tests {
         let pending = chapters.iter().find(|c| c.name == "Chapter 2").unwrap().id;
         db.add_chapter_data(downloaded, "<p>one two three</p>").unwrap();
         (downloaded as i64, pending as i64)
+    }
+
+    /// A stored image reaches the sandboxed reader as a data: URL, which is
+    /// what its CSP allows; a reference the scraper did not store stays a
+    /// plain path and is blocked.
+    #[tokio::test]
+    async fn reader_inlines_stored_images_as_data_urls() {
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::db::{ChapterImage, RegenerateFlags};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use std::sync::Arc;
+
+        let state = Arc::new(AppState::for_test_with_sources(vec![SourceConfig {
+            id: "test-source".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        }]));
+        let id = {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let vol = db.add_volume("Example Series").unwrap();
+            db.add_chapter("Chapter", "https://example.com/c1", vol).unwrap();
+            let id = db.get_chapters_by_volume(vol).unwrap()[0].id;
+            let image = ChapterImage {
+                chapter_id: id,
+                seq: 0,
+                path: format!("images/{}-0.png", id),
+                source_url: "https://example.com/p1.png".into(),
+                mime: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: vec![1, 2, 3],
+            };
+            let html = format!(
+                r#"<p><img src="images/{}-0.png" alt="Page 1"/></p><p><img src="images/{}-9.png" alt="Missing"/></p>"#,
+                id, id
+            );
+            db.store_chapter_content(id, &html, &[image], RegenerateFlags::ChapterOnly).unwrap();
+            id
+        };
+
+        let body = body_of(
+            super::chapter_raw(
+                State(Arc::clone(&state)),
+                AxumPath(("test-source".to_string(), id as i64)),
+                Query(super::ReaderQuery { theme: None }),
+            )
+            .await,
+        )
+        .await;
+
+        assert!(body.contains(r#"src="data:image/png;base64,AQID""#), "{}", body);
+        assert!(body.contains(&format!(r#"src="images/{}-9.png""#, id)), "unknown path untouched: {}", body);
+        assert!(!body.contains(&format!(r#"src="images/{}-0.png""#, id)), "{}", body);
+        assert!(body.contains("max-width: none"), "manga reader uses the full width: {}", body);
     }
 
     /// Volumes fold, the newest starts open, and a folded volume still
@@ -745,7 +836,7 @@ mod tests {
     /// reader theme is selected.
     #[test]
     fn every_reader_variant_declares_color_scheme() {
-        let auto = super::reader_css(super::ReaderTheme::Auto);
+        let auto = super::reader_css(super::ReaderTheme::Auto, false);
         assert!(
             auto.contains("color-scheme: light"),
             "auto must start from the light color-scheme: {}",
@@ -757,7 +848,7 @@ mod tests {
             auto
         );
 
-        let light = super::reader_css(super::ReaderTheme::Light);
+        let light = super::reader_css(super::ReaderTheme::Light, false);
         assert!(
             light.contains("color-scheme: light"),
             "the light theme must declare a light color-scheme: {}",
@@ -769,7 +860,7 @@ mod tests {
             light
         );
 
-        let dark = super::reader_css(super::ReaderTheme::Dark);
+        let dark = super::reader_css(super::ReaderTheme::Dark, false);
         assert!(
             dark.contains("color-scheme: dark"),
             "an explicit dark choice must declare a dark color-scheme: {}",
