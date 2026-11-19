@@ -321,10 +321,21 @@ cargo bump {major|minor|patch} --git-tag
 
 Create a `config.json` file with the following structure:
 
+Chapter images are downloaded, scaled to `Images`, and embedded; a text chapter whose image cannot be fetched is stored without it.
+
 ```jsonc
 {
   // Delay between HTTP requests in milliseconds (default: 1000)
   "RequestDelay": 1000,
+
+  // Image handling for every source (defaults shown). Pages and chapter
+  // images are scaled down to fit these bounds, never up.
+  "Images": {
+    "MaxWidth": 2528,      // Two Kindle screen widths, so a double-page spread keeps detail
+    "MaxHeight": 1680,     // Kindle Colorsoft / Paperwhite screen height
+    "JpegQuality": 85,
+    "RequestDelay": 250    // Milliseconds between image downloads
+  },
 
   // Email configuration for sending EPUBs (optional)
   "Mail": {
