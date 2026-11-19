@@ -1,4 +1,5 @@
 pub mod app;
+pub mod archive;
 pub mod auth;
 pub mod config_edit;
 pub mod download;

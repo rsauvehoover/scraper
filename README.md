@@ -62,7 +62,9 @@ Re-running with an already-seeded URL is a no-op.
 
 `wandering_inn_scraper web` serves a read-only view of the scraped data plus a
 configuration editor. It runs alongside the scraper and never writes to the
-databases through SQLite.
+databases through SQLite. A source's contents page offers every EPUB singly
+and all of them as one zip ("All EPUBs (zip)": chapters for manga, volumes for
+a serial), streamed as it is built so a series of gigabytes still downloads.
 
 | Flag | Default | Description |
 |------|---------|-------------|

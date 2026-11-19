@@ -348,6 +348,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(crate::web::download::volume_epub),
         )
         .route(
+            "/source/{source_id}/epubs.zip",
+            get(crate::web::archive::source_epubs_zip),
+        )
+        .route(
             "/source/{source_id}/send",
             get(crate::web::send::send_form).post(crate::web::send::send_submit),
         )

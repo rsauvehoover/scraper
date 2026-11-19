@@ -285,7 +285,6 @@ impl SourceDatabase {
     }
 
     /// Every volume, oldest first
-    #[cfg(test)]
     pub fn get_all_volumes(&self) -> Result<Vec<Volume>> {
         self.conn
             .prepare("SELECT id, name FROM volumes ORDER BY id")?
