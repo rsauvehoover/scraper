@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(ch.len(), 1);
         let imgs = db.get_chapter_images(ch[0].id).unwrap();
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].path, format!("images/{}-0.png", ch[0].id));
+        assert_eq!(imgs[0].path, format!("images/{}-0.jpg", ch[0].id));
         let html = db.get_chapter_data(ch[0].id).unwrap();
         assert_eq!(html.matches("<img").count(), 1);
         assert!(html.contains(&imgs[0].path));
@@ -773,7 +773,7 @@ mod tests {
 
         ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
 
-        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.png", id)));
+        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.jpg", id)));
         assert_eq!(db.get_chapter_images(id).unwrap().len(), 1);
         assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
         assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
@@ -901,7 +901,7 @@ mod tests {
         let id = ch[0].id;
         let imgs = db.get_chapter_images(id).unwrap();
         assert_eq!(imgs.iter().map(|i| i.seq).collect::<Vec<_>>(), [0, 1, 2]);
-        let paths: Vec<String> = (0..3).map(|n| format!("images/{}-{}.png", id, n)).collect();
+        let paths: Vec<String> = (0..3).map(|n| format!("images/{}-{}.jpg", id, n)).collect();
         assert_eq!(imgs.iter().map(|i| i.path.clone()).collect::<Vec<_>>(), paths);
         assert_eq!(
             imgs.iter().map(|i| i.source_url.clone()).collect::<Vec<_>>(),
