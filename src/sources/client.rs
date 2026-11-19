@@ -7,7 +7,7 @@ use soup::prelude::*;
 use crate::config::{ImagesConfig, SourceKind};
 use crate::db::{ChapterImage, RegenerateFlags, SourceDatabase};
 use crate::error::{ScrapeError, ScrapeResult};
-use crate::images::{process_image, ProcessedImage};
+use crate::images::{process_image, Alpha, ProcessedImage};
 
 use super::content_images::{assign_image_paths, drop_image};
 use super::traits::SourceScraper;
@@ -235,23 +235,23 @@ impl ScraperClient {
     }
 
     /// Fetch and process one image
-    async fn fetch_image(&self, url: &str, images: &ImagesConfig) -> ScrapeResult<ProcessedImage> {
+    async fn fetch_image(&self, url: &str, images: &ImagesConfig, alpha: Alpha) -> ScrapeResult<ProcessedImage> {
         let bytes = self.get_bytes(url).await?;
         let config = images.clone();
-        tokio::task::spawn_blocking(move || process_image(&bytes, &config))
+        tokio::task::spawn_blocking(move || process_image(&bytes, &config, alpha))
             .await
             .map_err(|e| ScrapeError::Image(e.to_string()))?
     }
 
     /// Fetch and process every image URL, in order. A failure is reported
     /// and recorded as `image: None`; the caller decides what it means.
-    pub async fn fetch_images(&self, urls: &[String], images: &ImagesConfig) -> Vec<FetchedImage> {
+    pub async fn fetch_images(&self, urls: &[String], images: &ImagesConfig, alpha: Alpha) -> Vec<FetchedImage> {
         let mut fetched = Vec::with_capacity(urls.len());
         for (i, url) in urls.iter().enumerate() {
             if i > 0 {
                 sleep(Duration::from_millis(images.request_delay)).await;
             }
-            let image = match self.fetch_image(url, images).await {
+            let image = match self.fetch_image(url, images, alpha).await {
                 Ok(image) => Some(image),
                 Err(e) => {
                     println!("  Warning: could not fetch image {}: {}", url, e);
@@ -583,7 +583,7 @@ impl ScraperClient {
             content.html
         };
 
-        let fetched = self.fetch_images(&content.images, images).await;
+        let fetched = self.fetch_images(&content.images, images, Alpha::for_kind(scraper.kind())).await;
         let assembled = assemble_chapter(
             chapter.id,
             &processed_html,
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(ch.len(), 1);
         let imgs = db.get_chapter_images(ch[0].id).unwrap();
         assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].path, format!("images/{}-0.jpg", ch[0].id));
+        assert_eq!(imgs[0].path, format!("images/{}-0.png", ch[0].id));
         let html = db.get_chapter_data(ch[0].id).unwrap();
         assert_eq!(html.matches("<img").count(), 1);
         assert!(html.contains(&imgs[0].path));
@@ -804,7 +804,7 @@ mod tests {
 
         ScraperClient::new().unwrap().redownload_all(&content_scraper(), &db, 0, &images).await.unwrap();
 
-        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.jpg", id)));
+        assert!(db.get_chapter_data(id).unwrap().contains(&format!("images/{}-0.png", id)));
         assert_eq!(db.get_chapter_images(id).unwrap().len(), 1);
         assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
         assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
@@ -938,7 +938,7 @@ mod tests {
         let id = ch[0].id;
         let imgs = db.get_chapter_images(id).unwrap();
         assert_eq!(imgs.iter().map(|i| i.seq).collect::<Vec<_>>(), [0, 1, 2]);
-        let paths: Vec<String> = (0..3).map(|n| format!("images/{}-{}.jpg", id, n)).collect();
+        let paths: Vec<String> = (0..3).map(|n| format!("images/{}-{}.png", id, n)).collect();
         assert_eq!(imgs.iter().map(|i| i.path.clone()).collect::<Vec<_>>(), paths);
         assert_eq!(
             imgs.iter().map(|i| i.source_url.clone()).collect::<Vec<_>>(),
