@@ -167,6 +167,24 @@ fn open_batch(db: &SourceDatabase) -> rusqlite::Result<Volume> {
     }
 }
 
+/// Create the batch after `open`, named `Volume n` for the first unused
+/// `n >= count + 1`. A name taken earlier (say by `--pull-chapter --volume`)
+/// is skipped, so a closed batch is never reused and never grows.
+fn new_batch(db: &SourceDatabase, open: isize) -> rusqlite::Result<isize> {
+    let mut n = db.count_volumes()? + 1;
+    while db.volume_exists(&format!("Volume {}", n))? {
+        n += 1;
+    }
+    let id = db.add_volume(&format!("Volume {}", n))?;
+    if id <= open {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!("new batch Volume {} reused volume {} at or before the open batch {}", n, id, open)),
+        ));
+    }
+    Ok(id)
+}
+
 /// Move a manga chapter about to be stored into the open batch, or into a new
 /// batch when its `this_bytes` of pages would push the open one over `budget`.
 /// A batch's first chapter always stays, so an oversized chapter is a batch of one.
@@ -180,8 +198,7 @@ pub fn place_in_batch(
     let full = db.volume_has_downloaded_chapter(open)?
         && db.volume_image_bytes(open)? + this_bytes > budget;
     let placement = if full {
-        let name = format!("Volume {}", db.count_volumes()? + 1);
-        Placement { volume_id: db.add_volume(&name)?, closed: Some(open) }
+        Placement { volume_id: new_batch(db, open)?, closed: Some(open) }
     } else {
         Placement { volume_id: open, closed: None }
     };
@@ -411,15 +428,28 @@ impl ScraperClient {
             None => extract_page_title(&html).unwrap_or_else(|| title_from_slug(url)),
         };
 
-        let volume_name = match volume_override {
-            Some(v) => v.to_string(),
-            None => db
-                .get_latest_volume()?
-                .map(|v| v.name)
-                .unwrap_or_else(|| "Main Story".to_string()),
+        // A manga chapter waits in the open batch like any newly indexed one;
+        // a named volume could reopen a closed batch.
+        let (volume_id, volume_name) = if scraper.kind() != SourceKind::Text {
+            if volume_override.is_some() {
+                println!(
+                    "({}) --volume is ignored for manga sources; seeding into the open batch",
+                    scraper.source_id()
+                );
+            }
+            let open = open_batch(db)?;
+            (open.id, open.name)
+        } else {
+            let volume_name = match volume_override {
+                Some(v) => v.to_string(),
+                None => db
+                    .get_latest_volume()?
+                    .map(|v| v.name)
+                    .unwrap_or_else(|| "Main Story".to_string()),
+            };
+            (db.add_volume(&volume_name)?, volume_name)
         };
 
-        let volume_id = db.add_volume(&volume_name)?;
         db.add_chapter(&title, url, volume_id)?;
         println!(
             "({}) Seeded chapter '{}' into {} ({})",
@@ -1170,6 +1200,58 @@ mod tests {
 
         assert_eq!(volume_of_each(&db), [ch_in(1, "The JOJOLands"), ch_in(2, "Volume 2")]);
         assert_eq!(flagged_volumes(&db), ["The JOJOLands"]);
+    }
+
+    #[test]
+    fn a_pre_existing_volume_name_is_skipped_when_a_batch_closes() {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let open = db.add_volume("Volume 3").unwrap();
+        db.add_chapter("Ch 1", "https://example.com/c1", v1).unwrap();
+        db.add_chapter("Ch 2", "https://example.com/c2", open).unwrap();
+        db.add_chapter("Ch 3", "https://example.com/c3", open).unwrap();
+        let ids: Vec<isize> = { let mut c = db.get_empty_chapters().unwrap(); c.sort_by_key(|c| c.id); c.into_iter().map(|c| c.id).collect() };
+        db.add_chapter_data(ids[0], "<a/>").unwrap();
+        db.add_chapter_data(ids[1], "<b/>").unwrap();
+        db.update_generated_volume(v1, false).unwrap();
+        db.update_generated_volume(open, false).unwrap();
+        let page = ChapterImage {
+            chapter_id: ids[2], seq: 0,
+            path: format!("images/{}-0.jpg", ids[2]),
+            source_url: "https://example.com/p.jpg".into(),
+            mime: "image/jpeg".into(), width: 1, height: 1, data: vec![0; 10],
+        };
+        let assembled = Assembled { html: "<c/>".into(), images: vec![page] };
+
+        store_in_batch(&db, ids[2], &assembled, 5).unwrap();
+
+        assert_eq!(volume_of_each(&db), [ch_in(1, "Volume 1"), ch_in(2, "Volume 3"), ch_in(3, "Volume 4")]);
+        let stored = db.get_downloaded_chapters().unwrap().into_iter().find(|c| c.id == ids[2]).unwrap();
+        assert_eq!(stored.volume_id, 3, "the new batch is a new volume");
+        assert_eq!(flagged_volumes(&db), ["Volume 3"]);
+        assert_eq!(db.count_volumes().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn seed_chapter_parks_a_manga_chapter_in_the_open_batch_ignoring_volume() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: MANGA_CHAPTER_PATH, status: 200, content_type: "text/html", body: b"<html><head><title>Ch 1</title></head><body></body></html>".to_vec() },
+        ]).await;
+        let scraper = manga_scraper(&base);
+        let url = format!("{}{}", base, MANGA_CHAPTER_PATH);
+        let client = ScraperClient::new().unwrap();
+
+        let empty = SourceDatabase::open_in_memory("t").unwrap();
+        client.seed_chapter(&scraper, &empty, &url, None, Some("Volume 9")).await.unwrap();
+        assert_eq!(volume_of_each(&empty), [ch_in(1, "Volume 1")]);
+        assert_eq!(empty.count_volumes().unwrap(), 1);
+
+        let two = SourceDatabase::open_in_memory("t").unwrap();
+        two.add_volume("Volume 1").unwrap();
+        two.add_volume("Volume 2").unwrap();
+        client.seed_chapter(&scraper, &two, &url, None, Some("Volume 9")).await.unwrap();
+        assert_eq!(volume_of_each(&two), [ch_in(1, "Volume 2")]);
+        assert_eq!(two.count_volumes().unwrap(), 2);
     }
 
     #[tokio::test]

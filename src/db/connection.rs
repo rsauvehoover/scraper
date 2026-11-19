@@ -259,6 +259,15 @@ impl SourceDatabase {
             })
     }
 
+    /// Whether a volume with this name exists
+    pub fn volume_exists(&self, name: &str) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM volumes WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    }
+
     /// Get a volume name by ID
     pub fn get_volume_name(&self, volume_id: isize) -> Result<String> {
         self.conn.query_row(
