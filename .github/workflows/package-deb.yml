@@ -57,10 +57,11 @@ jobs:
           apt-get update
           # libssl-dev is for building cargo-bundle; the scraper itself
           # links no OpenSSL. cmake, perl and libclang-dev build BoringSSL
-          # for wreq, the browser-fingerprint HTTP client.
+          # for wreq, the browser-fingerprint HTTP client, whose build script
+          # also runs git.
           apt-get install -y --no-install-recommends \
             ca-certificates curl build-essential pkg-config libssl-dev nodejs \
-            cmake perl libclang-dev
+            cmake perl libclang-dev git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A manual run with a tag builds that tag, so the package attached
