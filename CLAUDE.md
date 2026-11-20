@@ -26,6 +26,8 @@ This is a multi-source web serial scraper with plugin-like extensibility via tra
 
 `epub-builder` is vendored at `vendor/epub-builder` (the crates.io release pins a vulnerable `zip`); `vendor/README.md` lists the changes from upstream.
 
+HTTP goes through `wreq`, a client that presents a current Chrome TLS and HTTP/2 fingerprint: Royal Road sits behind a Cloudflare challenge that refuses a plain client. Building it compiles BoringSSL, which needs cmake, perl and libclang.
+
 ### Core Traits
 
 **`SourceScraper`** (`src/sources/traits.rs`): Defines how to scrape a source

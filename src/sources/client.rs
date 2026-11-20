@@ -1,4 +1,5 @@
-use reqwest::{header::HeaderValue, header::COOKIE, header::USER_AGENT, Client};
+use wreq::{header::HeaderValue, header::COOKIE, Client};
+use wreq_util::Emulation;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -151,9 +152,15 @@ pub struct ScraperClient {
 }
 
 impl ScraperClient {
-    /// Create a new scraper client
+    /// Create a new scraper client.
+    ///
+    /// The client presents a current Chrome's TLS and HTTP/2 fingerprint and
+    /// headers. Royal Road sits behind a Cloudflare challenge that refuses a
+    /// plain HTTP client outright but waves a browser fingerprint through;
+    /// the other sources do not mind either way.
     pub fn new() -> ScrapeResult<Self> {
         let client = Client::builder()
+            .emulation(Emulation::Chrome149)
             .cookie_store(true)
             .build()
             .map_err(ScrapeError::Http)?;
@@ -167,7 +174,7 @@ impl ScraperClient {
         url: &str,
         auth_headers: Option<&Vec<(String, String)>>,
     ) -> ScrapeResult<String> {
-        let mut request = self.client.get(url).header(USER_AGENT, "reqwest");
+        let mut request = self.client.get(url);
 
         if let Some(headers) = auth_headers {
             for (name, value) in headers {
@@ -190,7 +197,7 @@ impl ScraperClient {
         url: &str,
         auth_headers: Option<&Vec<(String, String)>>,
     ) -> ScrapeResult<String> {
-        let mut request = self.client.get(url).header(USER_AGENT, "reqwest");
+        let mut request = self.client.get(url);
         if let Some(headers) = auth_headers {
             for (name, value) in headers {
                 if name.to_lowercase() == "cookie" {
@@ -212,7 +219,6 @@ impl ScraperClient {
         let resp = self
             .client
             .get(url)
-            .header(USER_AGENT, "reqwest")
             .timeout(Duration::from_secs(60))
             .send()
             .await
@@ -294,6 +300,17 @@ impl ScraperClient {
 
         let html = self.get_html(scraper.toc_url(), None).await?;
         let chapters = scraper.parse_toc(&html).await?;
+
+        // A contents page that lists nothing for a source we already hold
+        // chapters of is a blocked or redesigned site, not an empty serial.
+        // Royal Road sat behind a bot challenge for six weeks of "0 chapters"
+        // runs that all counted as success; this makes the run fail instead.
+        if chapters.is_empty() && !db.get_downloaded_chapters()?.is_empty() {
+            return Err(ScrapeError::ContentNotFound(format!(
+                "the table of contents at {} lists no chapters, but the database holds some; the site may be blocking the scraper or have changed its layout",
+                scraper.toc_url()
+            )));
+        }
 
         let mut volume_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -1002,6 +1019,33 @@ mod tests {
         assert_eq!(vols.len(), 1);
         assert_eq!(vols[0].name, scraper.source_name());
         assert_eq!(db.get_chapters_by_volume(v1).unwrap().len(), 2);
+    }
+
+    /// A contents page with no chapters is only plausible for a source we
+    /// hold nothing of; for one with chapters it means the site is blocking
+    /// us or changed, and the run must say so instead of succeeding quietly.
+    #[tokio::test]
+    async fn an_empty_toc_for_a_source_with_chapters_is_an_error() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/toc", status: 200, content_type: "text/html", body: b"<html><head><title>Just a moment...</title></head><body></body></html>".to_vec() },
+        ]).await;
+        let mut cfg = SourceConfig::default();
+        cfg.toc_url = format!("{}/toc", base);
+        let scraper: Arc<dyn SourceScraper> = Arc::new(GenericScraper::new(cfg));
+        let client = ScraperClient::new().unwrap();
+
+        let fresh = SourceDatabase::open_in_memory("t").unwrap();
+        client.update_index(&scraper, &fresh, &vec![], &vec![]).await.expect("a new source may be empty");
+
+        let held = SourceDatabase::open_in_memory("t").unwrap();
+        let v1 = held.add_volume("Volume 1").unwrap();
+        held.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        let id = held.get_empty_chapters().unwrap()[0].id;
+        held.add_chapter_data(id, "<p>text</p>").unwrap();
+        let err = client.update_index(&scraper, &held, &vec![], &vec![]).await.unwrap_err();
+        assert!(matches!(err, ScrapeError::ContentNotFound(_)), "{}", err);
+        assert!(err.to_string().contains("lists no chapters"), "{}", err);
+        assert_eq!(volume_of_each(&held), [("C1".to_string(), "Volume 1".to_string())], "nothing changed");
     }
 
     #[tokio::test]

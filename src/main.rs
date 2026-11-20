@@ -108,7 +108,10 @@ async fn main() {
         }
     }
 
-    // Process each source
+    // Process each source. A source that fails its index or download step
+    // is skipped, counted, and makes the run exit non-zero at the end, so
+    // the hourly healthcheck sees it.
+    let mut failed = 0usize;
     for source in sources_to_process {
         println!(
             "\n=== Processing source: {} ({}) ===",
@@ -140,6 +143,7 @@ async fn main() {
                 .await
             {
                 println!("Error re-downloading chapters for {}: {}", source.id, e);
+                failed += 1;
             }
             continue;
         }
@@ -148,6 +152,7 @@ async fn main() {
         if !args.skip_index {
             if let Err(e) = client.update_index(&scraper, &db, &source.ignored_volumes, &source.ignored_chapters).await {
                 println!("Error updating index for {}: {}", source.id, e);
+                failed += 1;
                 continue;
             }
         } else {
@@ -179,6 +184,7 @@ async fn main() {
                 .await
             {
                 println!("Error downloading chapters for {}: {}", source.id, e);
+                failed += 1;
                 continue;
             }
         } else {
@@ -207,4 +213,8 @@ async fn main() {
     }
 
     println!("\n=== All sources processed ===");
+    if failed > 0 {
+        println!("{} source(s) failed; see above", failed);
+        std::process::exit(1);
+    }
 }

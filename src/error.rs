@@ -5,7 +5,7 @@ use thiserror::Error;
 #[allow(dead_code)]
 pub enum ScrapeError {
     #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] wreq::Error),
 
     #[error("Failed to parse HTML: {0}")]
     Parse(String),
