@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.2](https://github.com/rsauvehoover/scraper/compare/v2.9.1...v2.9.2) - 2026-11-20
+
+### Fixed
+
+- retry a request that meets a cloudflare challenge ([#50](https://github.com/rsauvehoover/scraper/pull/50))
+
 ## [2.9.1](https://github.com/rsauvehoover/scraper/compare/v2.9.0...v2.9.1) - 2026-11-20
 
 ### Fixed
