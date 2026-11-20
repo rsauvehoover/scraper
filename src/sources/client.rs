@@ -146,9 +146,25 @@ pub fn assemble_chapter(
     })
 }
 
+/// How many times a request is sent before a challenge page is accepted as
+/// the answer, and the pause before the second attempt (it grows linearly).
+const CHALLENGE_ATTEMPTS: u32 = 4;
+const CHALLENGE_PAUSE: Duration = Duration::from_secs(3);
+
+/// Cloudflare's managed challenge: a 403 that names itself in a header.
+fn is_challenge(resp: &wreq::Response) -> bool {
+    resp.status() == 403
+        && resp
+            .headers()
+            .get("cf-mitigated")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"challenge"))
+}
+
 /// HTTP client wrapper for scraping operations
 pub struct ScraperClient {
     client: Client,
+    /// Pause before the second attempt at a challenged request; tests set zero.
+    challenge_pause: Duration,
 }
 
 impl ScraperClient {
@@ -165,7 +181,54 @@ impl ScraperClient {
             .build()
             .map_err(ScrapeError::Http)?;
 
-        Ok(ScraperClient { client })
+        Ok(ScraperClient { client, challenge_pause: CHALLENGE_PAUSE })
+    }
+
+    #[cfg(test)]
+    fn without_challenge_pause(mut self) -> Self {
+        self.challenge_pause = Duration::ZERO;
+        self
+    }
+
+    /// A GET with the cookie from `auth_headers`, if any
+    fn get_with_auth(&self, url: &str, auth_headers: Option<&Vec<(String, String)>>) -> wreq::RequestBuilder {
+        let mut request = self.client.get(url);
+        if let Some(headers) = auth_headers {
+            for (name, value) in headers {
+                if name.to_lowercase() == "cookie" {
+                    request = request.header(COOKIE, HeaderValue::from_str(value).unwrap());
+                }
+            }
+        }
+        request
+    }
+
+    /// Send a request, retrying past Cloudflare's managed challenge.
+    ///
+    /// Cloudflare answers a challenge with 403 and `cf-mitigated: challenge`.
+    /// With a browser fingerprint it is a coin toss per request rather than a
+    /// wall: the same client, cookie jar kept, got Royal Road's contents page
+    /// on the third try. So a challenged request is repeated a few times with
+    /// a growing pause. The last response is returned whatever it is, so the
+    /// callers' own status and content checks still apply.
+    async fn send_past_challenge(
+        &self,
+        build: impl Fn() -> wreq::RequestBuilder,
+    ) -> ScrapeResult<wreq::Response> {
+        for attempt in 1..=CHALLENGE_ATTEMPTS {
+            let resp = build().send().await.map_err(ScrapeError::Http)?;
+            if !is_challenge(&resp) || attempt == CHALLENGE_ATTEMPTS {
+                return Ok(resp);
+            }
+            println!(
+                "  Challenge page from {} (attempt {} of {}), retrying",
+                resp.uri(),
+                attempt,
+                CHALLENGE_ATTEMPTS
+            );
+            sleep(self.challenge_pause * attempt).await;
+        }
+        unreachable!("the loop returns on its last attempt")
     }
 
     /// Fetch HTML from a URL with optional authentication
@@ -174,17 +237,7 @@ impl ScraperClient {
         url: &str,
         auth_headers: Option<&Vec<(String, String)>>,
     ) -> ScrapeResult<String> {
-        let mut request = self.client.get(url);
-
-        if let Some(headers) = auth_headers {
-            for (name, value) in headers {
-                if name.to_lowercase() == "cookie" {
-                    request = request.header(COOKIE, HeaderValue::from_str(value).unwrap());
-                }
-            }
-        }
-
-        let resp = request.send().await.map_err(ScrapeError::Http)?;
+        let resp = self.send_past_challenge(|| self.get_with_auth(url, auth_headers)).await?;
         let body = resp.text().await.map_err(ScrapeError::Http)?;
 
         Ok(body)
@@ -197,15 +250,7 @@ impl ScraperClient {
         url: &str,
         auth_headers: Option<&Vec<(String, String)>>,
     ) -> ScrapeResult<String> {
-        let mut request = self.client.get(url);
-        if let Some(headers) = auth_headers {
-            for (name, value) in headers {
-                if name.to_lowercase() == "cookie" {
-                    request = request.header(COOKIE, HeaderValue::from_str(value).unwrap());
-                }
-            }
-        }
-        let resp = request.send().await.map_err(ScrapeError::Http)?;
+        let resp = self.send_past_challenge(|| self.get_with_auth(url, auth_headers)).await?;
         let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
         let body = resp.text().await.map_err(ScrapeError::Http)?;
         Ok(body)
@@ -217,12 +262,8 @@ impl ScraperClient {
     /// request has a timeout and a body over `MAX_IMAGE_BYTES` is refused.
     pub async fn get_bytes(&self, url: &str) -> ScrapeResult<Vec<u8>> {
         let resp = self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(ScrapeError::Http)?;
+            .send_past_challenge(|| self.client.get(url).timeout(Duration::from_secs(60)))
+            .await?;
         let resp = resp.error_for_status().map_err(ScrapeError::Http)?;
         let too_big = || {
             ScrapeError::Image(format!(
@@ -1019,6 +1060,32 @@ mod tests {
         assert_eq!(vols.len(), 1);
         assert_eq!(vols[0].name, scraper.source_name());
         assert_eq!(db.get_chapters_by_volume(v1).unwrap().len(), 2);
+    }
+
+    /// Two challenge pages, then the real one: the fetch comes back with the
+    /// real page and the server saw three requests.
+    #[tokio::test]
+    async fn a_challenged_request_is_retried_until_it_passes() {
+        let (base, hits) = crate::test_support::serve_challenged(2, "<html><body>real</body></html>").await;
+        let client = ScraperClient::new().unwrap().without_challenge_pause();
+
+        let body = client.get_html(&format!("{}/page", base), None).await.unwrap();
+
+        assert!(body.contains("real"), "{}", body);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A challenge that never clears: the attempts stop at the cap and the
+    /// challenge page is what the caller gets, so its own checks decide.
+    #[tokio::test]
+    async fn a_persistent_challenge_gives_up_after_the_cap() {
+        let (base, hits) = crate::test_support::serve_challenged(100, "<html><body>real</body></html>").await;
+        let client = ScraperClient::new().unwrap().without_challenge_pause();
+
+        let body = client.get_html(&format!("{}/page", base), None).await.unwrap();
+
+        assert!(body.contains("Just a moment"), "{}", body);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), CHALLENGE_ATTEMPTS as usize);
     }
 
     /// A contents page with no chapters is only plausible for a source we

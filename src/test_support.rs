@@ -108,6 +108,41 @@ pub async fn serve_fixtures(routes: impl FnOnce(&str) -> Vec<FixtureRoute>) -> S
     base
 }
 
+/// Serve one page that answers its first `challenges` requests the way
+/// Cloudflare's managed challenge does (403, `cf-mitigated: challenge`, a
+/// "Just a moment" body) and every later one with `body` and 200. Returns
+/// the base URL and the request counter.
+pub async fn serve_challenged(
+    challenges: usize,
+    body: &'static str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let router = axum::Router::new().fallback(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= challenges {
+                (
+                    StatusCode::FORBIDDEN,
+                    [(CONTENT_TYPE, "text/html"), (axum::http::HeaderName::from_static("cf-mitigated"), "challenge")],
+                    "<html><head><title>Just a moment...</title></head><body></body></html>",
+                )
+                    .into_response()
+            } else {
+                (StatusCode::OK, [(CONTENT_TYPE, "text/html")], body).into_response()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (base, hits)
+}
+
 fn fixture_response(routes: &[FixtureRoute], path: &str) -> Response {
     match routes.iter().find(|r| r.path == path) {
         Some(r) => (
