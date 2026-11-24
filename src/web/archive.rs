@@ -71,6 +71,14 @@ fn plan(source: &SourceConfig, kcc: bool) -> Result<Vec<Item>, BuildError> {
                 items.push(Item::Volume(volume, chapters));
             }
         }
+        // Chapters with no number stay in the series volume and come singly.
+        if let Some(series) = db.get_volume_by_name(&source.name).map_err(|e| fault("volume lookup", e))? {
+            for chapter in db.get_chapters_by_volume(series.id).map_err(|e| fault("chapter list", e))? {
+                if chapter.data_id.is_some() {
+                    items.push(Item::Chapter(chapter));
+                }
+            }
+        }
         items
     } else if source.is_manga() {
         db.get_downloaded_chapters()

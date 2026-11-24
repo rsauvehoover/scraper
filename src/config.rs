@@ -295,8 +295,9 @@ pub struct SourceConfig {
     /// First chapter number to download (manga sources); earlier chapters are skipped
     pub start_chapter: Option<f64>,
     /// Manga sources: the last chapter number of each published volume, in
-    /// order. Chapters past the last entry stay loose in the series volume.
-    /// Empty means no volumes: a flat chapter list.
+    /// order. Past the last entry, volumes go on at the length of the most
+    /// recent one (see `volume_index`). Empty means no volumes: a flat
+    /// chapter list.
     pub volume_ends: Vec<f64>,
     /// Manga sources: how Kindle Comic Converter handles double-page spreads
     pub spreads: Spreads,
@@ -334,7 +335,7 @@ impl SourceConfig {
     }
 
     /// The 1-based volume a chapter number belongs to, by `VolumeEnds`;
-    /// `None` past the last volume or when there are no volumes.
+    /// `None` only when there are no volumes. See `volume_index`.
     pub fn volume_for(&self, number: f64) -> Option<usize> {
         volume_index(&self.volume_ends, number)
     }
@@ -964,6 +965,10 @@ mod tests {
         assert_eq!(flat.volume_for(1.0), None);
         // A single end: its length is the stride
         assert_eq!((volume_index(&[4.0], 4.0), volume_index(&[4.0], 5.0), volume_index(&[4.0], 9.0)), (Some(1), Some(2), Some(3)));
+        // Below the first end, a decimal inside a range, and a degenerate end
+        assert_eq!(volume_index(&[5.0, 11.0], 0.5), Some(1));
+        assert_eq!(volume_index(&[5.0, 11.0, 17.0], 11.5), Some(3));
+        assert_eq!(volume_index(&[0.0], 7.0), Some(1), "a stride of zero never divides");
     }
 
     #[test]

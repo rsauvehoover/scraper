@@ -147,7 +147,7 @@ pub async fn serve_challenged(
 /// `args.txt` and the input listing in `listing.txt`, then behaves per
 /// `mode`: `ok` writes `<name>.epub` holding `fake`; `split` writes
 /// `<name> 1.epub` and `<name> 2.epub`; `fail` exits 3 with `boom` on
-/// stderr; `silent` writes nothing. Returns the script's path.
+/// stderr; `silent` writes nothing; `split-volumes` splits a title holding "Volume" and succeeds otherwise. Returns the script's path.
 pub fn fake_kcc(dir: &std::path::Path, mode: &str) -> String {
     let script = dir.join("kcc-c2e");
     let body = format!(
@@ -164,6 +164,7 @@ ls -R "$input" > "{listing}"
 case "{mode}" in
   ok) printf 'fake' > "$out/$name.epub" ;;
   split) printf 'fakeone' > "$out/$name 1.epub"; printf 'faketwo' > "$out/$name 2.epub" ;;
+  split-volumes) case "$name" in *Volume*) printf 'one' > "$out/$name 1.epub"; printf 'two' > "$out/$name 2.epub" ;; *) printf 'fake' > "$out/$name.epub" ;; esac ;;
   fail) echo boom >&2; exit 3 ;;
   silent) ;;
 esac

@@ -38,14 +38,18 @@ pub async fn source_toc(
             return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response();
         }
     };
-    // A manga source keeps every chapter in one volume that is never built
-    // or sent, so its page is a flat chapter list: no fold, no volume
-    // checkbox, no volume EPUB link.
+    // A manga source without `VolumeEnds` keeps every chapter in one volume
+    // that is never built or sent, so its page is a flat chapter list: no
+    // fold, no volume checkbox, no volume EPUB link. With `VolumeEnds` it
+    // folds like a serial, `Volume N` first and the series volume last; a
+    // volume EPUB exists only when Kindle Comic Converter builds it.
     let manga = entry.config.is_manga();
-    // With `VolumeEnds`, a manga source lists its volumes folded like a
-    // serial's, `Volume N` first and the series volume (loose chapters) last.
     let has_volumes = manga && entry.config.has_volumes();
+    let volume_files = has_volumes && registry.kcc_builds();
     let ordered: Vec<&VolumeStat> = if manga { manga_volume_order(&stat.volumes, &stat.name) } else { stat.volumes.iter().collect() };
+    // The newest volume starts open: the last one with any chapter listed,
+    // since a manga series volume sits last and may be empty.
+    let open_index = ordered.iter().rposition(|v| !v.chapters.is_empty()).unwrap_or(ordered.len().saturating_sub(1));
 
     page(
         &stat.name,
@@ -90,9 +94,7 @@ pub async fn source_toc(
             // under this series' id.
             div id="volumes" data-storage-key={ "toc-open:" (source_id) } {
             @for (i, volume) in ordered.iter().enumerate() {
-                // Volumes are listed by id, so the last is the newest, the same
-                // volume `--pull-chapter` defaults to.
-                @let newest = i + 1 == ordered.len();
+                @let newest = i == open_index;
                 details class="volume" data-volume=(volume.id) open[newest] {
                     summary {
                     // `volume.chapters` includes pending chapters so the
@@ -117,8 +119,9 @@ pub async fn source_toc(
                             ", " (volume.pending_chapters) " pending"
                         }
                         // The series volume of a manga source is never built,
-                        // nor is a volume with nothing downloaded.
-                        @if !manga || (volume.name != stat.name && downloaded_chapters > 0) {
+                        // nor is a volume with nothing downloaded, and a manga
+                        // volume file exists only with Kindle Comic Converter.
+                        @if !manga || (volume_files && volume.name != stat.name && downloaded_chapters > 0) {
                             " · "
                             a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
                         }
@@ -957,5 +960,39 @@ mod tests {
         assert_eq!(body.matches("name=\"c\"").count(), 2, "every downloaded chapter is selectable: {}", body);
         let pos = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{} missing: {}", needle, body));
         assert!(pos("<h2>Volume 1</h2>") < pos("<h2>Volume 2</h2>") && pos("<h2>Volume 2</h2>") < pos("<h2>Example Series</h2>"), "series volume last: {}", body);
+    }
+
+    /// `VolumeEnds` without Kindle Comic Converter groups the page but
+    /// offers no volume EPUB link, since none is built.
+    #[tokio::test]
+    async fn volume_ends_without_kcc_folds_but_offers_no_volume_link() {
+        use crate::config::{SourceConfig, SourceKind};
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+        let state = Arc::new(crate::web::app::AppState::for_test_with_sources_and_kcc(vec![SourceConfig {
+            id: "test-source".into(),
+            name: "Example Series".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            volume_ends: vec![1.0],
+            ..Default::default()
+        }], false));
+        {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let v1 = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", v1).unwrap();
+            let id = db.get_chapters_by_volume(v1).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
+        }
+
+        let body = body_of(
+            super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
+        )
+        .await;
+
+        assert!(body.contains("<details class=\"volume\""), "{}", body);
+        assert!(!body.contains("/volume/"), "no volume link without a builder: {}", body);
+        assert!(body.contains("name=\"c\""), "{}", body);
     }
 }
