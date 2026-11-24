@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.3](https://github.com/rsauvehoover/scraper/compare/v2.9.2...v2.9.3) - 2026-11-24
+
+### Fixed
+
+- a day of grace before a failing source fails the run ([#52](https://github.com/rsauvehoover/scraper/pull/52))
+
 ## [2.9.2](https://github.com/rsauvehoover/scraper/compare/v2.9.1...v2.9.2) - 2026-11-20
 
 ### Fixed
