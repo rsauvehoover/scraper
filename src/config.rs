@@ -336,8 +336,30 @@ impl SourceConfig {
     /// The 1-based volume a chapter number belongs to, by `VolumeEnds`;
     /// `None` past the last volume or when there are no volumes.
     pub fn volume_for(&self, number: f64) -> Option<usize> {
-        self.volume_ends.iter().position(|end| number <= *end).map(|i| i + 1)
+        volume_index(&self.volume_ends, number)
     }
+}
+
+/// The 1-based volume a chapter number falls in, given the volume ends:
+/// the first end that is not below it. Past the last end, volumes are
+/// assumed to go on at the length of the most recent one (the last end
+/// less the one before, or the last end itself when it is alone), so an
+/// ongoing series is shelved ahead of the published list and corrected
+/// when `VolumeEnds` grows. `None` only when there are no ends.
+pub fn volume_index(ends: &[f64], number: f64) -> Option<usize> {
+    if let Some(i) = ends.iter().position(|end| number <= *end) {
+        return Some(i + 1);
+    }
+    let last = *ends.last()?;
+    let stride = match ends.len() {
+        1 => last,
+        n => last - ends[n - 2],
+    };
+    if stride <= 0.0 {
+        return Some(ends.len());
+    }
+    let beyond = ((number - last) / stride).ceil() as usize;
+    Some(ends.len() + beyond.max(1))
 }
 
 impl Default for SourceConfig {
@@ -934,10 +956,14 @@ mod tests {
         assert_eq!(m.volume_ends, [5.0, 11.0]);
         assert_eq!((m.volume_for(1.0), m.volume_for(5.0)), (Some(1), Some(1)));
         assert_eq!((m.volume_for(6.0), m.volume_for(11.0)), (Some(2), Some(2)));
-        assert_eq!(m.volume_for(12.0), None);
+        // Past the list, volumes go on at the last volume's length (6)
+        assert_eq!((m.volume_for(12.0), m.volume_for(17.0), m.volume_for(18.0)), (Some(3), Some(3), Some(4)));
+        assert_eq!(m.volume_for(12.5), Some(3));
         let flat = SourceConfig::default();
         assert!(!flat.has_volumes());
         assert_eq!(flat.volume_for(1.0), None);
+        // A single end: its length is the stride
+        assert_eq!((volume_index(&[4.0], 4.0), volume_index(&[4.0], 5.0), volume_index(&[4.0], 9.0)), (Some(1), Some(2), Some(3)));
     }
 
     #[test]

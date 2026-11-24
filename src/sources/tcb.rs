@@ -95,6 +95,14 @@ impl SourceScraper for TcbScraper {
     fn kind(&self) -> SourceKind {
         SourceKind::MangaTcb
     }
+
+    fn volume_ends(&self) -> &[f64] {
+        &self.config.volume_ends
+    }
+
+    fn chapter_pattern(&self) -> Option<&Regex> {
+        self.pattern.as_ref().ok()
+    }
 }
 
 #[cfg(test)]
