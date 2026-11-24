@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.0](https://github.com/rsauvehoover/scraper/compare/v2.9.3...v2.10.0) - 2026-11-24
+
+### Added
+
+- manga volumes through kindle comic converter ([#54](https://github.com/rsauvehoover/scraper/pull/54))
+
 ## [2.9.3](https://github.com/rsauvehoover/scraper/compare/v2.9.2...v2.9.3) - 2026-11-24
 
 ### Fixed
