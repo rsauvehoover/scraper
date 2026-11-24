@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.1](https://github.com/rsauvehoover/scraper/compare/v2.10.0...v2.10.1) - 2026-11-24
+
+### Other
+
+- kcc installs from its github tarball ([#56](https://github.com/rsauvehoover/scraper/pull/56))
+
 ## [2.10.0](https://github.com/rsauvehoover/scraper/compare/v2.9.3...v2.10.0) - 2026-11-24
 
 ### Added
