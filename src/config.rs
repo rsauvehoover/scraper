@@ -496,6 +496,10 @@ pub struct KccConfig {
     /// Largest output file in MB; KCC splits past it, which the scraper
     /// treats as an error
     pub target_mb: u32,
+    /// Keep colour: KCC turns every page grayscale for a Kindle profile
+    /// unless told not to, the Colorsoft included. True passes
+    /// `--forcecolor`.
+    pub colour: bool,
     /// Extra arguments appended verbatim, for example `--jpeg-quality 75`
     pub extra_args: Vec<String>,
 }
@@ -507,6 +511,7 @@ impl Default for KccConfig {
             profile: "KCS".into(),
             format: "KFX".into(),
             target_mb: 195,
+            colour: true,
             extra_args: Vec::new(),
         }
     }
@@ -989,6 +994,8 @@ mod tests {
         let kcc = cfg.manga.kcc.unwrap();
         assert_eq!(kcc.command, "/opt/kcc/bin/kcc-c2e");
         assert_eq!((kcc.profile.as_str(), kcc.format.as_str(), kcc.target_mb), ("KCS", "KFX", 195));
+        assert!(kcc.colour, "colour is kept unless switched off");
+        assert!(!parse_config(br#"{"Manga":{"Kcc":{"Command":"kcc-c2e","Colour":false}}}"#).unwrap().manga.kcc.unwrap().colour);
         assert!(kcc.extra_args.is_empty());
         assert!(parse_config(br#"{}"#).unwrap().manga.kcc.is_none());
         assert!(parse_config(br#"{"Manga":{"Kcc":{}}}"#).is_err(), "Command is required");

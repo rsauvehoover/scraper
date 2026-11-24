@@ -150,7 +150,11 @@ fn export_and_run(
         .arg("--ts").arg(kcc.target_mb.to_string())
         .arg("-t").arg(&job.title)
         .arg("-a").arg(job.author)
-        .arg("-o").arg(&out)
+        .arg("-o").arg(&out);
+    if kcc.colour {
+        command.arg("--forcecolor");
+    }
+    command
         .args(&kcc.extra_args)
         .arg(&input)
         .stdin(Stdio::null())
@@ -267,7 +271,7 @@ mod tests {
         let staging_out = args[args.iter().position(|a| a == "-o").unwrap() + 1].clone();
         assert_eq!(
             &args[..args.len() - 1],
-            &["-p", "KCS", "-f", "KFX", "-m", "-r", "1", "--ts", "195", "-t", "Example Series Volume 1", "-a", "Example Author", "-o", staging_out.as_str(), "--jpeg-quality", "75"]
+            &["-p", "KCS", "-f", "KFX", "-m", "-r", "1", "--ts", "195", "-t", "Example Series Volume 1", "-a", "Example Author", "-o", staging_out.as_str(), "--forcecolor", "--jpeg-quality", "75"]
         );
         assert!(input.ends_with("/in/Example Series Volume 1"), "{}", input);
         assert!(staging_out.ends_with("/out") && !Path::new(&staging_out).exists(), "KCC writes into staging, which is removed: {}", staging_out);

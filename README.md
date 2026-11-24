@@ -530,6 +530,7 @@ Two optional pieces turn a manga source into tankobon volumes built for the Kind
       "Profile": "KCS",                   // KCC device profile; KCS is the Kindle Colorsoft
       "Format": "KFX",                    // KCC's EPUB meant for Send to Kindle, 195 MB ceiling
       "TargetMb": 195,                    // KCC splits past this; the scraper treats a split as an error
+      "Colour": true,                     // keep colour (KCC's --forcecolor); KCC turns pages grayscale otherwise
       "ExtraArgs": []                     // appended verbatim, e.g. ["--jpeg-quality", "75"]
     }
   },
