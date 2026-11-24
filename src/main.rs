@@ -206,6 +206,7 @@ async fn main() {
             .await
             {
                 println!("Error generating EPUBs for {}: {}", source.id, e);
+                failed += 1;
                 continue;
             }
         } else {

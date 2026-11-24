@@ -196,9 +196,10 @@ fn wait_with_limit(mut child: std::process::Child, started: Instant) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fake_kcc;
 
-    /// A fake `kcc-c2e`: records its arguments, then behaves per `mode`.
-    fn fake_kcc(dir: &Path, mode: &str) -> String {
+    #[allow(dead_code)]
+    fn unused_fake_kcc(dir: &Path, mode: &str) -> String {
         let script = dir.join("kcc-c2e");
         let body = format!(
             r#"#!/bin/sh
