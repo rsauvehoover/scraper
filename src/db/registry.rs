@@ -122,6 +122,10 @@ pub struct SourceRegistry {
     /// Configured, enabled sources that did not make it into `entries`, in
     /// config order.
     skipped: Vec<SkippedSource>,
+    /// Whether `Manga.Kcc` is set: manga EPUBs are then files the scraper
+    /// built with Kindle Comic Converter, which the web serves and never
+    /// builds itself.
+    kcc: bool,
 }
 
 impl SourceRegistry {
@@ -209,6 +213,7 @@ impl SourceRegistry {
             entries,
             order,
             skipped,
+            kcc: config.manga.kcc.is_some(),
         }
     }
 
@@ -226,7 +231,13 @@ impl SourceRegistry {
             entries,
             order,
             skipped: Vec::new(),
+            kcc: config.manga.kcc.is_some(),
         }
+    }
+
+    /// Whether manga EPUBs come from Kindle Comic Converter builds on disk
+    pub fn kcc_builds(&self) -> bool {
+        self.kcc
     }
 
     /// Resolve a user-supplied source ID. `None` for anything not configured.

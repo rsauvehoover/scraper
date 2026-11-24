@@ -20,10 +20,10 @@ use zip::CompressionMethod;
 
 use crate::config::SourceConfig;
 use crate::db::{Chapter, SourceDatabase, Volume};
-use crate::epub::{build_chapter_epub, build_volume_epub, EpubContext};
+use crate::epub::{build_chapter_epub, build_volume_epub, chapter_filename, volume_filename, EpubContext};
 use crate::postprocess::ProcessorRegistry;
 use crate::web::app::AppState;
-use crate::web::download::{content_disposition, open, BuildError, DownloadQuery};
+use crate::web::download::{build_root, content_disposition, open, BuildError, DownloadQuery, NOT_BUILT};
 
 const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
 
@@ -43,14 +43,36 @@ impl Item {
     }
 }
 
-/// Blocking: the database work behind the plan.
-fn plan(source: &SourceConfig) -> Result<Vec<Item>, BuildError> {
+/// The file a Kindle Comic Converter item is read from
+fn kcc_file(source: &SourceConfig, item: &Item) -> std::path::PathBuf {
+    match item {
+        Item::Chapter(c) => build_root(source).join("chapters").join("kcc").join(chapter_filename(c)),
+        Item::Volume(v, _) => build_root(source).join("volumes").join(volume_filename(source, v)),
+    }
+}
+
+/// Blocking: the database work behind the plan. With `kcc`, a manga source
+/// with `VolumeEnds` is its volumes; the files are checked before the first
+/// byte, so a missing build refuses the whole archive rather than truncating it.
+fn plan(source: &SourceConfig, kcc: bool) -> Result<Vec<Item>, BuildError> {
     let db = open(&source.id)?;
     let fault = |what: &str, e: rusqlite::Error| {
         eprintln!("{} failed for {}: {}", what, source.id, e);
         BuildError::Internal
     };
-    let items = if source.is_manga() {
+    let items = if source.is_manga() && kcc && source.has_volumes() {
+        let mut items = Vec::new();
+        for volume in db.get_all_volumes().map_err(|e| fault("volume list", e))? {
+            if volume.name == source.name {
+                continue;
+            }
+            let chapters = db.get_chapters_by_volume(volume.id).map_err(|e| fault("chapter list", e))?;
+            if chapters.iter().any(|c| c.data_id.is_some()) {
+                items.push(Item::Volume(volume, chapters));
+            }
+        }
+        items
+    } else if source.is_manga() {
         db.get_downloaded_chapters()
             .map_err(|e| fault("chapter list", e))?
             .into_iter()
@@ -68,6 +90,9 @@ fn plan(source: &SourceConfig) -> Result<Vec<Item>, BuildError> {
     };
     if items.is_empty() {
         return Err(BuildError::NotFound("Nothing downloaded yet"));
+    }
+    if kcc && source.is_manga() && items.iter().any(|item| !kcc_file(source, item).is_file()) {
+        return Err(BuildError::NotBuilt);
     }
     Ok(items)
 }
@@ -97,6 +122,7 @@ fn write_zip(
     source: &SourceConfig,
     items: &[Item],
     strip_colour: bool,
+    kcc: bool,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     let registry = ProcessorRegistry::new();
@@ -107,11 +133,22 @@ fn write_zip(
         .compression_method(CompressionMethod::Stored)
         .large_file(true);
     for item in items {
-        let built = match item {
-            Item::Chapter(c) => build_chapter_epub(db, c, &ctx, strip_colour),
-            Item::Volume(v, chapters) => build_volume_epub(db, v, chapters, &ctx, strip_colour),
-        }
-        .map_err(|e| format!("building {}: {}", item.label(), e))?;
+        let built = if kcc && source.is_manga() {
+            let path = kcc_file(source, item);
+            std::fs::read(&path)
+                .map(|bytes| crate::mail::Attachment {
+                    filename: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    mime: "application/epub+zip".into(),
+                    bytes,
+                })
+                .map_err(|e| format!("reading {}: {}", path.display(), e))?
+        } else {
+            match item {
+                Item::Chapter(c) => build_chapter_epub(db, c, &ctx, strip_colour),
+                Item::Volume(v, chapters) => build_volume_epub(db, v, chapters, &ctx, strip_colour),
+            }
+            .map_err(|e| format!("building {}: {}", item.label(), e))?
+        };
         zip.start_file(&built.filename, options).map_err(|e| e.to_string())?;
         zip.write_all(&built.bytes).map_err(|e| e.to_string())?;
     }
@@ -133,6 +170,7 @@ pub async fn source_epubs_zip(
     };
     let source = entry.config.clone();
     let strip_colour = query.strip_colour() && !source.is_manga();
+    let kcc = registry.kcc_builds() && source.is_manga();
 
     // One permit for the whole archive: it is one long build, not many.
     let permit = Arc::clone(&state.epub_permits).acquire_owned().await;
@@ -144,11 +182,12 @@ pub async fn source_epubs_zip(
     // empty archive.
     let planned = {
         let source = source.clone();
-        tokio::task::spawn_blocking(move || plan(&source)).await
+        tokio::task::spawn_blocking(move || plan(&source, kcc)).await
     };
     let items = match planned {
         Ok(Ok(items)) => items,
         Ok(Err(BuildError::NotFound(msg))) => return (StatusCode::NOT_FOUND, msg).into_response(),
+        Ok(Err(BuildError::NotBuilt)) => return (StatusCode::SERVICE_UNAVAILABLE, NOT_BUILT).into_response(),
         Ok(Err(BuildError::Internal)) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response()
         }
@@ -170,7 +209,7 @@ pub async fn source_epubs_zip(
             Ok(db) => db,
             Err(_) => return,
         };
-        if let Err(e) = write_zip(&db, &source, &items, strip_colour, tx) {
+        if let Err(e) = write_zip(&db, &source, &items, strip_colour, kcc, tx) {
             eprintln!("zip of {} stopped: {}", source.id, e);
         }
     });
@@ -311,5 +350,73 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(std::str::from_utf8(&body).unwrap(), "Nothing downloaded yet");
+    }
+
+    fn kcc_state(volume_ends: Vec<f64>) -> Arc<AppState> {
+        Arc::new(AppState::for_test_with_sources_and_kcc(vec![SourceConfig {
+            id: "test-source".into(),
+            name: "Example Series".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            volume_ends,
+            ..Default::default()
+        }], true))
+    }
+
+    /// With Kindle Comic Converter and `VolumeEnds`, the zip is the volume
+    /// files; a missing one refuses the whole archive up front.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_kcc_zip_holds_volume_files_and_refuses_when_one_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        {
+            let db = SourceDatabase::open("test-source").unwrap();
+            db.add_volume("Example Series").unwrap();
+            let v1 = db.add_volume("Volume 1").unwrap();
+            let v2 = db.add_volume("Volume 2").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", v1).unwrap();
+            db.add_chapter("Chapter 2", "https://example.com/c2", v2).unwrap();
+            let id = db.get_chapters_by_volume(v1).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
+        }
+        let state = kcc_state(vec![1.0]);
+
+        let (status, _, body) = fetch(&state, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(std::str::from_utf8(&body).unwrap(), crate::web::download::NOT_BUILT);
+
+        std::fs::create_dir_all("build/test-source/volumes").unwrap();
+        std::fs::write("build/test-source/volumes/Example Series Volume 1.epub", b"fakevol").unwrap();
+        let (status, _, body) = fetch(&state, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = entries(&body);
+        assert_eq!(entries.iter().map(|e| (e.0.as_str(), e.2.as_slice())).collect::<Vec<_>>(), [("Example Series Volume 1.epub", b"fakevol".as_slice())], "only Volume 1 has a download; Volume 2 is pending");
+    }
+
+    /// Without `VolumeEnds` the Kindle Comic Converter zip is the chapter files.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_kcc_zip_of_a_flat_source_holds_chapter_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let id = {
+            let db = SourceDatabase::open("test-source").unwrap();
+            let series = db.add_volume("Example Series").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", series).unwrap();
+            let id = db.get_chapters_by_volume(series).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
+            id
+        };
+        let state = kcc_state(vec![]);
+        std::fs::create_dir_all("build/test-source/chapters/kcc").unwrap();
+        std::fs::write(format!("build/test-source/chapters/kcc/{}(Chapter 1).epub", id), b"fakech").unwrap();
+
+        let (status, _, body) = fetch(&state, None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(entries(&body).iter().map(|e| e.0.clone()).collect::<Vec<_>>(), [format!("{}(Chapter 1).epub", id)]);
     }
 }

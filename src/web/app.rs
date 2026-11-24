@@ -156,8 +156,17 @@ impl AppState {
     /// `for_test` with the given sources in place of its single text source.
     #[cfg(test)]
     pub fn for_test_with_sources(sources: Vec<crate::config::SourceConfig>) -> Self {
+        Self::for_test_with_sources_and_kcc(sources, false)
+    }
+
+    /// `for_test_with_sources`, with `Manga.Kcc` set when `kcc` is true.
+    #[cfg(test)]
+    pub fn for_test_with_sources_and_kcc(sources: Vec<crate::config::SourceConfig>, kcc: bool) -> Self {
         let mut config = crate::config::Config::default();
         config.sources = sources;
+        if kcc {
+            config.manga.kcc = Some(crate::config::KccConfig { command: "kcc-c2e".into(), ..Default::default() });
+        }
 
         AppState {
             registry: LiveRegistry::fixed(crate::db::SourceRegistry::from_config_for_test(&config)),

@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use maud::{html, Markup, PreEscaped};
 use serde::Deserialize;
 
-use crate::stats::cache::ChapterStat;
+use crate::stats::cache::{ChapterStat, VolumeStat};
 use crate::web::app::AppState;
 use crate::web::sanitize::sanitize_chapter;
 use crate::web::views::page;
@@ -42,6 +42,10 @@ pub async fn source_toc(
     // or sent, so its page is a flat chapter list: no fold, no volume
     // checkbox, no volume EPUB link.
     let manga = entry.config.is_manga();
+    // With `VolumeEnds`, a manga source lists its volumes folded like a
+    // serial's, `Volume N` first and the series volume (loose chapters) last.
+    let has_volumes = manga && entry.config.has_volumes();
+    let ordered: Vec<&VolumeStat> = if manga { manga_volume_order(&stat.volumes, &stat.name) } else { stat.volumes.iter().collect() };
 
     page(
         &stat.name,
@@ -62,7 +66,7 @@ pub async fn source_toc(
                         }
                     }
                 }
-                @if !manga {
+                @if !manga || has_volumes {
                     // Hidden until toc_folds.js runs, so a reader without
                     // JavaScript is not offered a button that does nothing.
                     button type="button" id="toggle-volumes" class="toggle-all"
@@ -70,9 +74,9 @@ pub async fn source_toc(
                 }
             }
             form id="send-pick" method="get" action={ "/source/" (source_id) "/send" } {
-            @if manga {
+            @if manga && !has_volumes {
                 ol class="chapters" {
-                    @for volume in &stat.volumes {
+                    @for volume in &ordered {
                         @for chapter in &volume.chapters {
                             (chapter_row(&source_id, chapter))
                         }
@@ -85,10 +89,10 @@ pub async fn source_toc(
             // then applies whatever this reader left open last time, stored
             // under this series' id.
             div id="volumes" data-storage-key={ "toc-open:" (source_id) } {
-            @for (i, volume) in stat.volumes.iter().enumerate() {
+            @for (i, volume) in ordered.iter().enumerate() {
                 // Volumes are listed by id, so the last is the newest, the same
                 // volume `--pull-chapter` defaults to.
-                @let newest = i + 1 == stat.volumes.len();
+                @let newest = i + 1 == ordered.len();
                 details class="volume" data-volume=(volume.id) open[newest] {
                     summary {
                     // `volume.chapters` includes pending chapters so the
@@ -99,8 +103,9 @@ pub async fn source_toc(
                     // their own figure instead. Same expression as `views.rs`.
                     @let downloaded_chapters =
                         volume.chapters.len() - volume.pending_chapters;
-                    // A volume with nothing downloaded has nothing to send.
-                    @if downloaded_chapters > 0 {
+                    // A volume with nothing downloaded has nothing to send;
+                    // a manga volume is never sent.
+                    @if downloaded_chapters > 0 && !manga {
                         input type="checkbox" class="pick" name="v" value=(volume.id)
                               aria-label={ "Select " (volume.name) };
                     }
@@ -111,11 +116,17 @@ pub async fn source_toc(
                         @if volume.pending_chapters > 0 {
                             ", " (volume.pending_chapters) " pending"
                         }
-                        " · "
-                        a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
-                        " · "
-                        a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
-                            "EPUB (no colour)"
+                        // The series volume of a manga source is never built,
+                        // nor is a volume with nothing downloaded.
+                        @if !manga || (volume.name != stat.name && downloaded_chapters > 0) {
+                            " · "
+                            a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub" } { "EPUB" }
+                        }
+                        @if !manga {
+                            " · "
+                            a href={ "/source/" (source_id) "/volume/" (volume.id) "/epub?stripped=1" } {
+                                "EPUB (no colour)"
+                            }
                         }
                     }
                     }
@@ -420,6 +431,18 @@ pub fn format_thousands(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// A manga source's volumes for display: `Volume N` ascending, then the
+/// series volume and anything else, last.
+fn manga_volume_order<'a>(volumes: &'a [VolumeStat], series: &str) -> Vec<&'a VolumeStat> {
+    let number = |v: &VolumeStat| v.name.strip_prefix("Volume ").and_then(|n| n.parse::<usize>().ok());
+    let mut numbered: Vec<(usize, &VolumeStat)> = volumes.iter().filter_map(|v| number(v).map(|n| (n, v))).collect();
+    numbered.sort_by_key(|(n, _)| *n);
+    let mut ordered: Vec<&VolumeStat> = numbered.into_iter().map(|(_, v)| v).collect();
+    ordered.extend(volumes.iter().filter(|v| number(v).is_none() || v.name == series));
+    ordered.dedup_by(|a, b| std::ptr::eq(*a, *b));
+    ordered
 }
 
 /// One chapter's line in a listing: checkbox, link, size or "pending", date,
@@ -885,5 +908,54 @@ mod tests {
         assert_eq!(format_thousands(999), "999");
         assert_eq!(format_thousands(1000), "1,000");
         assert_eq!(format_thousands(26451980), "26,451,980");
+    }
+
+    /// With `VolumeEnds`, a manga source folds like a serial: `Volume N`
+    /// headings with an EPUB link, no volume checkbox or colour link, the
+    /// series volume last and without a volume link, chapters selectable
+    /// everywhere.
+    #[tokio::test]
+    async fn a_manga_source_with_volume_ends_lists_folded_volumes_without_volume_checkboxes() {
+        use crate::config::{SourceConfig, SourceKind};
+        use axum::extract::{Path as AxumPath, State};
+        use std::sync::Arc;
+        let state = Arc::new(crate::web::app::AppState::for_test_with_sources_and_kcc(vec![SourceConfig {
+            id: "test-source".into(),
+            name: "Example Series".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            volume_ends: vec![1.0],
+            ..Default::default()
+        }], true));
+        let (series, v1, v2) = {
+            let registry = state.registry.snapshot();
+            let db = registry.get("test-source").unwrap().db();
+            let series = db.add_volume("Example Series").unwrap();
+            let v1 = db.add_volume("Volume 1").unwrap();
+            let v2 = db.add_volume("Volume 2").unwrap();
+            db.add_chapter("Loose", "https://example.com/special", series).unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", v1).unwrap();
+            db.add_chapter("Chapter 2", "https://example.com/c2", v2).unwrap();
+            for chapter in db.get_chapters_by_volume(series).unwrap().into_iter().chain(db.get_chapters_by_volume(v1).unwrap()) {
+                db.add_chapter_data(chapter.id, "<p>one</p>").unwrap();
+            }
+            (series, v1, v2)
+        };
+
+        let body = body_of(
+            super::source_toc(State(Arc::clone(&state)), AxumPath("test-source".to_string())).await,
+        )
+        .await;
+
+        assert!(body.contains("<details class=\"volume\""), "folded: {}", body);
+        assert!(body.contains("id=\"toggle-volumes\""), "{}", body);
+        assert!(!body.contains("name=\"v\""), "no volume checkbox: {}", body);
+        assert!(!body.contains("stripped=1"), "no colour link: {}", body);
+        assert!(body.contains(&format!("/volume/{}/epub\"", v1)), "Volume 1 link: {}", body);
+        assert!(!body.contains(&format!("/volume/{}/epub", series)), "series volume has no link: {}", body);
+        assert!(!body.contains(&format!("/volume/{}/epub", v2)), "a volume with nothing downloaded has no link: {}", body);
+        assert_eq!(body.matches("name=\"c\"").count(), 2, "every downloaded chapter is selectable: {}", body);
+        let pos = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{} missing: {}", needle, body));
+        assert!(pos("<h2>Volume 1</h2>") < pos("<h2>Volume 2</h2>") && pos("<h2>Volume 2</h2>") < pos("<h2>Example Series</h2>"), "series volume last: {}", body);
     }
 }

@@ -80,6 +80,7 @@ pub async fn send_submit(
         planned,
         mailer,
         build_item,
+        registry.kcc_builds(),
         Arc::clone(&state.epub_permits),
         max_attachment_bytes,
     ));
