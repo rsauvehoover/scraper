@@ -323,6 +323,7 @@ impl SourceDatabase {
         Ok(value
             .and_then(|v| v.parse::<u64>().ok())
             .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)))
+    }
 
     /// Move a chapter to another volume. Flags are untouched.
     pub fn move_chapter(&self, chapter_id: isize, volume_id: isize) -> Result<()> {
@@ -1057,7 +1058,9 @@ mod tests {
         db.note_success().unwrap();
         assert_eq!(db.failing_since().unwrap(), None);
         assert_eq!(db.note_failure(later).unwrap(), later, "a new streak starts afresh");
+    }
 
+    #[test]
     fn move_chapter_changes_only_the_volume() {
         let db = test_db();
         let v1 = db.add_volume("Volume 1").unwrap();
