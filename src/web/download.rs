@@ -25,7 +25,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 
 use crate::config::SourceConfig;
-use crate::epub::{build_chapter_epub, build_volume_epub, EpubContext};
+use crate::epub::{build_chapter_epub, build_volume_epub, chapter_filename, volume_filename, EpubContext};
 use crate::mail::Attachment;
 use crate::postprocess::ProcessorRegistry;
 use crate::web::app::AppState;
@@ -98,6 +98,7 @@ fn build_task_response(
     match result {
         Ok(Ok(a)) => epub_response(&a.filename, a.bytes),
         Ok(Err(BuildError::NotFound(msg))) => (StatusCode::NOT_FOUND, msg).into_response(),
+        Ok(Err(BuildError::NotBuilt)) => (StatusCode::SERVICE_UNAVAILABLE, NOT_BUILT).into_response(),
         Ok(Err(BuildError::Internal)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE).into_response()
         }
@@ -119,9 +120,10 @@ pub async fn volume_epub(
         return (StatusCode::NOT_FOUND, "Unknown source").into_response();
     };
     let source = entry.config.clone();
-    // A manga source's single volume is never built; its chapters are
-    // downloaded one by one.
-    if source.is_manga() {
+    // A manga volume exists only as a file Kindle Comic Converter built for
+    // a source with `VolumeEnds`; otherwise manga has no volume EPUBs.
+    let kcc = registry.kcc_builds() && source.is_manga() && source.has_volumes();
+    if source.is_manga() && !kcc {
         return (StatusCode::NOT_FOUND, MANGA_HAS_NO_VOLUMES).into_response();
     }
     let strip_colour = query.strip_colour();
@@ -136,8 +138,10 @@ pub async fn volume_epub(
     // Database work, lookups included, stays in the blocking task:
     // `open_query_only` sets a 5-second `busy_timeout` that must not be waited
     // out on an executor thread.
-    let result =
-        tokio::task::spawn_blocking(move || build_volume(&source, volume_id, strip_colour)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        if kcc { kcc_volume(&source, volume_id) } else { build_volume(&source, volume_id, strip_colour) }
+    })
+    .await;
     build_task_response(result)
 }
 
@@ -154,6 +158,9 @@ pub async fn chapter_epub(
     let source = entry.config.clone();
     // A manga source has no stripped variant; the output would be the same.
     let strip_colour = query.strip_colour() && !source.is_manga();
+    // With Kindle Comic Converter configured, a manga chapter is the file
+    // the scraper built, never a build on request.
+    let kcc = registry.kcc_builds() && source.is_manga();
 
     let permit = Arc::clone(&state.epub_permits).acquire_owned().await;
     let Ok(_permit) = permit else {
@@ -162,9 +169,10 @@ pub async fn chapter_epub(
 
     // See volume_epub: the chapter lookup is database work too, so it stays
     // inside the blocking task alongside the build.
-    let result =
-        tokio::task::spawn_blocking(move || build_chapter(&source, chapter_id, strip_colour))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        if kcc { kcc_chapter(&source, chapter_id) } else { build_chapter(&source, chapter_id, strip_colour) }
+    })
+    .await;
     build_task_response(result)
 }
 
@@ -173,10 +181,80 @@ pub async fn chapter_epub(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuildError {
     NotFound(&'static str),
+    /// A Kindle Comic Converter file the scraper has not written yet
+    NotBuilt,
     Internal,
 }
 
 const MANGA_HAS_NO_VOLUMES: &str = "Manga sources have no volume EPUBs";
+pub(crate) const NOT_BUILT: &str = "Not built yet; the scraper builds it on its next run";
+const SERIES_VOLUME_HAS_NO_EPUB: &str = "The series volume has no EPUB; its chapters are downloaded singly";
+
+/// Where the scraper writes a source's EPUBs, relative to the working
+/// directory the scraper and the web share.
+pub(crate) fn build_root(source: &SourceConfig) -> std::path::PathBuf {
+    std::path::Path::new("build").join(&source.id)
+}
+
+/// A file the scraper built with Kindle Comic Converter, as an attachment
+fn read_built(path: &std::path::Path, filename: String) -> Result<Attachment, BuildError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Attachment { filename, mime: "application/epub+zip".into(), bytes }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BuildError::NotBuilt),
+        Err(e) => {
+            eprintln!("reading {} failed: {}", path.display(), e);
+            Err(BuildError::Internal)
+        }
+    }
+}
+
+/// The scraper's Kindle Comic Converter file for a downloaded manga chapter.
+/// Blocking; `source` as for `build_chapter`.
+pub(crate) fn kcc_chapter(source: &SourceConfig, chapter_id: i64) -> Result<Attachment, BuildError> {
+    let db = open(&source.id)?;
+    let row: Result<(String, bool), _> = db.connection().query_row(
+        "SELECT c.name, rd.data IS NOT NULL
+         FROM chapters c
+         LEFT JOIN raw_data rd ON rd.chapter_id = c.id
+         WHERE c.id = ?1",
+        [chapter_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    let (name, downloaded) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Err(BuildError::NotFound("Unknown chapter")),
+        Err(e) => {
+            eprintln!("chapter lookup failed for {}/{}: {}", source.id, chapter_id, e);
+            return Err(BuildError::Internal);
+        }
+    };
+    if !downloaded {
+        return Err(BuildError::NotFound("Chapter has not been downloaded yet"));
+    }
+    let chapter = crate::db::Chapter { id: chapter_id as isize, name, uri: String::new(), volume_id: 0, data_id: None };
+    let filename = chapter_filename(&chapter);
+    read_built(&build_root(source).join("chapters").join("kcc").join(&filename), filename)
+}
+
+/// The scraper's Kindle Comic Converter file for a manga `Volume N`.
+/// Blocking; `source` as for `build_volume`.
+pub(crate) fn kcc_volume(source: &SourceConfig, volume_id: i64) -> Result<Attachment, BuildError> {
+    let db = open(&source.id)?;
+    let name = match db.get_volume_name(volume_id as isize) {
+        Ok(name) => name,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Err(BuildError::NotFound("Unknown volume")),
+        Err(e) => {
+            eprintln!("volume lookup failed for {}/{}: {}", source.id, volume_id, e);
+            return Err(BuildError::Internal);
+        }
+    };
+    if name == source.name {
+        return Err(BuildError::NotFound(SERIES_VOLUME_HAS_NO_EPUB));
+    }
+    let volume = crate::db::Volume { id: volume_id as isize, name };
+    let filename = volume_filename(source, &volume);
+    read_built(&build_root(source).join("volumes").join(&filename), filename)
+}
 
 /// Build a volume EPUB. Blocking: call from `spawn_blocking`. `source` must
 /// have come from `SourceRegistry::get` (see the module header).
@@ -535,7 +613,7 @@ mod tests {
         // The send job builds through `build_item`, which ignores the choice too.
         let source = state.registry.snapshot().get("test-source").unwrap().config.clone();
         let item = crate::web::send_plan::Item::Chapter { id: chapter_id as i64, name: "Chapter".into() };
-        let sent = crate::web::send_jobs::build_item(&source, &item, true).unwrap();
+        let sent = crate::web::send_jobs::build_item(&source, &item, true, false).unwrap();
         assert_eq!(page(&sent.bytes), plain, "a send must not strip a manga chapter");
     }
 
@@ -589,5 +667,109 @@ mod tests {
             build_volume(&manga, vol, false),
             Err(BuildError::NotFound("Manga sources have no volume EPUBs"))
         ));
+    }
+
+    /// A manga source with `VolumeEnds` and Kindle Comic Converter: the
+    /// volume route serves the scraper's file, says "not built yet" when
+    /// it is missing, and refuses the series volume.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kcc_volumes_are_served_from_the_build_directory_or_503() {
+        use super::{volume_epub, DownloadQuery};
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::web::app::AppState;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let (series, v1) = {
+            let db = crate::db::SourceDatabase::open("test-source").unwrap();
+            let series = db.add_volume("Example Series").unwrap();
+            let v1 = db.add_volume("Volume 1").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", v1).unwrap();
+            let id = db.get_chapters_by_volume(v1).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
+            (series, v1)
+        };
+        let state = Arc::new(AppState::for_test_with_sources_and_kcc(vec![SourceConfig {
+            id: "test-source".into(),
+            name: "Example Series".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            volume_ends: vec![1.0],
+            ..Default::default()
+        }], true));
+        let fetch = |vol: isize| {
+            let state = Arc::clone(&state);
+            async move {
+                let r = volume_epub(State(state), AxumPath(("test-source".to_string(), vol as i64)), Query(DownloadQuery { stripped: None })).await;
+                let status = r.status();
+                let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let (status, body) = fetch(v1).await;
+        assert_eq!((status, body.as_str()), (StatusCode::SERVICE_UNAVAILABLE, super::NOT_BUILT));
+
+        std::fs::create_dir_all("build/test-source/volumes").unwrap();
+        std::fs::write("build/test-source/volumes/Example Series Volume 1.epub", b"fakevol").unwrap();
+        let (status, body) = fetch(v1).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "fakevol"));
+
+        let (status, body) = fetch(series).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("series volume"), "{}", body);
+    }
+
+    /// With Kindle Comic Converter, a manga chapter is the scraper's file on
+    /// the download route and for a web send alike; without a file, 503.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kcc_chapters_are_served_from_the_build_directory_or_503() {
+        use super::{chapter_epub, DownloadQuery};
+        use crate::config::{SourceConfig, SourceKind};
+        use crate::web::app::AppState;
+        use crate::web::send_plan::Item;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::change_to(dir.path());
+        std::fs::create_dir_all("db").unwrap();
+        let id = {
+            let db = crate::db::SourceDatabase::open("test-source").unwrap();
+            let series = db.add_volume("Example Series").unwrap();
+            db.add_chapter("Chapter 1", "https://example.com/c1", series).unwrap();
+            let id = db.get_chapters_by_volume(series).unwrap()[0].id;
+            db.add_chapter_data(id, "<p>one</p>").unwrap();
+            id
+        };
+        let source = SourceConfig {
+            id: "test-source".into(),
+            name: "Example Series".into(),
+            enabled: true,
+            kind: SourceKind::MangaWordpress,
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::for_test_with_sources_and_kcc(vec![source.clone()], true));
+        let item = Item::Chapter { id: id as i64, name: "Chapter 1".into() };
+
+        let r = chapter_epub(State(Arc::clone(&state)), AxumPath(("test-source".to_string(), id as i64)), Query(DownloadQuery { stripped: None })).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(crate::web::send_jobs::build_item(&source, &item, false, true), Err(super::BuildError::NotBuilt)));
+
+        std::fs::create_dir_all("build/test-source/chapters/kcc").unwrap();
+        std::fs::write(format!("build/test-source/chapters/kcc/{}(Chapter 1).epub", id), b"fakech").unwrap();
+        let r = chapter_epub(State(Arc::clone(&state)), AxumPath(("test-source".to_string(), id as i64)), Query(DownloadQuery { stripped: None })).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"fakech");
+        let sent = crate::web::send_jobs::build_item(&source, &item, false, true).unwrap();
+        assert_eq!((sent.filename.as_str(), sent.bytes.as_slice()), (format!("{}(Chapter 1).epub", id).as_str(), b"fakech".as_slice()));
     }
 }

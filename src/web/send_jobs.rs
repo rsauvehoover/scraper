@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 use crate::config::SourceConfig;
 use crate::mail::{Attachment, Mailer, SendError};
 use crate::web::auth::random_token;
-use crate::web::download::{build_chapter, build_volume, BuildError};
+use crate::web::download::{build_chapter, build_volume, kcc_chapter, kcc_volume, BuildError};
 use crate::web::send_plan::{Item, PlannedEmail, Refusal};
 
 /// Finished jobs kept for the status page, the running one included.
@@ -136,13 +136,17 @@ impl SendJobs {
 // `download.rs`), and a `pub` item naming a less-visible type is a
 // `private_interfaces` warning. Nothing outside the crate needs these —
 // `send.rs` (inside `src/web`) is the only caller.
-pub(crate) type BuildFn = fn(&SourceConfig, &Item, bool) -> Result<Attachment, BuildError>;
+pub(crate) type BuildFn = fn(&SourceConfig, &Item, bool, bool) -> Result<Attachment, BuildError>;
 
-/// The same builds the download links serve.
-pub(crate) fn build_item(source: &SourceConfig, item: &Item, strip_colour: bool) -> Result<Attachment, BuildError> {
+/// The same builds the download links serve. `kcc`: manga files come from
+/// the scraper's Kindle Comic Converter builds.
+pub(crate) fn build_item(source: &SourceConfig, item: &Item, strip_colour: bool, kcc: bool) -> Result<Attachment, BuildError> {
     // A manga source has no stripped variant, as on the download route.
     let strip_colour = strip_colour && !source.is_manga();
+    let kcc = kcc && source.is_manga();
     match item {
+        Item::Volume { id, .. } if kcc => kcc_volume(source, *id),
+        Item::Chapter { id, .. } if kcc => kcc_chapter(source, *id),
         Item::Volume { id, .. } => build_volume(source, *id, strip_colour),
         Item::Chapter { id, .. } => build_chapter(source, *id, strip_colour),
     }
@@ -168,6 +172,7 @@ pub(crate) async fn run_job(
     emails: Vec<PlannedEmail>,
     mut mailer: Box<dyn Mailer>,
     build: BuildFn,
+    kcc: bool,
     permits: Arc<Semaphore>,
     max_attachment_bytes: usize,
 ) {
@@ -187,7 +192,7 @@ pub(crate) async fn run_job(
             // or be starved indefinitely.
             let Ok(_permit) = Arc::clone(&permits).acquire_owned().await else { return };
             let (source, item, strip) = (Arc::clone(&source), email.item.clone(), email.strip_colour);
-            tokio::task::spawn_blocking(move || build(&source, &item, strip)).await
+            tokio::task::spawn_blocking(move || build(&source, &item, strip, kcc)).await
         };
         let attachment = match built {
             Ok(Ok(a)) => a,
@@ -255,7 +260,7 @@ mod tests {
         SourceConfig { id: "test-source".into(), name: "Test Serial".into(), enabled: true, ..SourceConfig::default() }
     }
 
-    fn fake_build(_: &SourceConfig, item: &Item, strip: bool) -> Result<Attachment, BuildError> {
+    fn fake_build(_: &SourceConfig, item: &Item, strip: bool, _kcc: bool) -> Result<Attachment, BuildError> {
         if item.label() == "broken" {
             return Err(BuildError::Internal);
         }
@@ -268,7 +273,7 @@ mod tests {
     async fn run(emails: Vec<PlannedEmail>, mailer: RecordingMailer) -> Job {
         let jobs = Arc::new(SendJobs::new());
         let id = jobs.try_start("test-source", "Test Serial", &emails).unwrap();
-        run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), fake_build,
+        run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), fake_build, false,
                 Arc::new(Semaphore::new(1)), 17 * 1024 * 1024).await;
         jobs.get(&id).unwrap()
     }
@@ -304,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_too_large_build_fails_that_email_without_calling_the_mailer() {
-        fn huge_build(_: &SourceConfig, _: &Item, _: bool) -> Result<Attachment, BuildError> {
+        fn huge_build(_: &SourceConfig, _: &Item, _: bool, _kcc: bool) -> Result<Attachment, BuildError> {
             Ok(Attachment {
                 filename: "big.epub".into(),
                 mime: "application/epub+zip".into(),
@@ -315,7 +320,7 @@ mod tests {
         let emails = vec![email("a", "Reader", false)];
         let jobs = Arc::new(SendJobs::new());
         let id = jobs.try_start("test-source", "Test Serial", &emails).unwrap();
-        run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), huge_build,
+        run_job(Arc::clone(&jobs), id.clone(), source(), emails, Box::new(mailer), huge_build, false,
                 Arc::new(Semaphore::new(1)), 1024).await;
         let job = jobs.get(&id).unwrap();
         assert_eq!(job.emails[0].state, EmailState::Failed("too large to send"));

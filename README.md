@@ -505,9 +505,9 @@ A source with `"Kind": "manga-tcb"` or `"Kind": "manga-wordpress"` is a manga so
 Behaviour:
 
 - Colour is kept; pages are scaled and re-encoded as JPEG according to the `Images` block, with any alpha channel flattened onto white. A page that already fits is stored untouched when that is smaller.
-- Every chapter sits in one volume named after the source. That volume is never built or sent: manga chapters go out one at a time, to destinations with `SendIndividualChapters`.
+- Without `VolumeEnds`, every chapter sits in one volume named after the source. That volume is never built or sent: manga chapters go out one at a time, to destinations with `SendIndividualChapters`. With `VolumeEnds` (below), chapters are shelved into `Volume 1`, `Volume 2`, ... as well, and each volume gets an EPUB for the Send to Kindle web page; chapters are still sent singly.
 - A chapter EPUB larger than `Mail.MaxAttachmentMb` is refused by the send guard and logged. Pages are tuned with `Images.JpegQuality` and `Images.MaxHeight`; a full-colour series measured 15 to 41 MB per chapter with its pages stored untouched.
-- The web frontend lists a manga source as a flat chapter list with a send checkbox and an EPUB link per downloaded chapter. There is no volume EPUB.
+- The web frontend lists a manga source as a flat chapter list with a send checkbox and an EPUB link per downloaded chapter, or folded by volume when `VolumeEnds` is set, with an EPUB link per volume and never a volume checkbox.
 - `--redownload` re-fetches pages and flags nothing.
 - A chapter page with no images counts as not yet available and is retried on the next run.
 
@@ -517,6 +517,40 @@ Rollout:
 2. For an ongoing series, add it to a destination with `SendIndividualChapters` after the first scrape, so only chapters released later are sent.
 3. A chapter that failed during the backfill and succeeds on a later run counts as new and is mailed. Wait for a clean run before adding the source to a destination.
 4. A database from the batch design, with volumes named `Volume 1`, `Volume 2` and so on, is collapsed into the series volume by the next run. The collapse moves rows only and flags nothing.
+
+#### Volumes and Kindle Comic Converter
+
+Two optional pieces turn a manga source into tankobon volumes built for the Kindle:
+
+```jsonc
+{
+  "Manga": {
+    "Kcc": {
+      "Command": "/opt/kcc/bin/kcc-c2e",  // required when Kcc is set
+      "Profile": "KCS",                   // KCC device profile; KCS is the Kindle Colorsoft
+      "Format": "KFX",                    // KCC's EPUB meant for Send to Kindle, 195 MB ceiling
+      "TargetMb": 195,                    // KCC splits past this; the scraper treats a split as an error
+      "ExtraArgs": []                     // appended verbatim, e.g. ["--jpeg-quality", "75"]
+    }
+  },
+  "Sources": [{
+    "Id": "jojo-jojolands", "Kind": "manga-wordpress", "...": "...",
+    "VolumeEnds": [4, 8, 12, 16, 20, 24, 28, 32, 36],  // last chapter number of each published volume
+    "Spreads": "split"                                  // split (default), rotate or both: KCC's --splitter
+  }]
+}
+```
+
+- `VolumeEnds` shelves chapters by the number `Selectors.ChapterPattern` reads from their URL: chapter 1 to the first end is `Volume 1`, and so on. Past the last end, volumes are assumed to go on at the length of the most recent one, so an ongoing series is shelved ahead of the published list; add the next end when the volume comes out and the next run moves whatever differs. Chapters whose URL yields no number stay in the series volume. Reshelving sets no chapter flag and mails nothing; it flags the volumes it touched for a rebuild.
+- With `Manga.Kcc` set, every manga EPUB is built by [Kindle Comic Converter](https://github.com/ciromattia/kcc) from a temporary export of the stored pages: pages sized to the device, double-page spreads split right to left, output under the size ceiling. Chapters go to `build/<source>/chapters/kcc/`, volumes to `build/<source>/volumes/`, each built when flagged or when its file is missing, so a backlog is built once. Only the scraper runs KCC; the web serves the files and answers 503 "Not built yet" for one the scraper has not written. A KCC failure leaves the flag and fails the source for that run, after what did build has been sent. Without `Manga.Kcc` the built-in builder is used; `VolumeEnds` then only groups the contents page, as no manga volume EPUB is built.
+- Stored pages are never modified; KCC's output is a derived file.
+- Install on Debian: `apt install python3-venv`, `python3 -m venv /opt/kcc`, `/opt/kcc/bin/pip install KindleComicConverter`, and check `/opt/kcc/bin/kcc-c2e --help` runs as the scraper user. The first run after configuring builds every volume and chapter of a backfilled series, which takes a while on a small machine and holds the cron lock throughout.
+
+Published volume ends, from the JoJo wiki, in the sites' continuous chapter numbering:
+
+- Steel Ball Run (24 volumes): `[5, 11, 17, 23, 27, 30, 33, 36, 39, 42, 45, 48, 51, 55, 59, 63, 68, 72, 76, 80, 84, 88, 91, 95]`
+- JoJolion (27 volumes): `[5, 9, 13, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74, 78, 82, 86, 90, 94, 98, 102, 106, 110]`
+- The JOJOLands (9 so far): `[4, 8, 12, 16, 20, 24, 28, 32, 36]`
 
 ### Minimal Configuration
 

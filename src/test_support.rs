@@ -143,6 +143,42 @@ pub async fn serve_challenged(
     (base, hits)
 }
 
+/// A fake `kcc-c2e` written into `dir`: records its arguments in
+/// `args.txt` and the input listing in `listing.txt`, then behaves per
+/// `mode`: `ok` writes `<name>.epub` holding `fake`; `split` writes
+/// `<name> 1.epub` and `<name> 2.epub`; `fail` exits 3 with `boom` on
+/// stderr; `silent` writes nothing; `split-volumes` splits a title holding "Volume" and succeeds otherwise. Returns the script's path.
+pub fn fake_kcc(dir: &std::path::Path, mode: &str) -> String {
+    let script = dir.join("kcc-c2e");
+    let body = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "{args}"
+out=""
+while [ $# -gt 1 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; fi
+  shift
+done
+input="$1"
+name=$(basename "$input")
+ls -R "$input" > "{listing}"
+case "{mode}" in
+  ok) printf 'fake' > "$out/$name.epub" ;;
+  split) printf 'fakeone' > "$out/$name 1.epub"; printf 'faketwo' > "$out/$name 2.epub" ;;
+  split-volumes) case "$name" in *Volume*) printf 'one' > "$out/$name 1.epub"; printf 'two' > "$out/$name 2.epub" ;; *) printf 'fake' > "$out/$name.epub" ;; esac ;;
+  fail) echo boom >&2; exit 3 ;;
+  silent) ;;
+esac
+"#,
+        args = dir.join("args.txt").display(),
+        listing = dir.join("listing.txt").display(),
+        mode = mode
+    );
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script.to_string_lossy().into_owned()
+}
+
 fn fixture_response(routes: &[FixtureRoute], path: &str) -> Response {
     match routes.iter().find(|r| r.path == path) {
         Some(r) => (

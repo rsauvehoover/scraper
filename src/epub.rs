@@ -130,8 +130,18 @@ fn generate_cover_with_text(
 
 /// Replace path separators so chapter/volume names can be used in filenames
 /// and zip-internal content paths.
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.replace(['/', '\\'], "-")
+}
+
+/// The file a chapter's EPUB is written to, under its source's directory
+pub(crate) fn chapter_filename(chapter: &Chapter) -> String {
+    format!("{}({}).epub", chapter.id, sanitize_filename(&chapter.name))
+}
+
+/// The file a manga volume built with KCC is written to, under `volumes/`
+pub(crate) fn volume_filename(source: &SourceConfig, volume: &Volume) -> String {
+    format!("{}.epub", sanitize_filename(&format!("{} {}", source.name, volume.name)))
 }
 
 fn load_stylesheet() -> &'static str {
@@ -214,7 +224,7 @@ pub fn build_chapter_epub(
     epub.generate(&mut output)?;
 
     Ok(Attachment {
-        filename: format!("{}({}).epub", &chapter.id, &safe_name),
+        filename: chapter_filename(chapter),
         mime: String::from("application/epub+zip"),
         bytes: output,
     })
@@ -403,6 +413,112 @@ fn generate_volume(
     Ok(attachment)
 }
 
+/// Manga through Kindle Comic Converter: every downloaded chapter gets a
+/// file under `chapters/kcc/`, every configured `Volume N` a file under
+/// `volumes/`, each built when flagged or when its file is missing (so a
+/// backlog is built once, and a deleted build directory is refilled).
+/// Chapter attachments go to the mail step as before; volumes never do.
+/// A failed build is logged, leaves its flag, and is counted in
+/// `failures`: the caller sends what did build, then reports the failure.
+fn build_manga_with_kcc(
+    db: &SourceDatabase,
+    source_dir: &Path,
+    config: &Config,
+    source: &SourceConfig,
+    kcc: &crate::config::KccConfig,
+    wanted: bool,
+) -> Result<GeneratedEpubs, Box<dyn std::error::Error>> {
+    use crate::kcc::{build_with_kcc, KccJob};
+
+    let splitter = source.spreads.splitter();
+    let mut failures = 0usize;
+    let mut chaps = Vec::<Attachment>::new();
+
+    let flagged_volumes: Vec<isize> = db.get_volumes_to_regenerate()?.into_iter().map(|v| v.id).collect();
+    if config.epub_gen.volumes && source.has_volumes() {
+        let volumes_dir = source_dir.join("volumes");
+        for volume in db.get_all_volumes()? {
+            if volume.name == source.name {
+                // The series volume holds only unnumbered chapters; never built.
+                db.update_generated_volume(volume.id, false)?;
+                continue;
+            }
+            let file = volumes_dir.join(volume_filename(source, &volume));
+            if !flagged_volumes.contains(&volume.id) && file.is_file() {
+                continue;
+            }
+            let chapters: Vec<Chapter> = db
+                .get_chapters_by_volume(volume.id)?
+                .into_iter()
+                .filter(|c| c.data_id.is_some())
+                .collect();
+            if chapters.is_empty() {
+                db.update_generated_volume(volume.id, false)?;
+                continue;
+            }
+            let job = KccJob {
+                title: format!("{} {}", source.name, volume.name),
+                author: &source.metadata.author,
+                chapters: chapters.iter().map(|c| (c.name.clone(), c.id)).collect(),
+                db,
+            };
+            println!("({}) Building {} with kcc ({} chapters)", source.id, volume.name, chapters.len());
+            match build_with_kcc(kcc, splitter, &job, &file) {
+                Ok(_) => db.update_generated_volume(volume.id, false)?,
+                Err(e) => {
+                    println!("({}) kcc failed for {}: {}", source.id, volume.name, e);
+                    failures += 1;
+                }
+            }
+        }
+    } else {
+        for id in &flagged_volumes {
+            db.update_generated_volume(*id, false)?;
+        }
+    }
+
+    if config.epub_gen.chapters {
+        let flagged_chapters: Vec<isize> = db.get_chapters_to_regenerate()?.into_iter().map(|c| c.id).collect();
+        let chapters_dir = source_dir.join("chapters").join("kcc");
+        for chapter in db.get_downloaded_chapters()? {
+            let flagged = flagged_chapters.contains(&chapter.id);
+            let file = chapters_dir.join(chapter_filename(&chapter));
+            if !flagged && file.is_file() {
+                continue;
+            }
+            let job = KccJob {
+                title: format!("{} {}", source.name, chapter.name),
+                author: &source.metadata.author,
+                chapters: vec![(chapter.name.clone(), chapter.id)],
+                db,
+            };
+            println!("({}) Building chapter {} with kcc", source.id, chapter.name);
+            let read_back = || -> Result<Option<Attachment>, std::io::Error> {
+                if !(flagged && wanted) {
+                    return Ok(None);
+                }
+                Ok(Some(Attachment {
+                    filename: chapter_filename(&chapter),
+                    mime: String::from("application/epub+zip"),
+                    bytes: std::fs::read(&file)?,
+                }))
+            };
+            match build_with_kcc(kcc, splitter, &job, &file).map_err(|e| e.to_string()).and_then(|_| read_back().map_err(|e| e.to_string())) {
+                Ok(attachment) => {
+                    chaps.extend(attachment);
+                    db.update_generated_chapter(chapter.id, false)?;
+                }
+                Err(e) => {
+                    println!("({}) kcc failed for chapter {}: {}", source.id, chapter.name, e);
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    Ok(GeneratedEpubs { vols: Vec::new(), vols_stripped: Vec::new(), chaps, chaps_stripped: Vec::new(), failures })
+}
+
 /// Generate EPUBs for a specific source, then mail them.
 pub async fn generate_epubs_for_source(
     db: &SourceDatabase,
@@ -412,6 +528,7 @@ pub async fn generate_epubs_for_source(
     processor_registry: &ProcessorRegistry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let built = build_epubs_for_source(db, build_dir, config, source, processor_registry)?;
+    let failures = built.failures;
     send_epubs(
         &config.mail,
         &source.id,
@@ -421,6 +538,9 @@ pub async fn generate_epubs_for_source(
         &built.chaps_stripped,
     )
     .await;
+    if failures > 0 {
+        return Err(format!("{} kcc build(s) failed; see above", failures).into());
+    }
     Ok(())
 }
 
@@ -430,6 +550,9 @@ pub(crate) struct GeneratedEpubs {
     pub vols_stripped: Vec<Attachment>,
     pub chaps: Vec<Attachment>,
     pub chaps_stripped: Vec<Attachment>,
+    /// Builds that failed and left their flag for the next run. What did
+    /// build is still sent before the failure is reported.
+    pub failures: usize,
 }
 
 /// Write a source's pending EPUBs to disk and clear their flags. Sends
@@ -451,6 +574,10 @@ pub(crate) fn build_epubs_for_source(
 
     // Create source-specific output directory
     let source_dir = build_dir.join(&source.id);
+
+    if let (true, Some(kcc)) = (source.is_manga(), &config.manga.kcc) {
+        return build_manga_with_kcc(db, &source_dir, config, source, kcc, wanted);
+    }
 
     let mut vols = Vec::<Attachment>::new();
     let mut vols_stripped = Vec::<Attachment>::new();
@@ -552,6 +679,7 @@ pub(crate) fn build_epubs_for_source(
         vols_stripped,
         chaps,
         chaps_stripped,
+        failures: 0,
     })
 }
 
@@ -971,5 +1099,134 @@ mod tests {
         assert!(root.join("volumes/Volume 1.epub").exists());
         assert!(root.join("volumes_stripped_colour/Volume 1.epub").exists());
         assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+    }
+
+    fn kcc_config(dir: &Path, mode: &str) -> Config {
+        let mut config = Config::default();
+        config.epub_gen = EpubGenConfig { volumes: true, chapters: true, strip_colour: true };
+        config.mail.destinations.clear();
+        config.manga.kcc = Some(crate::config::KccConfig {
+            command: crate::test_support::fake_kcc(dir, mode),
+            ..Default::default()
+        });
+        config
+    }
+
+    fn wanting(config: &mut Config, source_id: &str) {
+        let mut dest = crate::config::UserConfig::default();
+        dest.sources.insert(source_id.to_string(), Default::default());
+        config.mail.destinations = vec![dest];
+    }
+
+    #[test]
+    fn kcc_builds_chapters_flagged_or_missing_and_returns_flagged_attachments() {
+        let (db, source) = manga_db_with_two_chapters();
+        let chapters = db.get_downloaded_chapters().unwrap();
+        db.update_generated_chapter(chapters[1].id, false).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = kcc_config(dir.path(), "ok");
+        wanting(&mut config, &source.id);
+        let build = dir.path().join("build");
+
+        let built = build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+
+        let kcc_dir = build.join(&source.id).join("chapters").join("kcc");
+        assert!(kcc_dir.join(chapter_filename(&chapters[0])).is_file());
+        assert!(kcc_dir.join(chapter_filename(&chapters[1])).is_file(), "an unflagged chapter without a file is built once");
+        assert_eq!(built.chaps.len(), 1, "only the flagged chapter is an attachment");
+        assert_eq!((built.chaps[0].filename.as_str(), built.chaps[0].bytes.as_slice()), (chapter_filename(&chapters[0]).as_str(), b"fake".as_slice()));
+        assert!(built.vols.is_empty() && built.chaps_stripped.is_empty());
+        assert!(db.get_chapters_to_regenerate().unwrap().is_empty());
+        assert!(!build.join(&source.id).join("chapters").join("individual").exists(), "the built-in builder did not run");
+        assert_eq!(std::fs::read_dir(&kcc_dir).unwrap().count(), 2, "no export directory left behind");
+
+        std::fs::remove_file(dir.path().join("args.txt")).unwrap();
+        build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+        assert!(!dir.path().join("args.txt").exists(), "nothing flagged and nothing missing: kcc not run");
+    }
+
+    #[test]
+    fn kcc_builds_flagged_or_missing_volumes_and_mails_none() {
+        let (db, mut source) = manga_db_with_two_chapters();
+        source.volume_ends = vec![2.0];
+        let v1 = db.add_volume("Volume 1").unwrap();
+        for c in db.get_downloaded_chapters().unwrap() {
+            db.move_chapter(c.id, v1).unwrap();
+        }
+        db.update_generated_volume(v1, true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = kcc_config(dir.path(), "ok");
+        wanting(&mut config, &source.id);
+        let build = dir.path().join("build");
+        let volume = crate::db::Volume { id: v1, name: "Volume 1".into() };
+        let file = build.join(&source.id).join("volumes").join(volume_filename(&source, &volume));
+
+        let built = build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+
+        assert!(file.is_file(), "{}", file.display());
+        assert_eq!(file.file_name().unwrap().to_str().unwrap(), "Example Series Volume 1.epub");
+        assert!(built.vols.is_empty(), "a manga volume is never an attachment");
+        assert_eq!(built.chaps.len(), 2, "chapters inside a volume still get files and attachments");
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty());
+        let listing = std::fs::read_to_string(dir.path().join("listing.txt")).unwrap();
+        assert!(listing.contains("001 - C1") || listing.contains("001 - C2"), "{}", listing);
+
+        std::fs::remove_file(&file).unwrap();
+        build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+        assert!(file.is_file(), "a missing volume file is rebuilt without a flag");
+    }
+
+    #[test]
+    fn the_series_volume_is_never_built_with_kcc() {
+        let (db, mut source) = manga_db_with_two_chapters();
+        source.volume_ends = vec![2.0];
+        let dir = tempfile::tempdir().unwrap();
+        let config = kcc_config(dir.path(), "ok");
+        let build = dir.path().join("build");
+
+        build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+
+        assert!(!build.join(&source.id).join("volumes").exists());
+        assert!(db.get_volumes_to_regenerate().unwrap().is_empty(), "its flag is cleared all the same");
+    }
+
+    #[test]
+    fn a_kcc_failure_is_an_error_and_leaves_the_flag() {
+        let (db, source) = manga_db_with_two_chapters();
+        let dir = tempfile::tempdir().unwrap();
+        let config = kcc_config(dir.path(), "fail");
+
+        let built = build_epubs_for_source(&db, &dir.path().join("build"), &config, &source, &ProcessorRegistry::new()).unwrap();
+
+        assert_eq!(built.failures, 2);
+        assert!(built.chaps.is_empty());
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 2, "flags stay for the next run");
+    }
+
+    /// One failing volume must not cost the chapters that built in the same
+    /// run their email: the attachments come back with the failure count,
+    /// and only the caller turns the count into an error after sending.
+    #[tokio::test]
+    async fn a_failing_volume_still_delivers_the_chapters_that_built() {
+        let (db, mut source) = manga_db_with_two_chapters();
+        source.volume_ends = vec![2.0];
+        let v1 = db.add_volume("Volume 1").unwrap();
+        for c in db.get_downloaded_chapters().unwrap() {
+            db.move_chapter(c.id, v1).unwrap();
+        }
+        db.update_generated_volume(v1, true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // The fake splits volumes (a title with "Volume") and succeeds on chapters.
+        let mut config = kcc_config(dir.path(), "split-volumes");
+        wanting(&mut config, &source.id);
+        let build = dir.path().join("build");
+
+        let built = build_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).unwrap();
+        assert_eq!(built.failures, 1);
+        assert_eq!(built.chaps.len(), 2, "the chapters still come back as attachments");
+        assert_eq!(db.get_volumes_to_regenerate().unwrap().len(), 1, "the volume keeps its flag");
+
+        let err = generate_epubs_for_source(&db, &build, &config, &source, &ProcessorRegistry::new()).await.unwrap_err();
+        assert!(err.to_string().contains("1 kcc build(s) failed"), "{}", err);
     }
 }

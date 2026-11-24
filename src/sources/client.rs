@@ -5,12 +5,13 @@ use std::time::Duration;
 use tokio::time::sleep;
 use soup::prelude::*;
 
-use crate::config::{ImagesConfig, SourceKind};
+use crate::config::{volume_index, ImagesConfig, SourceKind};
 use crate::db::{ChapterImage, RegenerateFlags, SourceDatabase};
 use crate::error::{ScrapeError, ScrapeResult};
 use crate::images::{process_image, Alpha, ProcessedImage};
 
 use super::content_images::{assign_image_paths, drop_image};
+use super::manga::chapter_number;
 use super::traits::SourceScraper;
 
 /// Largest image body `get_bytes` will accept, in bytes.
@@ -144,6 +145,68 @@ pub fn assemble_chapter(
         html: assign_image_paths(&html, &assigned),
         images,
     })
+}
+
+/// What `shelve` did to a manga source
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shelved {
+    /// Chapters moved to the volume `VolumeEnds` puts them in
+    pub moved: usize,
+    /// Chapters whose URI yields no chapter number; left where they were
+    pub unnumbered: usize,
+}
+
+/// The volume a manga chapter belongs in: `Volume N` by `VolumeEnds`, else
+/// the series volume, named after the source.
+fn target_volume_name(scraper: &dyn SourceScraper, number: Option<f64>) -> String {
+    match number.and_then(|n| volume_index(scraper.volume_ends(), n)) {
+        Some(n) => format!("Volume {}", n),
+        None => scraper.source_name().to_string(),
+    }
+}
+
+/// Put every chapter of a manga source with `VolumeEnds` into its volume.
+/// Idempotent and config-driven: editing `VolumeEnds` moves chapters on the
+/// next run. Moves set no chapter flag; a `Volume N` a chapter joins or
+/// leaves is flagged for a rebuild, the series volume never is. An empty
+/// `Volume N` past the configured count is deleted.
+pub fn shelve(db: &SourceDatabase, scraper: &dyn SourceScraper) -> rusqlite::Result<Shelved> {
+    let tx = db.connection().unchecked_transaction()?;
+    let series_id = db.add_volume(scraper.source_name())?;
+    let mut shelved = Shelved { moved: 0, unnumbered: 0 };
+    let mut touched = std::collections::BTreeSet::new();
+    for chapter in db.get_all_chapters()? {
+        let number = scraper.chapter_pattern().and_then(|p| chapter_number(&chapter.uri, p));
+        if number.is_none() {
+            shelved.unnumbered += 1;
+            continue;
+        }
+        let target = db.add_volume(&target_volume_name(scraper, number))?;
+        if target != chapter.volume_id {
+            db.move_chapter(chapter.id, target)?;
+            touched.insert(chapter.volume_id);
+            touched.insert(target);
+            shelved.moved += 1;
+        }
+    }
+    for id in touched {
+        if id != series_id {
+            db.update_generated_volume(id, true)?;
+        }
+    }
+    let configured = scraper.volume_ends().len();
+    for volume in db.get_all_volumes()? {
+        let past_config = volume
+            .name
+            .strip_prefix("Volume ")
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_some_and(|n| n > configured);
+        if volume.id != series_id && past_config {
+            db.delete_volume_if_empty(volume.id)?;
+        }
+    }
+    tx.commit()?;
+    Ok(shelved)
 }
 
 /// How many times a request is sent before a challenge page is accepted as
@@ -324,10 +387,21 @@ impl ScraperClient {
             scraper.toc_url()
         );
 
-        // A manga source keeps every chapter in one volume named after it.
-        // Databases from the batch design are folded into it here, before
-        // the TOC fetch, so a site outage never postpones the migration.
-        if scraper.kind() != SourceKind::Text {
+        // A manga source is shelved by `VolumeEnds`, or keeps every chapter
+        // in one volume named after it. Either runs before the TOC fetch, so
+        // a site outage never postpones it.
+        let shelved_by_config = scraper.kind() != SourceKind::Text && !scraper.volume_ends().is_empty();
+        if shelved_by_config {
+            let done = shelve(db, &**scraper)?;
+            if done.moved > 0 || done.unnumbered > 0 {
+                println!(
+                    "({}) Shelved {} chapters into volumes ({} without a chapter number left in place)",
+                    scraper.source_id(),
+                    done.moved,
+                    done.unnumbered
+                );
+            }
+        } else if scraper.kind() != SourceKind::Text {
             let moved = db.collapse_volumes_into(scraper.source_name())?;
             if moved > 0 {
                 println!(
@@ -360,9 +434,15 @@ impl ScraperClient {
             if ignored_volumes.contains(&chapter.volume_name) || ignored_chapters.contains(&chapter.title) {
                 continue
             }
-            let volume_id = db.add_volume(&chapter.volume_name)?;
+            let volume_name = if shelved_by_config {
+                let number = scraper.chapter_pattern().and_then(|p| chapter_number(&chapter.uri, p));
+                target_volume_name(&**scraper, number)
+            } else {
+                chapter.volume_name
+            };
+            let volume_id = db.add_volume(&volume_name)?;
             db.upsert_chapter_from_toc(&chapter.title, &chapter.uri, volume_id)?;
-            *volume_counts.entry(chapter.volume_name).or_insert(0) += 1;
+            *volume_counts.entry(volume_name).or_insert(0) += 1;
         }
 
         for (volume_name, count) in &volume_counts {
@@ -406,15 +486,16 @@ impl ScraperClient {
             None => extract_page_title(&html).unwrap_or_else(|| title_from_slug(url)),
         };
 
-        // A manga chapter goes into the series volume like any indexed one.
+        // A manga chapter goes where its number puts it, like any indexed one.
         let (volume_id, volume_name) = if scraper.kind() != SourceKind::Text {
             if volume_override.is_some() {
                 println!(
-                    "({}) --volume is ignored for manga sources; seeding into the series volume",
+                    "({}) --volume is ignored for manga sources; seeding by chapter number",
                     scraper.source_id()
                 );
             }
-            let name = scraper.source_name().to_string();
+            let number = scraper.chapter_pattern().and_then(|p| chapter_number(url, p));
+            let name = target_volume_name(&**scraper, number);
             (db.add_volume(&name)?, name)
         } else {
             let volume_name = match volume_override {
@@ -683,9 +764,13 @@ impl ScraperClient {
         let assembled = content.assembled;
         match scraper.kind() {
             SourceKind::Text => db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, RegenerateFlags::ChapterAndVolume)?,
-            // The series volume is never built, so only the chapter is flagged.
+            // A configured `Volume N` is rebuilt when a chapter lands in it;
+            // the series volume is never built, so only the chapter is flagged.
             SourceKind::MangaTcb | SourceKind::MangaWordpress => {
-                db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, RegenerateFlags::ChapterOnly)?
+                let in_volume = !scraper.volume_ends().is_empty()
+                    && db.get_volume_name(chapter.volume_id)? != scraper.source_name();
+                let flags = if in_volume { RegenerateFlags::ChapterAndVolume } else { RegenerateFlags::ChapterOnly };
+                db.store_chapter_content(chapter.id, &assembled.html, &assembled.images, flags)?
             }
         }
 
@@ -923,11 +1008,16 @@ mod tests {
 
     /// A WordPress comic scraper whose TOC is `toc_url`
     fn manga_scraper(toc_url: &str) -> Arc<dyn SourceScraper> {
+        manga_scraper_with(toc_url, &[])
+    }
+
+    fn manga_scraper_with(toc_url: &str, volume_ends: &[f64]) -> Arc<dyn SourceScraper> {
         let cfg = SourceConfig {
             id: "example-manga".into(),
             name: "Example Series".into(),
             kind: SourceKind::MangaWordpress,
             toc_url: toc_url.into(),
+            volume_ends: volume_ends.to_vec(),
             ..SourceConfig::default()
         };
         Arc::new(WordPressComicScraper::new(cfg))
@@ -1016,6 +1106,123 @@ mod tests {
         chapters.extend(db.get_downloaded_chapters().unwrap());
         chapters.sort_by_key(|c| c.id);
         chapters.into_iter().map(|c| (c.name, db.get_volume_name(c.volume_id).unwrap())).collect()
+    }
+
+    /// A flat database of numbered chapters, in the series volume
+    fn flat_db(n: u32) -> SourceDatabase {
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+        let series = db.add_volume("Example Series").unwrap();
+        for i in 1..=n {
+            db.add_chapter(&format!("Ch {}", i), &format!("https://manga.example.com/manga/example-chapter-{}/", i), series).unwrap();
+        }
+        db
+    }
+
+    fn flagged_volume_names(db: &SourceDatabase) -> Vec<String> {
+        let mut names: Vec<String> = db.get_volumes_to_regenerate().unwrap().into_iter().map(|v| v.name).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn shelving_places_chapters_by_number_and_flags_touched_volumes() {
+        let db = flat_db(12);
+        let ids: Vec<isize> = db.get_empty_chapters().unwrap().iter().map(|c| c.id).collect();
+        db.update_generated_chapter(ids[2], true).unwrap();
+        let scraper = manga_scraper_with("https://manga.example.com/", &[5.0, 11.0]);
+
+        let done = shelve(&db, &*scraper).unwrap();
+
+        assert_eq!(done, Shelved { moved: 12, unnumbered: 0 });
+        let expect: Vec<(String, String)> = (1..=12).map(|n| (format!("Ch {}", n), match n { 1..=5 => "Volume 1", 6..=11 => "Volume 2", _ => "Volume 3" }.to_string())).collect();
+        assert_eq!(volume_of_each(&db), expect, "chapter 12 is shelved on at the last volume's length");
+        assert_eq!(flagged_volume_names(&db), ["Volume 1", "Volume 2", "Volume 3"]);
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [ids[2]], "chapter flags untouched");
+
+        for v in db.get_all_volumes().unwrap() { db.update_generated_volume(v.id, false).unwrap(); }
+        assert_eq!(shelve(&db, &*scraper).unwrap(), Shelved { moved: 0, unnumbered: 0 });
+        assert!(flagged_volume_names(&db).is_empty(), "a no-op run flags nothing");
+    }
+
+    #[test]
+    fn reshelving_after_a_config_change_moves_and_flags() {
+        let db = flat_db(12);
+        shelve(&db, &*manga_scraper_with("https://manga.example.com/", &[5.0, 11.0])).unwrap();
+        for v in db.get_all_volumes().unwrap() { db.update_generated_volume(v.id, false).unwrap(); }
+
+        let done = shelve(&db, &*manga_scraper_with("https://manga.example.com/", &[6.0, 11.0])).unwrap();
+
+        assert_eq!(done.moved, 1);
+        assert_eq!(volume_of_each(&db)[5], ("Ch 6".to_string(), "Volume 1".to_string()));
+        assert_eq!(flagged_volume_names(&db), ["Volume 1", "Volume 2"]);
+    }
+
+    #[test]
+    fn an_empty_volume_no_longer_named_is_deleted() {
+        let db = flat_db(11);
+        shelve(&db, &*manga_scraper_with("https://manga.example.com/", &[5.0, 11.0])).unwrap();
+
+        shelve(&db, &*manga_scraper_with("https://manga.example.com/", &[11.0])).unwrap();
+
+        let names: Vec<String> = db.get_all_volumes().unwrap().into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["Example Series", "Volume 1"]);
+        assert_eq!(db.get_chapters_by_volume(db.get_volume_by_name("Volume 1").unwrap().unwrap().id).unwrap().len(), 11);
+    }
+
+    #[test]
+    fn an_unnumbered_chapter_is_left_in_place() {
+        let db = flat_db(2);
+        let series = db.get_volume_by_name("Example Series").unwrap().unwrap().id;
+        db.add_chapter("Special", "https://manga.example.com/manga/example-special/", series).unwrap();
+
+        let done = shelve(&db, &*manga_scraper_with("https://manga.example.com/", &[1.0])).unwrap();
+
+        assert_eq!(done, Shelved { moved: 2, unnumbered: 1 });
+        assert_eq!(volume_of_each(&db)[2], ("Special".to_string(), "Example Series".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_new_toc_chapter_lands_in_its_target_volume() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: "/", status: 200, content_type: "text/html", body: include_bytes!("../../tests/fixtures/manga/wp-home.html").to_vec() },
+        ]).await;
+        let scraper = manga_scraper_with(&format!("{}/", base), &[1.0]);
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+
+        ScraperClient::new().unwrap().update_index(&scraper, &db, &vec![], &vec![]).await.unwrap();
+
+        let placed = volume_of_each(&db);
+        assert_eq!(placed.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(), ["Volume 1", "Volume 2", "Volume 94", "Volume 95"]);
+        assert!(flagged_volume_names(&db).is_empty(), "indexing flags nothing");
+    }
+
+    #[tokio::test]
+    async fn download_flags_the_volumes_chapters_land_in() {
+        let (scraper, db) = series_setup_with(5, &[2.0]).await;
+        shelve(&db, &*scraper).unwrap();
+        for v in db.get_all_volumes().unwrap() { db.update_generated_volume(v.id, false).unwrap(); }
+
+        download_series(&scraper, &db).await;
+
+        assert_eq!(flagged_volume_names(&db), ["Volume 1", "Volume 2", "Volume 3"]);
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 5);
+
+        let (flat_scraper, flat) = series_setup(2).await;
+        download_series(&flat_scraper, &flat).await;
+        assert!(flagged_volume_names(&flat).is_empty(), "a flat source never flags its series volume");
+    }
+
+    #[tokio::test]
+    async fn seed_chapter_goes_to_its_target_volume() {
+        let base = serve_fixtures(|_| vec![
+            FixtureRoute { path: MANGA_CHAPTER_PATH, status: 200, content_type: "text/html", body: b"<html><head><title>Ch 42</title></head><body></body></html>".to_vec() },
+        ]).await;
+        let scraper = manga_scraper_with(&base, &[10.0, 50.0]);
+        let db = SourceDatabase::open_in_memory("t").unwrap();
+
+        ScraperClient::new().unwrap().seed_chapter(&scraper, &db, &format!("{}{}", base, MANGA_CHAPTER_PATH), None, None).await.unwrap();
+
+        assert_eq!(volume_of_each(&db), [("Ch 42".to_string(), "Volume 2".to_string())]);
     }
 
     #[tokio::test]
@@ -1148,6 +1355,10 @@ mod tests {
     /// and return a manga scraper and a db holding them pending in the
     /// series volume
     async fn series_setup(n: usize) -> (Arc<dyn SourceScraper>, SourceDatabase) {
+        series_setup_with(n, &[]).await
+    }
+
+    async fn series_setup_with(n: usize, volume_ends: &[f64]) -> (Arc<dyn SourceScraper>, SourceDatabase) {
         let png = png_2x2();
         let base = serve_fixtures(|b| {
             let mut routes: Vec<FixtureRoute> = SERIES_CHAPTER_PATHS[..n].iter()
@@ -1158,7 +1369,7 @@ mod tests {
             }
             routes
         }).await;
-        let scraper = manga_scraper(&base);
+        let scraper = manga_scraper_with(&base, volume_ends);
         let db = SourceDatabase::open_in_memory("t").unwrap();
         let vol = db.add_volume(scraper.source_name()).unwrap();
         for (i, p) in SERIES_CHAPTER_PATHS[..n].iter().enumerate() {

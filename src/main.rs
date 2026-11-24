@@ -206,6 +206,7 @@ async fn main() {
             .await
             {
                 println!("Error generating EPUBs for {}: {}", source.id, e);
+                overdue += record_failure(&db, &source.id, now);
                 continue;
             }
         } else {

@@ -8,6 +8,7 @@ pub mod db;
 pub mod epub;
 pub mod error;
 pub mod images;
+pub mod kcc;
 pub mod mail;
 pub mod postprocess;
 pub mod sources;

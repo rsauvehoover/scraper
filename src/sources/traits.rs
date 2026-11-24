@@ -69,4 +69,15 @@ pub trait SourceScraper: Send + Sync {
     fn kind(&self) -> SourceKind {
         SourceKind::Text
     }
+
+    /// Manga sources: `VolumeEnds`, the last chapter number of each
+    /// configured volume. Empty for a flat chapter list.
+    fn volume_ends(&self) -> &[f64] {
+        &[]
+    }
+
+    /// Manga sources: the compiled chapter-number pattern, when it is valid
+    fn chapter_pattern(&self) -> Option<&regex::Regex> {
+        None
+    }
 }
