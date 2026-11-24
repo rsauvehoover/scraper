@@ -294,6 +294,50 @@ pub struct SourceConfig {
     pub kind: SourceKind,
     /// First chapter number to download (manga sources); earlier chapters are skipped
     pub start_chapter: Option<f64>,
+    /// Manga sources: the last chapter number of each published volume, in
+    /// order. Chapters past the last entry stay loose in the series volume.
+    /// Empty means no volumes: a flat chapter list.
+    pub volume_ends: Vec<f64>,
+    /// Manga sources: how Kindle Comic Converter handles double-page spreads
+    pub spreads: Spreads,
+}
+
+/// How double-page spreads are handled when manga EPUBs are built with
+/// Kindle Comic Converter: its `--splitter` modes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Spreads {
+    /// Split into two pages, right page first for manga
+    #[default]
+    Split,
+    /// Rotate the spread to fill a portrait page
+    Rotate,
+    /// Both: the rotated spread, then its two halves
+    Both,
+}
+
+impl Spreads {
+    /// KCC's `--splitter` value
+    pub fn splitter(self) -> u8 {
+        match self {
+            Spreads::Split => 0,
+            Spreads::Rotate => 1,
+            Spreads::Both => 2,
+        }
+    }
+}
+
+impl SourceConfig {
+    /// Whether chapters are shelved into configured volumes
+    pub fn has_volumes(&self) -> bool {
+        !self.volume_ends.is_empty()
+    }
+
+    /// The 1-based volume a chapter number belongs to, by `VolumeEnds`;
+    /// `None` past the last volume or when there are no volumes.
+    pub fn volume_for(&self, number: f64) -> Option<usize> {
+        self.volume_ends.iter().position(|end| number <= *end).map(|i| i + 1)
+    }
 }
 
 impl Default for SourceConfig {
@@ -311,6 +355,8 @@ impl Default for SourceConfig {
             post_processors: Vec::new(),
             kind: SourceKind::Text,
             start_chapter: None,
+            volume_ends: Vec::new(),
+            spreads: Spreads::Split,
         }
     }
 }
@@ -340,6 +386,8 @@ impl SourceConfig {
             post_processors: vec![String::from("mrsha-write"), String::from("strip-links")],
             kind: SourceKind::Text,
             start_chapter: None,
+            volume_ends: Vec::new(),
+            spreads: Spreads::Split,
         }
     }
 
@@ -384,6 +432,8 @@ impl SourceConfig {
             post_processors: vec![String::from("strip-links")],
             kind: SourceKind::Text,
             start_chapter: None,
+            volume_ends: Vec::new(),
+            spreads: Spreads::Split,
         }
     }
 }
@@ -401,6 +451,44 @@ fn slug_name(name: &str) -> String {
         .join("-")
 }
 
+/// Manga-wide settings
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MangaConfig {
+    /// Build manga EPUBs with Kindle Comic Converter; absent means the
+    /// built-in builder
+    pub kcc: Option<KccConfig>,
+}
+
+/// How Kindle Comic Converter is run. Only `Command` is required.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct KccConfig {
+    /// Path of `kcc-c2e`
+    pub command: String,
+    /// KCC device profile; `KCS` is the Kindle Colorsoft
+    pub profile: String,
+    /// KCC output format; `KFX` is its EPUB meant for Send to Kindle
+    pub format: String,
+    /// Largest output file in MB; KCC splits past it, which the scraper
+    /// treats as an error
+    pub target_mb: u32,
+    /// Extra arguments appended verbatim, for example `--jpeg-quality 75`
+    pub extra_args: Vec<String>,
+}
+
+impl Default for KccConfig {
+    fn default() -> Self {
+        KccConfig {
+            command: String::new(),
+            profile: "KCS".into(),
+            format: "KFX".into(),
+            target_mb: 195,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Config {
@@ -412,6 +500,8 @@ pub struct Config {
     pub sources: Vec<SourceConfig>,
     /// Chapter image download settings
     pub images: ImagesConfig,
+    /// Manga handling: the Kindle Comic Converter hook
+    pub manga: MangaConfig,
 
     // Legacy fields for backward compatibility
     #[serde(default)]
@@ -428,6 +518,7 @@ impl Default for Config {
             epub_gen: EpubGenConfig::default(),
             sources: vec![SourceConfig::wandering_inn()],
             images: ImagesConfig::default(),
+            manga: MangaConfig::default(),
             toc_url: None,
             patreon_name: None,
         }
@@ -593,6 +684,27 @@ fn try_parse_and_migrate(raw: &[u8]) -> Result<Config, serde_json::Error> {
 
             // Backward compatibility: migrate legacy config to multi-source format
             config = migrate_legacy_config(config);
+
+            for source in &mut config.sources {
+                if !source.volume_ends.is_empty() && !source.is_manga() {
+                    eprintln!(
+                        "warning: source {} is not a manga source; VolumeEnds is ignored",
+                        source.id
+                    );
+                    source.volume_ends.clear();
+                }
+                if source.volume_ends.windows(2).any(|w| w[1] <= w[0]) {
+                    return Err(serde::de::Error::custom(format!(
+                        "source {}: VolumeEnds must be strictly ascending",
+                        source.id
+                    )));
+                }
+            }
+            if let Some(kcc) = &config.manga.kcc {
+                if kcc.command.trim().is_empty() {
+                    return Err(serde::de::Error::custom("Manga.Kcc.Command is required when Manga.Kcc is set"));
+                }
+            }
 
             // Print enabled sources
             for source in config.enabled_sources() {
@@ -812,5 +924,53 @@ mod tests {
 
         let cfg = parse_config(br#"{"Images":{"MaxHeight":1000}}"#).unwrap();
         assert_eq!((cfg.images.max_width, cfg.images.max_height), (2528, 1000));
+    }
+
+    #[test]
+    fn volume_ends_parses_and_maps_chapters() {
+        let cfg = parse_config(br#"{"Sources":[{"Id":"m","Name":"M","Kind":"manga-tcb","VolumeEnds":[5, 11]}]}"#).unwrap();
+        let m = &cfg.sources[0];
+        assert!(m.has_volumes());
+        assert_eq!(m.volume_ends, [5.0, 11.0]);
+        assert_eq!((m.volume_for(1.0), m.volume_for(5.0)), (Some(1), Some(1)));
+        assert_eq!((m.volume_for(6.0), m.volume_for(11.0)), (Some(2), Some(2)));
+        assert_eq!(m.volume_for(12.0), None);
+        let flat = SourceConfig::default();
+        assert!(!flat.has_volumes());
+        assert_eq!(flat.volume_for(1.0), None);
+    }
+
+    #[test]
+    fn volume_ends_must_ascend() {
+        assert!(parse_config(br#"{"Sources":[{"Id":"m","Name":"M","Kind":"manga-tcb","VolumeEnds":[5, 5]}]}"#).is_err());
+        assert!(parse_config(br#"{"Sources":[{"Id":"m","Name":"M","Kind":"manga-tcb","VolumeEnds":[11, 5]}]}"#).is_err());
+    }
+
+    #[test]
+    fn volume_ends_on_a_text_source_is_dropped() {
+        let cfg = parse_config(br#"{"Sources":[{"Id":"t","Name":"T","VolumeEnds":[5]}]}"#).unwrap();
+        assert!(cfg.sources[0].volume_ends.is_empty());
+    }
+
+    #[test]
+    fn manga_kcc_parses_with_defaults() {
+        let cfg = parse_config(br#"{"Manga":{"Kcc":{"Command":"/opt/kcc/bin/kcc-c2e"}}}"#).unwrap();
+        let kcc = cfg.manga.kcc.unwrap();
+        assert_eq!(kcc.command, "/opt/kcc/bin/kcc-c2e");
+        assert_eq!((kcc.profile.as_str(), kcc.format.as_str(), kcc.target_mb), ("KCS", "KFX", 195));
+        assert!(kcc.extra_args.is_empty());
+        assert!(parse_config(br#"{}"#).unwrap().manga.kcc.is_none());
+        assert!(parse_config(br#"{"Manga":{"Kcc":{}}}"#).is_err(), "Command is required");
+        let cfg = parse_config(br#"{"Manga":{"Kcc":{"Command":"kcc-c2e","TargetMb":100,"ExtraArgs":["--jpeg-quality","75"]}}}"#).unwrap();
+        assert_eq!(cfg.manga.kcc.unwrap().extra_args, ["--jpeg-quality", "75"]);
+    }
+
+    #[test]
+    fn spreads_parse_to_the_splitter_mode() {
+        let cfg = parse_config(br#"{"Sources":[{"Id":"m","Name":"M","Kind":"manga-tcb","Spreads":"rotate"}]}"#).unwrap();
+        assert_eq!(cfg.sources[0].spreads, Spreads::Rotate);
+        assert_eq!(cfg.sources[0].spreads.splitter(), 1);
+        assert_eq!(SourceConfig::default().spreads.splitter(), 0);
+        assert_eq!(Spreads::Both.splitter(), 2);
     }
 }
