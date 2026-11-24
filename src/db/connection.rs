@@ -284,6 +284,47 @@ impl SourceDatabase {
             .optional()
     }
 
+    /// Record that this run failed for the source, and return when the
+    /// failing streak began: `now` if this is its first failure, else the
+    /// time recorded then. Kept in `source_metadata` so the streak survives
+    /// across runs; `note_success` ends it.
+    pub fn note_failure(&self, now: std::time::SystemTime) -> Result<std::time::SystemTime> {
+        if let Some(since) = self.failing_since()? {
+            return Ok(since);
+        }
+        let secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO source_metadata(key, value) VALUES ('failing_since', ?1)",
+            [secs.to_string()],
+        )?;
+        Ok(now)
+    }
+
+    /// End the failing streak after a run that got through every step.
+    pub fn note_success(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM source_metadata WHERE key = 'failing_since'", ())?;
+        Ok(())
+    }
+
+    /// When the current failing streak began, if the source is in one
+    pub fn failing_since(&self) -> Result<Option<std::time::SystemTime>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM source_metadata WHERE key = 'failing_since'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)))
+    }
+
     /// Every volume, oldest first
     pub fn get_all_volumes(&self) -> Result<Vec<Volume>> {
         self.conn
@@ -949,6 +990,23 @@ mod tests {
         db.add_chapter_data(ids[0], "<a/>").unwrap();
         let got: Vec<isize> = db.get_downloaded_chapters().unwrap().iter().map(|c| c.id).collect();
         assert_eq!(got, vec![ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn a_failing_streak_keeps_its_start_until_a_success_ends_it() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let db = test_db();
+        let first = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = first + Duration::from_secs(5 * 3600);
+
+        assert_eq!(db.failing_since().unwrap(), None);
+        assert_eq!(db.note_failure(first).unwrap(), first);
+        assert_eq!(db.note_failure(later).unwrap(), first, "the streak keeps its start");
+        assert_eq!(db.failing_since().unwrap(), Some(first));
+
+        db.note_success().unwrap();
+        assert_eq!(db.failing_since().unwrap(), None);
+        assert_eq!(db.note_failure(later).unwrap(), later, "a new streak starts afresh");
     }
 
     #[test]

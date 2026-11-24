@@ -148,7 +148,7 @@ pub fn assemble_chapter(
 
 /// How many times a request is sent before a challenge page is accepted as
 /// the answer, and the pause before the second attempt (it grows linearly).
-const CHALLENGE_ATTEMPTS: u32 = 4;
+const CHALLENGE_ATTEMPTS: u32 = 6;
 const CHALLENGE_PAUSE: Duration = Duration::from_secs(3);
 
 /// Cloudflare's managed challenge: a 403 that names itself in a header.
