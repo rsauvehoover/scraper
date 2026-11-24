@@ -230,6 +230,13 @@ And the scheduled scrape as the same user, in `/etc/cron.d/scraper`:
 17 * * * * scraper cd /var/lib/scraper && /usr/bin/wandering_inn_scraper
 ```
 
+The exit status is meant for a healthcheck ping. A source whose index or
+download step fails is skipped for that run and its failing streak is
+recorded in its database; the run exits 1 only once some source has been
+failing for more than 24 hours, so a passing bot challenge or a site hiccup
+does not page anyone, while a site that has been down all day does. A run
+that gets a source through every step clears its streak.
+
 `--schedule-file` makes the Sources page show the schedule and the next run,
 e.g. "Scrapes run hourly at :17 · next 18:17 server time, in 12 min". It
 expects system crontab format (a file under `/etc/cron.d`, or `/etc/crontab`)

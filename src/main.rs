@@ -108,10 +108,13 @@ async fn main() {
         }
     }
 
-    // Process each source. A source that fails its index or download step
-    // is skipped, counted, and makes the run exit non-zero at the end, so
-    // the hourly healthcheck sees it.
-    let mut failed = 0usize;
+    // Process each source. A source that fails its index or download step is
+    // skipped and its failing streak recorded in its database. The run exits
+    // non-zero only for a source that has been failing for longer than
+    // FAILURE_GRACE, so an hour of Cloudflare challenges does not page anyone
+    // but a site that has been down all day does.
+    let mut overdue = 0usize;
+    let now = std::time::SystemTime::now();
     for source in sources_to_process {
         println!(
             "\n=== Processing source: {} ({}) ===",
@@ -143,7 +146,7 @@ async fn main() {
                 .await
             {
                 println!("Error re-downloading chapters for {}: {}", source.id, e);
-                failed += 1;
+                overdue += record_failure(&db, &source.id, now);
             }
             continue;
         }
@@ -152,7 +155,7 @@ async fn main() {
         if !args.skip_index {
             if let Err(e) = client.update_index(&scraper, &db, &source.ignored_volumes, &source.ignored_chapters).await {
                 println!("Error updating index for {}: {}", source.id, e);
-                failed += 1;
+                overdue += record_failure(&db, &source.id, now);
                 continue;
             }
         } else {
@@ -184,7 +187,7 @@ async fn main() {
                 .await
             {
                 println!("Error downloading chapters for {}: {}", source.id, e);
-                failed += 1;
+                overdue += record_failure(&db, &source.id, now);
                 continue;
             }
         } else {
@@ -209,12 +212,42 @@ async fn main() {
             println!("({}) Skipping EPUB generation", source.id);
         }
 
+        if let Err(e) = db.note_success() {
+            println!("({}) could not clear the failure record: {}", source.id, e);
+        }
         println!("({}) Done", source.id);
     }
 
     println!("\n=== All sources processed ===");
-    if failed > 0 {
-        println!("{} source(s) failed; see above", failed);
+    if overdue > 0 {
+        println!("{} source(s) failing for over {} hours; see above", overdue, FAILURE_GRACE.as_secs() / 3600);
         std::process::exit(1);
+    }
+}
+
+/// How long a source may keep failing before a run reports it: a day of
+/// hourly runs. Cloudflare challenges and site hiccups clear well inside
+/// that; a real outage shows up the next morning.
+const FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Record this run's failure for a source and say whether it is overdue:
+/// 1 when the streak is older than FAILURE_GRACE (or the record itself
+/// cannot be kept, which must not hide a failure), else 0.
+fn record_failure(db: &SourceDatabase, source_id: &str, now: std::time::SystemTime) -> usize {
+    let since = match db.note_failure(now) {
+        Ok(since) => since,
+        Err(e) => {
+            println!("({}) could not record the failure: {}", source_id, e);
+            return 1;
+        }
+    };
+    let for_how_long = now.duration_since(since).unwrap_or_default();
+    let hours = for_how_long.as_secs() / 3600;
+    if for_how_long >= FAILURE_GRACE {
+        println!("({}) failing for {} hours, past the {} hour grace", source_id, hours, FAILURE_GRACE.as_secs() / 3600);
+        1
+    } else {
+        println!("({}) failing for {} hours; the run stays green until {}", source_id, hours, FAILURE_GRACE.as_secs() / 3600);
+        0
     }
 }
