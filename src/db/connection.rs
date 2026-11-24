@@ -323,6 +323,56 @@ impl SourceDatabase {
         Ok(value
             .and_then(|v| v.parse::<u64>().ok())
             .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)))
+
+    /// Move a chapter to another volume. Flags are untouched.
+    pub fn move_chapter(&self, chapter_id: isize, volume_id: isize) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chapters SET volumeid = ?1 WHERE id = ?2",
+            [volume_id, chapter_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a volume that holds no chapters; false when it holds some.
+    pub fn delete_volume_if_empty(&self, volume_id: isize) -> Result<bool> {
+        let held: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chapters WHERE volumeid = ?1",
+            [volume_id],
+            |row| row.get(0),
+        )?;
+        if held > 0 {
+            return Ok(false);
+        }
+        self.conn.execute("DELETE FROM volumes WHERE id = ?1", [volume_id])?;
+        Ok(true)
+    }
+
+    /// A volume by its name, if it exists
+    pub fn get_volume_by_name(&self, name: &str) -> Result<Option<Volume>> {
+        self.conn
+            .query_row(
+                "SELECT id, name FROM volumes WHERE name = ?1",
+                [name],
+                |row| Ok(Volume { id: row.get(0)?, name: row.get(1)? }),
+            )
+            .optional()
+    }
+
+    /// Every chapter, pending or downloaded, in id order
+    pub fn get_all_chapters(&self) -> Result<Vec<Chapter>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, uri, volumeid, data_id FROM chapters ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Chapter {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                uri: row.get(2)?,
+                volume_id: row.get(3)?,
+                data_id: row.get(4)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Every volume, oldest first
@@ -1007,6 +1057,45 @@ mod tests {
         db.note_success().unwrap();
         assert_eq!(db.failing_since().unwrap(), None);
         assert_eq!(db.note_failure(later).unwrap(), later, "a new streak starts afresh");
+
+    fn move_chapter_changes_only_the_volume() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let v2 = db.add_volume("Volume 2").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        let id = db.get_empty_chapters().unwrap()[0].id;
+        db.update_generated_chapter(id, true).unwrap();
+
+        db.move_chapter(id, v2).unwrap();
+
+        assert_eq!(db.get_chapters_by_volume(v2).unwrap().len(), 1);
+        assert!(db.get_chapters_by_volume(v1).unwrap().is_empty());
+        assert_eq!(db.get_chapters_to_regenerate().unwrap().len(), 1, "flag untouched");
+        assert_eq!(db.get_volume_by_name("Volume 2").unwrap().map(|v| v.id), Some(v2));
+        assert!(db.get_volume_by_name("Volume 9").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_volume_if_empty_refuses_a_volume_with_chapters() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        let v2 = db.add_volume("Volume 2").unwrap();
+        db.add_chapter("C1", "https://example.com/c1", v1).unwrap();
+        assert!(!db.delete_volume_if_empty(v1).unwrap());
+        assert!(db.delete_volume_if_empty(v2).unwrap());
+        assert_eq!(db.get_all_volumes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_all_chapters_lists_pending_and_downloaded_in_id_order() {
+        let db = test_db();
+        let v1 = db.add_volume("Volume 1").unwrap();
+        for n in 1..=3 { db.add_chapter(&format!("C{}", n), &format!("https://example.com/c{}", n), v1).unwrap(); }
+        let ids: Vec<isize> = db.get_empty_chapters().unwrap().iter().map(|c| c.id).collect();
+        db.add_chapter_data(ids[1], "<p/>").unwrap();
+        let all = db.get_all_chapters().unwrap();
+        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["C1", "C2", "C3"]);
+        assert_eq!(all.iter().map(|c| c.data_id.is_some()).collect::<Vec<_>>(), [false, true, false]);
     }
 
     #[test]
